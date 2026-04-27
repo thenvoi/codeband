@@ -61,7 +61,7 @@ mv agent_config.yaml agent_config.yaml.v0.bak
 cb setup-agents
 ```
 
-**Free-tier Band.ai:** Delete the old agents in the Band.ai UI, create new ones with the v1 names, and write `agent_config.yaml` by hand. See the [README's manual registration walkthrough](../README.md#4-register-your-agents-on-bandai).
+**Free-tier Band.ai:** Delete the old agents in the Band.ai UI, create new ones with the v1 names, and write `agent_config.yaml` by hand. See [Configuration: Manual Agent Registration](CONFIGURATION.md#manual-agent-registration-free-tier).
 
 ### 4. Clean up the workspace
 

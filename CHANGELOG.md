@@ -9,3 +9,4 @@ This project is currently in alpha. Until the first stable release, minor versio
 - Added OSS community files, issue templates, and CI workflow.
 - Restructured the README into a shorter landing guide.
 - Added focused authentication, configuration, and troubleshooting docs.
+- Added PyPI publishing workflow (tag-driven, trusted publishing) and `RELEASING.md`.

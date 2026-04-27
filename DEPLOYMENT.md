@@ -74,7 +74,7 @@ cb setup-agents
 
 This registers all agents (Planner, Conductor, Reviewers, Coders, Mergemaster) on the Band.ai platform and writes credentials to `agent_config.yaml`. The Watchdog is an in-process daemon that reuses the Conductor's credentials — it is not registered as a platform agent. Safe to run multiple times — existing agents are reused.
 
-**Option B — free-tier Band.ai:** `cb setup-agents` requires the enterprise agent-registration API and will fail with a 403. Create the agents manually in the Band.ai web UI and write `agent_config.yaml` by hand — see the step-by-step walkthrough in the [README](README.md#4-register-your-agents-on-bandai).
+**Option B — free-tier Band.ai:** `cb setup-agents` requires the enterprise agent-registration API and will fail with a 403. Create the agents manually in the Band.ai web UI and write `agent_config.yaml` by hand — see the step-by-step walkthrough in [Configuration](docs/CONFIGURATION.md#manual-agent-registration-free-tier).
 
 ---
 
