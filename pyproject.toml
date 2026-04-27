@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codeband"
+version = "0.1.0"
+description = "Multi-agent coding orchestration via Band.ai"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Band.ai" }]
+license = { text = "MIT" }
+keywords = [
+    "agents",
+    "ai-agents",
+    "automation",
+    "band",
+    "claude-code",
+    "codex",
+    "code-review",
+    "coding",
+    "coding-agent",
+    "multi-agent",
+    "orchestration",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/band-ai/codeband"
+Documentation = "https://github.com/band-ai/codeband#documentation"
+Repository = "https://github.com/band-ai/codeband"
+Issues = "https://github.com/band-ai/codeband/issues"
+Changelog = "https://github.com/band-ai/codeband/blob/main/CHANGELOG.md"
+
+dependencies = [
+    "band-sdk[codex,claude-sdk]>=0.2.8",
+    "click>=8.1",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "prompt_toolkit>=3.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+cb = "codeband.cli:cli"
+codeband = "codeband.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+codeband = ["prompts/*.md"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

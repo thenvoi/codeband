@@ -1,0 +1,224 @@
+# Codeband Multi-Agent Docker Compose
+#
+# Runs all agents with shared workspace volumes.
+# Each agent connects to the Band.ai platform via WebSocket.
+#
+# NOTE: All services use Dockerfile.claude by default. For Codex-based agents,
+# change `dockerfile: docker/Dockerfile.claude` to `dockerfile: docker/Dockerfile.codex`
+# on the relevant service (e.g., coder or reviewer with framework: codex in codeband.yaml).
+#
+# Usage:
+#   cp .env.example .env                   # Configure API keys
+#   codeband setup-agents                 # Register agents
+#   docker compose -f docker/docker-compose.yml build
+#   docker compose -f docker/docker-compose.yml up -d
+#   docker compose -f docker/docker-compose.yml logs -f
+
+x-agent-base: &agent-base
+  restart: unless-stopped
+  env_file:
+    - path: ${CODEBAND_PROJECT_DIR:-.}/.env
+      required: false
+  environment: &env-base
+    CODEBAND_CONFIG: /app/config/codeband.yaml
+    AGENT_CONFIG: /app/config/agent_config.yaml
+    WORKSPACE: /workspace
+    REPO_URL: ${REPO_URL:-}
+    REPO_BRANCH: ${REPO_BRANCH:-}
+    WORKTREE_PREFIX: ${WORKTREE_PREFIX:-codeband}
+    BAND_REST_URL: ${BAND_REST_URL:-https://app.band.ai}
+    BAND_WS_URL: ${BAND_WS_URL:-wss://app.band.ai/api/v1/socket/websocket}
+    BAND_MEMORY_MODE: ${BAND_MEMORY_MODE:-}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    GH_TOKEN: ${GH_TOKEN:-}
+    GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    CODEBAND_DEBUG: ${CODEBAND_DEBUG:-}
+  volumes: &volumes-base
+    - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
+    - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
+    - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro  # overrides only; package defaults used when present
+    - ${GIT_CREDENTIALS_PATH:-/dev/null}:/home/appuser/.git-credentials:ro
+    - ${SSH_AUTH_SOCK:-/dev/null}:/run/ssh-agent:ro
+    - bare_repo:/workspace/repo.git
+    - worktrees:/workspace/worktrees
+    - shared_notes:/workspace/notes
+    - shared_state:/workspace/state
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+# Volume list for services that run on the Codex framework (coder-codex-*,
+# reviewer-codex-*, plan_reviewer-codex-*, planner-codex-*). Adds a
+# read-only bind mount of the host ~/.codex so the entrypoint can seed
+# subscription tokens into a container-local CODEX_HOME. Claude-only
+# services (coder-claude-*, reviewer-claude-*, planner-claude-*, conductor,
+# mergemaster, watchdog) inherit &volumes-base instead and never see host
+# Codex credentials.
+x-volumes-codex: &volumes-codex
+  - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
+  - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
+  - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
+  - ${GIT_CREDENTIALS_PATH:-/dev/null}:/home/appuser/.git-credentials:ro
+  - ${SSH_AUTH_SOCK:-/dev/null}:/run/ssh-agent:ro
+  - ${CODEX_HOME:-${HOME}/.codex}:/home/appuser/.codex:ro
+  - bare_repo:/workspace/repo.git
+  - worktrees:/workspace/worktrees
+  - shared_notes:/workspace/notes
+  - shared_state:/workspace/state
+
+services:
+  # ── Conductor (singleton — Claude) ─────────────────────────────────────
+  conductor:
+    <<: *agent-base
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.claude
+    environment:
+      <<: *env-base
+      AGENT_KEY: conductor
+      AGENT_ROLE: conductor
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  # ── Mergemaster (singleton — Claude) ───────────────────────────────────
+  mergemaster:
+    <<: *agent-base
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.claude
+    environment:
+      <<: *env-base
+      AGENT_KEY: mergemaster
+      AGENT_ROLE: mergemaster
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  # ── Planner pool (Claude / Codex profiles) ─────────────────────────────
+  # Both services are profile-gated. `cb up` reads codeband.yaml and
+  # exports COMPOSE_PROFILES based on `planners.{claude_sdk,codex}.count`
+  # so flipping pool counts is enough to switch planner frameworks — no
+  # manual compose edit. If you invoke docker compose directly (without
+  # `cb up`), pass the right profile yourself:
+  # `COMPOSE_PROFILES=claude-planner docker compose up`.
+  planner-claude-0:
+    <<: *agent-base
+    profiles: ["claude-planner"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.claude
+    environment:
+      <<: *env-base
+      AGENT_KEY: planner-claude_sdk-0
+      AGENT_ROLE: planner
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  planner-codex-0:
+    <<: *agent-base
+    profiles: ["codex-planner"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.codex
+    environment:
+      <<: *env-base
+      AGENT_KEY: planner-codex-0
+      AGENT_ROLE: planner
+    volumes: *volumes-codex
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  # ── Plan-Reviewer pool (Claude / Codex profiles) ───────────────────────
+  # Symmetric to the planner pool above — profile-gated so `cb up` activates
+  # the variant your codeband.yaml asks for. Default config has
+  # plan_reviewers.codex.count: 1 (cross-model with the Claude planner).
+  # Inversion: set plan_reviewers.claude_sdk.count: 1 + codex.count: 0,
+  # `cb up` will switch profiles automatically.
+  plan-reviewer-claude-0:
+    <<: *agent-base
+    profiles: ["claude-plan-reviewer"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.claude
+    environment:
+      <<: *env-base
+      AGENT_KEY: plan_reviewer-claude_sdk-0
+      AGENT_ROLE: plan_reviewer
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  plan-reviewer-codex-0:
+    <<: *agent-base
+    profiles: ["codex-plan-reviewer"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.codex
+    environment:
+      <<: *env-base
+      AGENT_KEY: plan_reviewer-codex-0
+      AGENT_ROLE: plan_reviewer
+    volumes: *volumes-codex
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  # ── Coder-Claude-0 (pool) ──────────────────────────────────────────────
+  coder-claude-0:
+    <<: *agent-base
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.claude
+    environment:
+      <<: *env-base
+      AGENT_KEY: coder-claude_sdk-0
+      AGENT_ROLE: coder
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  # ── Coder-Codex-0 (pool) ───────────────────────────────────────────────
+  coder-codex-0:
+    <<: *agent-base
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.codex
+    environment:
+      <<: *env-base
+      AGENT_KEY: coder-codex-0
+      AGENT_ROLE: coder
+    volumes: *volumes-codex
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  # ── Reviewer-Claude-0 (pool — pairs with Codex coders) ─────────────────
+  reviewer-claude-0:
+    <<: *agent-base
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.claude
+    environment:
+      <<: *env-base
+      AGENT_KEY: reviewer-claude_sdk-0
+      AGENT_ROLE: reviewer
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  # ── Reviewer-Codex-0 (pool — pairs with Claude coders) ─────────────────
+  reviewer-codex-0:
+    <<: *agent-base
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.codex
+    environment:
+      <<: *env-base
+      AGENT_KEY: reviewer-codex-0
+      AGENT_ROLE: reviewer
+    volumes: *volumes-codex
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  # ── Watchdog (deterministic daemon — no LLM) ───────────────────────────
+  watchdog:
+    <<: *agent-base
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.claude
+    environment:
+      <<: *env-base
+      AGENT_KEY: watchdog
+      AGENT_ROLE: watchdog
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+volumes:
+  bare_repo:
+  worktrees:
+  shared_notes:
+  shared_state:

@@ -1,0 +1,222 @@
+# Codeband Distributed Docker Compose
+#
+# Template for running agents on separate hosts. Each agent gets its own
+# independent workspace (no shared volumes). Coordination happens via
+# Band.ai WebSocket; code sync via git push/fetch to remote origin.
+#
+# NOTE: All services build from Dockerfile.claude — a unified image that
+# bundles both Claude Code and Codex CLIs (see docker/Dockerfile.claude
+# header). The same image is used for Claude-framework and Codex-framework
+# agents; framework selection happens at runtime via codeband.yaml. The
+# legacy docker/Dockerfile.codex is functionally equivalent and may be
+# retired in a future cleanup.
+#
+# In practice, deploy each service independently on its target host.
+# This file serves as a reference for the required configuration.
+#
+# Usage:
+#   cp .env.example .env                       # Configure API keys
+#   codeband setup-agents                      # Register agents
+#   docker compose -f docker/docker-compose.distributed.yml up conductor
+
+# Shared config bind mounts (repeated per service since YAML list anchors
+# cannot be merged). Each service needs these three read-only mounts.
+# Paths use CODEBAND_PROJECT_DIR (set by `codeband up`, defaults to ".").
+
+x-agent-base: &agent-base
+  restart: unless-stopped
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.claude
+  env_file:
+    - path: ${CODEBAND_PROJECT_DIR:-.}/.env
+      required: false
+  environment: &env-base
+    CODEBAND_CONFIG: /app/config/codeband.yaml
+    DEPLOYMENT_MODE: distributed
+    BAND_REST_URL: ${BAND_REST_URL:-https://app.band.ai}
+    BAND_WS_URL: ${BAND_WS_URL:-wss://app.band.ai/api/v1/socket/websocket}
+    BAND_MEMORY_MODE: ${BAND_MEMORY_MODE:-}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    GH_TOKEN: ${GH_TOKEN:-}
+    GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    REPO_URL: ${REPO_URL:-}
+    REPO_BRANCH: ${REPO_BRANCH:-}
+    CODEBAND_DEBUG: ${CODEBAND_DEBUG:-}
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  # Singletons
+  conductor:
+    <<: *agent-base
+    environment:
+      <<: *env-base
+      AGENT_KEY: conductor
+      AGENT_ROLE: conductor
+    volumes:
+      - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
+      - conductor_workspace:/workspace
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  mergemaster:
+    <<: *agent-base
+    environment:
+      <<: *env-base
+      AGENT_KEY: mergemaster
+      AGENT_ROLE: mergemaster
+    volumes:
+      - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
+      - mergemaster_workspace:/workspace
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  # Pool workers — planner is profile-gated (see docker-compose.yml for
+  # rationale). `cb up` derives the active profile from codeband.yaml's
+  # `planners.{claude_sdk,codex}.count`. For direct docker compose use,
+  # pass `COMPOSE_PROFILES=claude-planner` or `codex-planner` yourself.
+  planner-claude-0:
+    <<: *agent-base
+    profiles: ["claude-planner"]
+    environment:
+      <<: *env-base
+      AGENT_KEY: planner-claude_sdk-0
+      AGENT_ROLE: planner
+    volumes:
+      - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
+      - planner_claude_0_workspace:/workspace
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  planner-codex-0:
+    <<: *agent-base
+    profiles: ["codex-planner"]
+    environment:
+      <<: *env-base
+      AGENT_KEY: planner-codex-0
+      AGENT_ROLE: planner
+    volumes:
+      - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
+      - ${CODEX_HOME:-${HOME}/.codex}:/home/appuser/.codex:ro
+      - planner_codex_0_workspace:/workspace
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  # Plan-reviewer pool — profile-gated, like the planner pool above.
+  # `cb up` derives profiles from codeband.yaml; for direct docker compose
+  # use set `COMPOSE_PROFILES=claude-plan-reviewer` or `codex-plan-reviewer`.
+  plan-reviewer-claude-0:
+    <<: *agent-base
+    profiles: ["claude-plan-reviewer"]
+    environment:
+      <<: *env-base
+      AGENT_KEY: plan_reviewer-claude_sdk-0
+      AGENT_ROLE: plan_reviewer
+    volumes:
+      - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
+      - plan_reviewer_claude_0_workspace:/workspace
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  plan-reviewer-codex-0:
+    <<: *agent-base
+    profiles: ["codex-plan-reviewer"]
+    environment:
+      <<: *env-base
+      AGENT_KEY: plan_reviewer-codex-0
+      AGENT_ROLE: plan_reviewer
+    volumes:
+      - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
+      - ${CODEX_HOME:-${HOME}/.codex}:/home/appuser/.codex:ro
+      - plan_reviewer_codex_0_workspace:/workspace
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  coder-claude-0:
+    <<: *agent-base
+    environment:
+      <<: *env-base
+      AGENT_KEY: coder-claude_sdk-0
+      AGENT_ROLE: coder
+    volumes:
+      - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
+      - coder_claude_0_workspace:/workspace
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  coder-codex-0:
+    <<: *agent-base
+    environment:
+      <<: *env-base
+      AGENT_KEY: coder-codex-0
+      AGENT_ROLE: coder
+    volumes:
+      - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
+      - ${CODEX_HOME:-${HOME}/.codex}:/home/appuser/.codex:ro
+      - coder_codex_0_workspace:/workspace
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  reviewer-claude-0:
+    <<: *agent-base
+    environment:
+      <<: *env-base
+      AGENT_KEY: reviewer-claude_sdk-0
+      AGENT_ROLE: reviewer
+    volumes:
+      - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
+      - reviewer_claude_0_workspace:/workspace
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  reviewer-codex-0:
+    <<: *agent-base
+    environment:
+      <<: *env-base
+      AGENT_KEY: reviewer-codex-0
+      AGENT_ROLE: reviewer
+    volumes:
+      - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
+      - ${CODEX_HOME:-${HOME}/.codex}:/home/appuser/.codex:ro
+      - reviewer_codex_0_workspace:/workspace
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+  watchdog:
+    <<: *agent-base
+    environment:
+      <<: *env-base
+      AGENT_KEY: watchdog
+      AGENT_ROLE: watchdog
+    volumes:
+      - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
+      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
+      - watchdog_workspace:/workspace
+    command: ["python", "-m", "codeband.orchestration.agent_main"]
+
+volumes:
+  conductor_workspace:
+  mergemaster_workspace:
+  planner_claude_0_workspace:
+  planner_codex_0_workspace:
+  plan_reviewer_claude_0_workspace:
+  plan_reviewer_codex_0_workspace:
+  coder_claude_0_workspace:
+  coder_codex_0_workspace:
+  reviewer_claude_0_workspace:
+  reviewer_codex_0_workspace:
+  watchdog_workspace:
