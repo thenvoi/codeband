@@ -94,6 +94,42 @@ def create_worktree(
         _run_git(cmd, cwd=bare_repo)
 
 
+def branch_exists(bare_repo: Path, branch: str) -> bool:
+    """True if ``branch`` resolves to a ref (local head or remote-tracking)."""
+    try:
+        subprocess.run(
+            ["git", "-C", str(bare_repo), "rev-parse", "--verify", "--quiet", branch],
+            check=True, capture_output=True, timeout=10,
+        )
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+
+
+def list_known_branches(bare_repo: Path) -> list[str]:
+    """Return all local + remote-tracking branches, deduplicated and sorted.
+
+    Strips the ``origin/`` prefix so the names match what the user would
+    write in ``codeband.yaml``. Skips ``HEAD`` symrefs.
+    """
+    output = _run_git(
+        ["branch", "-a", "--format=%(refname:short)"], cwd=bare_repo
+    )
+    names: set[str] = set()
+    for line in output.splitlines():
+        name = line.strip()
+        if not name or name == "HEAD":
+            continue
+        if name.startswith("origin/"):
+            stripped = name[len("origin/"):]
+            if stripped == "HEAD":
+                continue
+            names.add(stripped)
+        else:
+            names.add(name)
+    return sorted(names)
+
+
 def remove_worktree(bare_repo: Path, worktree_path: Path) -> None:
     """Remove a git worktree."""
     if not worktree_path.exists():

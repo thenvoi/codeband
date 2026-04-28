@@ -324,13 +324,18 @@ async def _run_preflight(config: CodebandConfig) -> bool:
     on missing credentials and confuse the user with a silent feed.
     Returns True on success, False (and prints) on failure.
     """
+    from codeband.logging_setup import suppress_preflight_sdk_noise
     from codeband.preflight import run_preflight
 
-    err = await run_preflight(config)
+    with suppress_preflight_sdk_noise():
+        err = await run_preflight(config)
     if err is not None:
-        println(f"Error: {err.summary}")
-        println("")
-        println(err.remediation)
+        if err.classified:
+            println(f"Error: {err.remediation}")
+        else:
+            println(f"Error: {err.summary}")
+            println("")
+            println(err.remediation)
         return False
     return True
 

@@ -24,10 +24,17 @@ logger = logging.getLogger(__name__)
 @dataclasses.dataclass(frozen=True)
 class PreflightError:
     """A preflight failure — summary describes what happened, remediation
-    tells the user how to fix it."""
+    tells the user how to fix it.
+
+    ``classified`` is True when a known pattern matched the failure text;
+    in that case the remediation is self-explanatory and the cli prints
+    only that line. False means we couldn't classify it, so the summary
+    is the only diagnostic available and must be shown to the user.
+    """
 
     summary: str
     remediation: str
+    classified: bool = False
 
 
 # Ordered list of (lower-case substring, remediation). First match wins.
@@ -65,6 +72,43 @@ _CLAUDE_ERROR_PATTERNS: list[tuple[str, str]] = [
             "Claude Pro/Max usage limit reached. Wait for reset, upgrade the "
             "subscription, or fall back to ANTHROPIC_API_KEY."
         ),
+    ),
+    (
+        # Newer Claude CLI wording, e.g.
+        # "You've hit your limit · resets 1:10am (America/Los_Angeles)".
+        "hit your limit",
+        (
+            "Claude Pro/Max usage limit reached. Wait for reset, upgrade the "
+            "subscription, or fall back to ANTHROPIC_API_KEY."
+        ),
+    ),
+    (
+        # Stream-json event the CLI emits on stdout when a Pro/Max usage
+        # limit is rejected. Captured by ``utility_llm.one_shot_text`` and
+        # appended to the exception message.
+        "status=rejected",
+        (
+            "Claude Pro/Max usage limit reached. Wait for reset, upgrade the "
+            "subscription, or fall back to ANTHROPIC_API_KEY."
+        ),
+    ),
+    (
+        # ``AssistantMessage.error`` literal from the API — billing path.
+        "assistant_message_error=billing_error",
+        (
+            "Top up at https://console.anthropic.com/settings/billing, or "
+            "switch to a Claude Pro/Max OAuth token (run `claude setup-token` "
+            "and set CLAUDE_CODE_OAUTH_TOKEN in .env), or — on macOS — "
+            "`claude` login to seed the keychain and unset ANTHROPIC_API_KEY."
+        ),
+    ),
+    (
+        "assistant_message_error=authentication_failed",
+        "Claude authentication failed. Verify ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN.",
+    ),
+    (
+        "assistant_message_error=rate_limit",
+        "Claude rate limit hit. Wait a moment, or switch auth method.",
     ),
     (
         "rate_limit_error",
@@ -180,6 +224,7 @@ async def check_codex_auth() -> PreflightError | None:
             return PreflightError(
                 summary=f"Codex auth check failed: {' / '.join(preview)[:300]}",
                 remediation=remediation,
+                classified=True,
             )
     # Non-zero exit without a recognized pattern is still a failure signal.
     if returncode != 0:
@@ -206,12 +251,27 @@ async def check_claude_auth() -> PreflightError | None:
     try:
         result = await one_shot_text("Reply with just: ok")
     except Exception as exc:
+        # Usage-limit, auth, and rate-limit failures surface here too: the
+        # CLI exits non-zero and ``one_shot_text`` re-raises with stderr
+        # and structured stream-json context appended. Run the same pattern
+        # matcher so the user sees the specific remediation, not a generic
+        # "check auth" hint.
+        message = f"{type(exc).__name__}: {exc}"
+        haystack = message.lower()
+        for pattern, remediation in _CLAUDE_ERROR_PATTERNS:
+            if pattern in haystack:
+                return PreflightError(
+                    summary=f"Claude auth check failed: {exc}",
+                    remediation=remediation,
+                    classified=True,
+                )
         return PreflightError(
-            summary=f"Claude SDK call raised {type(exc).__name__}: {exc}",
+            summary=f"Claude SDK call raised {message}",
             remediation=(
                 "Check Claude CLI auth (ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, "
                 "or macOS keychain via `claude` login) and network connectivity."
             ),
+            classified=False,
         )
 
     haystack = result.lower()
@@ -220,6 +280,7 @@ async def check_claude_auth() -> PreflightError | None:
             return PreflightError(
                 summary=f"Claude auth check failed: {result.strip()}",
                 remediation=remediation,
+                classified=True,
             )
 
     return None

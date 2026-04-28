@@ -98,6 +98,128 @@ class TestCheckClaudeAuth:
         assert "network down" in err.summary
 
     @pytest.mark.asyncio
+    async def test_detects_usage_limit_via_exception(self):
+        """Usage-limit failures come through the exception path: the CLI
+        exits 1 with the limit message on stderr, and ``one_shot_text``
+        re-raises with stderr appended. Preflight must still classify it
+        as a usage-limit error, not a generic crash.
+        """
+        from codeband.preflight import check_claude_auth
+
+        # ``one_shot_text`` (post-fix) re-raises with the captured stderr in
+        # the exception message — the pattern matcher must inspect that.
+        exc = RuntimeError(
+            "Command failed with exit code 1\n"
+            "claude stderr: You've hit your limit · resets 1:10am (America/Los_Angeles)"
+        )
+        with patch(
+            "codeband.utility_llm.one_shot_text",
+            AsyncMock(side_effect=exc),
+        ):
+            err = await check_claude_auth()
+        assert err is not None
+        assert "usage limit" in err.remediation.lower()
+
+    @pytest.mark.asyncio
+    async def test_detects_credit_balance_via_exception(self):
+        """Same path for the API-key billing failure — must classify off
+        the exception text rather than collapsing to ``RuntimeError: ...``.
+        """
+        from codeband.preflight import check_claude_auth
+
+        exc = RuntimeError(
+            "Command failed with exit code 1\n"
+            "claude stderr: Credit balance is too low to access the API."
+        )
+        with patch(
+            "codeband.utility_llm.one_shot_text",
+            AsyncMock(side_effect=exc),
+        ):
+            err = await check_claude_auth()
+        assert err is not None
+        assert "billing" in err.remediation.lower()
+
+    @pytest.mark.asyncio
+    async def test_detects_rate_limit_event_rejected(self):
+        """``RateLimitEvent`` with ``status=rejected`` is the structured
+        signal the CLI emits via stdout JSON when a usage limit is hit.
+        Preflight must classify it as a usage-limit failure."""
+        from codeband.preflight import check_claude_auth
+
+        exc = RuntimeError(
+            "Command failed with exit code 1\n"
+            "rate_limit_event status=rejected resets_at=2026-04-28T08:10:00Z"
+        )
+        with patch(
+            "codeband.utility_llm.one_shot_text",
+            AsyncMock(side_effect=exc),
+        ):
+            err = await check_claude_auth()
+        assert err is not None
+        assert "usage limit" in err.remediation.lower()
+
+    @pytest.mark.asyncio
+    async def test_detects_assistant_message_error_rate_limit(self):
+        from codeband.preflight import check_claude_auth
+
+        exc = RuntimeError(
+            "Command failed with exit code 1\n"
+            "assistant_message_error=rate_limit"
+        )
+        with patch(
+            "codeband.utility_llm.one_shot_text",
+            AsyncMock(side_effect=exc),
+        ):
+            err = await check_claude_auth()
+        assert err is not None
+        assert "rate limit" in err.remediation.lower()
+
+    @pytest.mark.asyncio
+    async def test_detects_assistant_message_error_billing(self):
+        from codeband.preflight import check_claude_auth
+
+        exc = RuntimeError(
+            "Command failed with exit code 1\n"
+            "assistant_message_error=billing_error"
+        )
+        with patch(
+            "codeband.utility_llm.one_shot_text",
+            AsyncMock(side_effect=exc),
+        ):
+            err = await check_claude_auth()
+        assert err is not None
+        assert "billing" in err.remediation.lower()
+
+    @pytest.mark.asyncio
+    async def test_classified_flag_set_when_pattern_matches(self):
+        """When a pattern matches, ``classified`` is True so cli.py knows
+        the remediation is self-explanatory and can skip the noisy summary
+        (which dumps the SDK exception text)."""
+        from codeband.preflight import check_claude_auth
+
+        with patch(
+            "codeband.utility_llm.one_shot_text",
+            AsyncMock(return_value="Credit balance is too low"),
+        ):
+            err = await check_claude_auth()
+        assert err is not None
+        assert err.classified is True
+
+    @pytest.mark.asyncio
+    async def test_classified_flag_unset_when_no_pattern_matches(self):
+        """Unclassified failures keep ``classified=False`` so cli.py prints
+        the summary too — it's the only diagnostic available."""
+        from codeband.preflight import check_claude_auth
+
+        with patch(
+            "codeband.utility_llm.one_shot_text",
+            AsyncMock(side_effect=RuntimeError("totally unknown failure mode")),
+        ):
+            err = await check_claude_auth()
+        assert err is not None
+        assert err.classified is False
+
+    @pytest.mark.asyncio
     async def test_match_is_case_insensitive(self):
         from codeband.preflight import check_claude_auth
 

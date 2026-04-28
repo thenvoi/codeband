@@ -413,10 +413,23 @@ def run(agent: str | None, debug: bool, project_dir: str, skip_preflight: bool) 
         logging.getLogger("asyncio").setLevel(logging.ERROR)
 
     if not skip_preflight:
+        from codeband.logging_setup import suppress_preflight_sdk_noise
         from codeband.preflight import run_preflight
 
-        err = asyncio.run(run_preflight(config))
+        # The SDK logs ``Fatal error in message reader: Command failed …``
+        # at ERROR level for every non-zero CLI exit. Outside preflight
+        # that's a load-bearing failure signal (see logging_setup.py),
+        # but here we already classify and print the failure cleanly, so
+        # the log line is pure noise. Scope the suppression to just this
+        # call.
+        with suppress_preflight_sdk_noise():
+            err = asyncio.run(run_preflight(config))
         if err is not None:
+            # Classified failures: the remediation already names what
+            # went wrong. The summary just dumps SDK exception text and
+            # structured context — useful for --debug, never for users.
+            if err.classified:
+                raise click.ClickException(err.remediation)
             raise click.ClickException(f"{err.summary}\n\n{err.remediation}")
 
     if agent:

@@ -102,3 +102,55 @@ class TestInstallIdempotent:
         logger = logging.getLogger(_ADAPTER_LOGGER)
         matches = [f for f in logger.filters if isinstance(f, _SessionResumeFilter)]
         assert len(matches) == 1
+
+
+class TestSuppressPreflightSdkNoise:
+    """During preflight we already classify failures cleanly — the SDK's
+    own ``Fatal error in message reader`` ERROR log is pure noise. Outside
+    preflight it stays a load-bearing failure signal (see the
+    ``TestPreservesRealFailures`` tests above), so suppression must be
+    strictly scoped to the context manager."""
+
+    def test_suppresses_message_reader_error_inside_context(self):
+        from codeband.logging_setup import suppress_preflight_sdk_noise
+
+        sdk_logger = logging.getLogger("claude_agent_sdk._internal.query")
+        outer_filter_count = len(sdk_logger.filters)
+
+        with suppress_preflight_sdk_noise():
+            # During the context, the SDK logger has a filter that drops
+            # ERROR records.
+            r = _make_record(
+                "claude_agent_sdk._internal.query",
+                logging.ERROR,
+                "Fatal error in message reader: Command failed with exit code 1",
+            )
+            assert any(f.filter(r) is False for f in sdk_logger.filters), (
+                "expected an installed filter to suppress the message-reader ERROR"
+            )
+
+        # After the context, no extra filters remain on the SDK logger.
+        assert len(sdk_logger.filters) == outer_filter_count
+
+    def test_does_not_suppress_outside_context(self):
+        """Sanity-check the scoping — without the context manager, the SDK
+        logger has no extra filter, so ERROR records pass through."""
+        from codeband.logging_setup import suppress_preflight_sdk_noise
+
+        sdk_logger = logging.getLogger("claude_agent_sdk._internal.query")
+        # Establish baseline.
+        with suppress_preflight_sdk_noise():
+            pass
+
+        # After: any newly created log record is not blocked by a residual
+        # filter.
+        r = _make_record(
+            "claude_agent_sdk._internal.query",
+            logging.ERROR,
+            "Fatal error in message reader: Command failed with exit code 1",
+        )
+        # Filters may exist from other tests, but none should drop this record.
+        for f in sdk_logger.filters:
+            assert f.filter(r) is not False, (
+                f"residual filter {f!r} is suppressing ERROR outside the context"
+            )

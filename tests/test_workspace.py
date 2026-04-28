@@ -19,6 +19,7 @@ from codeband.workspace.git import (
 from codeband.workspace.init import (
     _validate_workspace_root,
     initialize_agent_workspace,
+    initialize_workspace,
     resolve_layout,
 )
 
@@ -129,6 +130,50 @@ class TestGitOperations:
         create_worktree(bare, wt, "codeband/player-0/test")
         # Should not raise
         commit_and_push(wt, "No changes", remote="origin")
+
+    def test_branch_exists_finds_default_branch(
+        self, source_repo: Path, tmp_path: Path
+    ):
+        """Knows the source repo's default branch is present in the bare clone."""
+        from codeband.workspace.git import branch_exists
+
+        bare = tmp_path / "bare.git"
+        clone_bare(str(source_repo), bare)
+
+        # Discover the actual default branch (master or main, depending on
+        # the host's git config).
+        default = subprocess.run(
+            ["git", "-C", str(source_repo), "branch", "--show-current"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        assert branch_exists(bare, default) is True
+
+    def test_branch_exists_returns_false_for_missing(
+        self, source_repo: Path, tmp_path: Path
+    ):
+        from codeband.workspace.git import branch_exists
+
+        bare = tmp_path / "bare.git"
+        clone_bare(str(source_repo), bare)
+
+        assert branch_exists(bare, "definitely-not-a-real-branch") is False
+
+    def test_list_known_branches_returns_default(
+        self, source_repo: Path, tmp_path: Path
+    ):
+        from codeband.workspace.git import list_known_branches
+
+        bare = tmp_path / "bare.git"
+        clone_bare(str(source_repo), bare)
+
+        default = subprocess.run(
+            ["git", "-C", str(source_repo), "branch", "--show-current"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        branches = list_known_branches(bare)
+        assert default in branches
 
 
 class TestWorktreeClaudeSettings:
@@ -379,6 +424,96 @@ class TestAgentWorkspaceInit:
         # Both have the repo content
         assert (layout1.worktree / "README.md").exists()
         assert (layout2.worktree / "README.md").exists()
+
+
+class TestInitializeWorkspaceBranchValidation:
+    """Pre-validate ``config.repo.branch`` against the cloned repo so the
+    user gets a clean message naming codeband.yaml — not a raw
+    ``git worktree add … fatal: invalid reference: main`` traceback.
+    """
+
+    @pytest.fixture
+    def source_repo(self, tmp_path: Path) -> Path:
+        repo = tmp_path / "source"
+        repo.mkdir()
+        # Force ``master`` so the test is deterministic regardless of the
+        # host's ``init.defaultBranch`` setting.
+        subprocess.run(
+            ["git", "init", "-b", "master", str(repo)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "test@test.com"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "Test"],
+            check=True, capture_output=True,
+        )
+        (repo / "README.md").write_text("# Test")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "Initial"],
+            check=True, capture_output=True,
+        )
+        return repo
+
+    def _config_for(self, source_repo: Path, branch: str, tmp_path: Path):
+        from codeband.config import (
+            AgentsConfig,
+            CodebandConfig,
+            ConductorConfig,
+            FrameworkPool,
+            MergemasterConfig,
+            PlanReviewersConfig,
+            PoolEntry,
+            RepoConfig,
+            ReviewersConfig,
+            WatchdogConfig,
+            WorkspaceConfig,
+        )
+        return CodebandConfig(
+            repo=RepoConfig(url=str(source_repo), branch=branch),
+            agents=AgentsConfig(
+                conductor=ConductorConfig(model="claude-sonnet-4-6"),
+                mergemaster=MergemasterConfig(),
+                planners=FrameworkPool(
+                    claude_sdk=PoolEntry(count=1, model="claude-sonnet-4-6"),
+                ),
+                plan_reviewers=PlanReviewersConfig(),
+                coders=FrameworkPool(
+                    claude_sdk=PoolEntry(count=1, model="claude-sonnet-4-6"),
+                ),
+                reviewers=ReviewersConfig(
+                    claude_sdk=PoolEntry(count=1, model="claude-sonnet-4-6"),
+                ),
+                watchdog=WatchdogConfig(),
+            ),
+            workspace=WorkspaceConfig(path=str(tmp_path / "workspace")),
+        )
+
+    def test_invalid_branch_raises_friendly_error(
+        self, source_repo: Path, tmp_path: Path
+    ):
+        from codeband.workspace.git import WorkspaceError
+
+        config = self._config_for(source_repo, "main", tmp_path)
+        with pytest.raises(WorkspaceError) as exc:
+            initialize_workspace(config)
+
+        msg = str(exc.value)
+        assert "main" in msg, "must name the configured branch"
+        assert "codeband.yaml" in msg, "must point user at the config field"
+        assert "master" in msg, "must list the actual branch(es) so user knows what to set"
+        # Negative: the raw git CLI noise should NOT be in the friendly message.
+        assert "git worktree add" not in msg
+        assert "fatal: invalid reference" not in msg
+
+    def test_valid_branch_succeeds(self, source_repo: Path, tmp_path: Path):
+        """Sanity-check: a correctly configured branch still works."""
+        config = self._config_for(source_repo, "master", tmp_path)
+        # Should not raise.
+        initialize_workspace(config)
 
 
 class TestResolveLayout:

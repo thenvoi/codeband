@@ -18,7 +18,13 @@ from typing import Literal
 
 from codeband.config import CodebandConfig, Framework, FrameworkPool, PoolEntry
 from codeband.workers import WorkerId, WorkerRole
-from codeband.workspace.git import clone_bare, create_worktree
+from codeband.workspace.git import (
+    WorkspaceError,
+    branch_exists,
+    clone_bare,
+    create_worktree,
+    list_known_branches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +131,26 @@ def initialize_workspace(config: CodebandConfig) -> WorkspaceLayout:
 
     # Clone bare repo
     clone_bare(config.repo.url, layout.bare_repo)
+
+    # Validate ``config.repo.branch`` exists in the cloned repo before any
+    # worktree creation. Without this, ``git worktree add -b … <branch>``
+    # fails with an opaque ``fatal: invalid reference: <branch>`` deep in
+    # the orchestrator stack — useless for a user who just wants to know
+    # they typed the wrong branch in codeband.yaml (commonly ``main`` vs
+    # ``master``).
+    if not branch_exists(layout.bare_repo, config.repo.branch):
+        available = list_known_branches(layout.bare_repo)
+        if not available:
+            available_str = "<none — repo appears empty>"
+        elif len(available) <= 10:
+            available_str = ", ".join(available)
+        else:
+            available_str = ", ".join(available[:10]) + f", … ({len(available) - 10} more)"
+        raise WorkspaceError(
+            f"Branch '{config.repo.branch}' does not exist in {config.repo.url}. "
+            f"Update `repo.branch` in codeband.yaml. "
+            f"Available: {available_str}."
+        )
 
     # Coder worktrees — workspace branch per worker
     prefix = config.workspace.worktree_prefix

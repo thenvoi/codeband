@@ -23,8 +23,11 @@ real failures visible.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
+from typing import Iterator
 
 _ADAPTER_LOGGER = "thenvoi.adapters.claude_sdk"
+_SDK_QUERY_LOGGER = "claude_agent_sdk._internal.query"
 
 _FRIENDLY_MSG = (
     "Claude session reset after container recreation (expected); starting fresh."
@@ -53,3 +56,35 @@ def install_session_resume_filter() -> None:
     logger = logging.getLogger(_ADAPTER_LOGGER)
     if not any(isinstance(f, _SessionResumeFilter) for f in logger.filters):
         logger.addFilter(_SessionResumeFilter())
+
+
+class _DropMessageReaderErrorFilter(logging.Filter):
+    """Drop the SDK's ``Fatal error in message reader`` ERROR records.
+
+    Scoped via :func:`suppress_preflight_sdk_noise` only — see the
+    module docstring for why we do NOT drop these unconditionally.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (
+            record.name == _SDK_QUERY_LOGGER and record.levelno >= logging.ERROR
+        )
+
+
+@contextmanager
+def suppress_preflight_sdk_noise() -> Iterator[None]:
+    """Silence the SDK's noisy ``Fatal error in message reader`` ERROR
+    log for the duration of the ``with`` block.
+
+    Use only around the preflight call: preflight already classifies the
+    failure and prints a clean remediation, so the SDK's raw log line is
+    pure noise. Outside this scope the log stays load-bearing — see the
+    rationale in the module docstring at the top of this file.
+    """
+    logger = logging.getLogger(_SDK_QUERY_LOGGER)
+    flt = _DropMessageReaderErrorFilter()
+    logger.addFilter(flt)
+    try:
+        yield
+    finally:
+        logger.removeFilter(flt)

@@ -48,6 +48,71 @@ class TestRunOutput:
         assert "stopped" in result.output.lower()
 
 
+class TestPreflightErrorOutput:
+    """Verify 'cb run' prints a clean preflight error: just the actionable
+    remediation when classified, summary + remediation when unclassified.
+
+    The diagnostic context (SDK exception text, structured error fields) is
+    kept inside the exception itself for --debug, but never user-facing on
+    a classified failure — that's pure noise.
+    """
+
+    @patch("codeband.cli.load_config")
+    @patch("codeband.preflight.run_preflight", new_callable=AsyncMock)
+    def test_classified_error_shows_only_remediation(
+        self, mock_run_preflight, mock_load_config, tmp_path
+    ):
+        from codeband.preflight import PreflightError
+
+        mock_load_config.return_value = _make_mock_config()
+        mock_run_preflight.return_value = PreflightError(
+            summary=(
+                "Claude auth check failed: Command failed with exit code 1\n"
+                "rate_limit_event status=rejected resets_at=1777363800 "
+                "type=five_hour\nassistant_message_error=rate_limit"
+            ),
+            remediation=(
+                "Claude Pro/Max usage limit reached. Wait for reset, upgrade "
+                "the subscription, or fall back to ANTHROPIC_API_KEY."
+            ),
+            classified=True,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["run", "--dir", str(tmp_path)])
+
+        assert result.exit_code != 0
+        assert "Claude Pro/Max usage limit reached" in result.output
+        assert "rate_limit_event" not in result.output
+        assert "Command failed with exit code" not in result.output
+        assert "assistant_message_error" not in result.output
+
+    @patch("codeband.cli.load_config")
+    @patch("codeband.preflight.run_preflight", new_callable=AsyncMock)
+    def test_unclassified_error_shows_summary_and_remediation(
+        self, mock_run_preflight, mock_load_config, tmp_path
+    ):
+        from codeband.preflight import PreflightError
+
+        mock_load_config.return_value = _make_mock_config()
+        mock_run_preflight.return_value = PreflightError(
+            summary="Claude SDK call raised RuntimeError: totally novel failure",
+            remediation=(
+                "Check Claude CLI auth (ANTHROPIC_API_KEY, "
+                "CLAUDE_CODE_OAUTH_TOKEN, or macOS keychain via `claude` "
+                "login) and network connectivity."
+            ),
+            classified=False,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["run", "--dir", str(tmp_path)])
+
+        assert result.exit_code != 0
+        assert "totally novel failure" in result.output
+        assert "Check Claude CLI auth" in result.output
+
+
 class TestRunDebugFlag:
     """Verify --debug flag controls logging verbosity."""
 
