@@ -17,7 +17,7 @@ For larger behavior changes, open an issue first so we can agree on the shape be
 ## Development Setup
 
 ```bash
-git clone https://github.com/band-ai/codeband.git
+git clone https://github.com/thenvoi/codeband.git
 cd codeband
 python -m venv .venv
 source .venv/bin/activate

@@ -33,13 +33,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 
-[project.urls]
-Homepage = "https://github.com/band-ai/codeband"
-Documentation = "https://github.com/band-ai/codeband#documentation"
-Repository = "https://github.com/band-ai/codeband"
-Issues = "https://github.com/band-ai/codeband/issues"
-Changelog = "https://github.com/band-ai/codeband/blob/main/CHANGELOG.md"
-
 dependencies = [
     "band-sdk[codex,claude-sdk]>=0.2.8",
     "click>=8.1",
@@ -60,6 +53,13 @@ dev = [
 [project.scripts]
 cb = "codeband.cli:cli"
 codeband = "codeband.cli:cli"
+
+[project.urls]
+Homepage = "https://github.com/thenvoi/codeband"
+Documentation = "https://github.com/thenvoi/codeband#documentation"
+Repository = "https://github.com/thenvoi/codeband"
+Issues = "https://github.com/thenvoi/codeband/issues"
+Changelog = "https://github.com/thenvoi/codeband/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]

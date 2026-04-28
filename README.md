@@ -7,7 +7,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/codeband.svg)](https://pypi.org/project/codeband/)
-[![GitHub stars](https://img.shields.io/github/stars/band-ai/codeband?style=social)](https://github.com/band-ai/codeband)
+[![GitHub stars](https://img.shields.io/github/stars/thenvoi/codeband?style=social)](https://github.com/thenvoi/codeband)
 
 **Adversarial multi-model coding agents via [Band.ai](https://band.ai).**
 
@@ -204,7 +204,7 @@ Current planned work:
 Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), and please open an issue before large behavior changes.
 
 ```bash
-git clone https://github.com/band-ai/codeband.git
+git clone https://github.com/thenvoi/codeband.git
 cd codeband
 pip install -e ".[dev]"
 
