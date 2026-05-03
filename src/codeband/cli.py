@@ -44,7 +44,7 @@ def _load_project_dotenv(project_dir: str) -> None:
 
 
 def _init_project_env(project_dir: str) -> None:
-    """Load ``.env`` for a project dir then re-resolve Claude auth.
+    """Load ``.env`` for a project dir then re-resolve LLM auth.
 
     Call this at the top of every subcommand body that takes ``--dir``.
     The cli group also calls it, but only on the bare-cb path — when a
@@ -53,6 +53,7 @@ def _init_project_env(project_dir: str) -> None:
     """
     _load_project_dotenv(project_dir)
     _resolve_claude_auth()
+    _resolve_codex_auth()
 
 
 def _project_aware(fn):
@@ -139,7 +140,9 @@ def _resolve_claude_auth() -> None:
     The Claude CLI's own precedence (per its docs) puts ``ANTHROPIC_API_KEY``
     *above* subscription OAuth — so without intervention, a user with both a
     subscription and an API key in ``.env`` would silently pay per token.
-    We strip ``ANTHROPIC_API_KEY`` when any OAuth source is present:
+    We strip ``ANTHROPIC_API_KEY`` when any OAuth source is present, but keep
+    a process-local backup so preflight can fall back only if the subscription
+    path reports a usage-limit exhaustion:
       1. ``CLAUDE_CODE_OAUTH_TOKEN`` env var, or
       2. subscription credential on disk / keychain (see
          ``_has_claude_subscription_oauth``).
@@ -154,7 +157,46 @@ def _resolve_claude_auth() -> None:
         os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
         or _has_claude_subscription_oauth()
     ):
+        os.environ.setdefault(
+            "CODEBAND_FALLBACK_ANTHROPIC_API_KEY",
+            os.environ["ANTHROPIC_API_KEY"],
+        )
         del os.environ["ANTHROPIC_API_KEY"]
+
+
+def _codex_auth_file() -> Path:
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    return codex_home / "auth.json"
+
+
+def _has_codex_subscription_auth() -> bool:
+    auth_file = _codex_auth_file()
+    if not auth_file.is_file():
+        return False
+    try:
+        content = auth_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return '"auth_mode": "ChatGPT"' in content
+
+
+def _resolve_codex_auth() -> None:
+    """Prefer Codex ChatGPT subscription auth over API key at startup.
+
+    Like Claude auth, Codeband should not silently burn API credits while the
+    subscription path is usable. If ``OPENAI_API_KEY`` is set alongside a
+    logged-in Codex ChatGPT subscription, strip the key from the active
+    environment but keep a process-local fallback. Preflight restores it only
+    if the subscription path reports usage-limit exhaustion.
+    """
+    if not os.environ.get("OPENAI_API_KEY"):
+        return
+    if _has_codex_subscription_auth():
+        os.environ.setdefault(
+            "CODEBAND_FALLBACK_OPENAI_API_KEY",
+            os.environ["OPENAI_API_KEY"],
+        )
+        del os.environ["OPENAI_API_KEY"]
 
 
 @click.group(invoke_without_command=True)
@@ -242,15 +284,15 @@ def init(repo: str, branch: str, project_dir: str) -> None:
         "# Used by every Claude-based agent (Conductor, Planner, Coders,\n"
         "# Reviewers, Mergemaster) and the cb prs/issues --smart helpers.\n"
         "#\n"
-        "# Codeband resolves Claude auth in this order at startup:\n"
+        "# Codeband starts with subscription auth when available:\n"
         "#   1. CLAUDE_CODE_OAUTH_TOKEN env var (from `claude setup-token`)\n"
         "#   2. Host subscription OAuth, picked up automatically:\n"
         "#        macOS: Keychain entry from `claude` login\n"
         "#        Linux/Windows: $CLAUDE_CONFIG_DIR/.credentials.json\n"
         "#        (default ~/.claude/.credentials.json)\n"
-        "#   3. ANTHROPIC_API_KEY (last-resort pay-per-token)\n"
-        "# Codeband auto-strips ANTHROPIC_API_KEY when (1) or (2) is present,\n"
-        "# so the subscription path wins and you don't silently burn API credits.\n"
+        "#   3. ANTHROPIC_API_KEY fallback only if subscription usage is exhausted\n"
+        "# Codeband auto-strips ANTHROPIC_API_KEY while subscription auth is usable,\n"
+        "# then restores it only after a Claude Pro/Max usage-limit error.\n"
         "#\n"
         "# Option A: Anthropic API key — pay-per-token, no subscription caps.\n"
         "ANTHROPIC_API_KEY=sk-ant-...\n"
@@ -263,14 +305,11 @@ def init(repo: str, branch: str, project_dir: str) -> None:
         "# automatically.)\n"
         "#\n"
         "# ── Codex authentication (optional, for Codex agents) ───────────\n"
-        "# Unlike Claude, Codex is API-KEY-FIRST by default: when both are\n"
-        "# present, OPENAI_API_KEY wins. Rationale: parallel Codex workers\n"
-        "# can exhaust a ChatGPT subscription's quota quickly, and OpenAI's\n"
-        "# own docs recommend API keys for automation.\n"
-        "#\n"
-        "# Either set OPENAI_API_KEY below, or run `codex login --device-auth`\n"
-        "# on the host (works locally and in Docker — your ~/.codex is mounted\n"
-        "# into containers). If you don't use Codex agents, leave this unset.\n"
+        "# Codeband starts with ChatGPT subscription auth when available\n"
+        "# (`codex login --device-auth`, stored in ~/.codex/auth.json).\n"
+        "# If OPENAI_API_KEY is also set, it is used only after Codex reports\n"
+        "# a subscription usage-limit error. If you don't use Codex agents,\n"
+        "# leave this unset.\n"
         "OPENAI_API_KEY=sk-...\n"
         "#\n"
         "# ── Platform & GitHub ───────────────────────────────────────────\n"
@@ -789,7 +828,7 @@ def doctor(project_dir: str) -> None:
 @cli.command()
 @click.option("--dir", "project_dir", default=".", help="Project directory")
 @_project_aware
-def pending(project_dir: str) -> None:
+def pending(project_dir: str, command_style: str = "cli") -> None:
     """Show PRs with risk classification and merge eligibility."""
     import json
     import re
@@ -883,8 +922,14 @@ def pending(project_dir: str) -> None:
     if policy == "none":
         click.echo("\n  Policy: none — all PRs require human approval.")
     click.echo()
-    click.echo("  Approve:  cb approve <number>")
-    click.echo("  Reject:   cb reject <number> --reason \"...\"")
+    if command_style == "slash":
+        approve_hint = "/approve <number>"
+        reject_hint = "/reject <number> --reason \"...\""
+    else:
+        approve_hint = "cb approve <number>"
+        reject_hint = "cb reject <number> --reason \"...\""
+    click.echo(f"  Approve:  {approve_hint}")
+    click.echo(f"  Reject:   {reject_hint}")
     click.echo("=" * 80)
     click.echo()
 
@@ -893,7 +938,7 @@ def pending(project_dir: str) -> None:
 @click.argument("number", type=int)
 @click.option("--dir", "project_dir", default=".", help="Project directory")
 @_project_aware
-def approve(number: int, project_dir: str) -> None:
+def approve(number: int, project_dir: str, command_style: str = "cli") -> None:
     """Approve a PR for merge (sends approval to Conductor in existing task room)."""
     project = Path(project_dir).resolve()
     config = load_config(project)
@@ -911,7 +956,9 @@ def approve(number: int, project_dir: str) -> None:
 
     from codeband.orchestration.kickoff import send_room_message
 
-    _run_async(send_room_message(config, project, message))
+    _run_async(send_room_message(
+        config, project, message, command_style=command_style,
+    ))
 
 
 @cli.command()
@@ -919,7 +966,12 @@ def approve(number: int, project_dir: str) -> None:
 @click.option("--reason", default=None, help="Reason for rejection")
 @click.option("--dir", "project_dir", default=".", help="Project directory")
 @_project_aware
-def reject(number: int, reason: str | None, project_dir: str) -> None:
+def reject(
+    number: int,
+    reason: str | None,
+    project_dir: str,
+    command_style: str = "cli",
+) -> None:
     """Reject a PR (sends rejection to Conductor in existing task room)."""
     project = Path(project_dir).resolve()
     config = load_config(project)
@@ -938,7 +990,9 @@ def reject(number: int, reason: str | None, project_dir: str) -> None:
 
     from codeband.orchestration.kickoff import send_room_message
 
-    _run_async(send_room_message(config, project, message))
+    _run_async(send_room_message(
+        config, project, message, command_style=command_style,
+    ))
 
 
 @cli.command()
@@ -1361,4 +1415,3 @@ def _detect_github_auth(env: dict[str, str]) -> None:
     token = result.stdout.strip()
     if token:
         env.setdefault("GH_TOKEN", token)
-

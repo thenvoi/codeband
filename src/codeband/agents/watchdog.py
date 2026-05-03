@@ -163,9 +163,11 @@ class WatchdogDaemon:
 
         The Conductor writes these envelopes (see ``prompts/conductor.md``):
         ``swarm status active task <slug>`` when accepting a new user task,
+        ``swarm status waiting_human_approval task <slug> pr <N>`` while a PR
+        is blocked on a human merge decision, and
         ``swarm status complete task <slug>`` when reporting completion. We
-        gate patrols on this so a fully-idle swarm is not poked between
-        user tasks.
+        gate patrols on this so a fully-idle or correctly-waiting swarm is not
+        poked between actionable steps.
         """
         try:
             if self._memory_store is not None:
@@ -231,20 +233,22 @@ class WatchdogDaemon:
         """Single patrol cycle: check all rooms for stale agents."""
         now = datetime.now(UTC)
 
-        # Gate: if the Conductor has reported task completion to the user
-        # within the idle-grace window, the swarm has nothing to do — skip
-        # nudging entirely. Falls through (today's time-based behavior) when
-        # no envelope exists, so a fresh swarm or one whose Conductor has
-        # not yet adopted the protocol is unaffected.
+        # Gate: if the Conductor has reported task completion or is waiting on
+        # a human merge approval within the idle-grace window, the agents have
+        # nothing actionable to do — skip nudging entirely. Falls through
+        # (today's time-based behavior) when no envelope exists, so a fresh
+        # swarm or one whose Conductor has not yet adopted the protocol is
+        # unaffected.
         status = await self._read_latest_swarm_status()
         if status is not None:
             state, written_at = status
             grace = timedelta(seconds=self._config.swarm_idle_grace_seconds)
-            if state == "complete" and now - written_at < grace:
+            if state in {"complete", "waiting_human_approval"} and now - written_at < grace:
                 if not self._idle_skip_logged:
                     logger.info(
-                        "Watchdog: swarm status is 'complete' (written %ds ago) — "
+                        "Watchdog: swarm status is '%s' (written %ds ago) — "
                         "suppressing nudges until grace window of %ds elapses",
+                        state,
                         int((now - written_at).total_seconds()),
                         self._config.swarm_idle_grace_seconds,
                     )

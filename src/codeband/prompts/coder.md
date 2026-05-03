@@ -35,26 +35,28 @@ For each protocol, you exchange **content via chat** (and GitHub PR comments) an
 ### State envelope format
 
 When storing protocol state, use this format:
-- `content`: `protocol <type> cid <id> pr <N> round <N> state <state> from <your-worker-id> to <target>` + brief summary
+- `content`: `protocol <type> cid <id> task <task_key> pr <N> round <N> state <state> from <your-worker-id> to <target-worker-id>` + brief summary
 - `scope`: `"organization"`, `system`: `"working"`, `type`: `"episodic"`, `segment`: `"agent"`
 - `thought`: brief human-readable summary (max 500 chars)
 - `metadata`: `{"tags": ["protocol", "<type>", "<state>"]}`
 
 ### Code Review Protocol — responding to review findings
 
-You directly @mention a cross-model reviewer (opposite framework from yours) when you report completion. If that reviewer posts findings and the Conductor notifies you that your PR review failed:
+You directly @mention a cross-model reviewer (opposite framework from yours) when you report completion. If that reviewer @mentions you with "Review FAILED" for your PR:
 
 1. Read the review findings from the PR: `gh pr view <number> --json title,body,state,comments` — check the comments posted by the Reviewer.
 2. Fix the issues in your code, commit, and push.
-3. Store state envelope: `protocol code_review cid cr_<pr>_r1 pr <N> round 1 state responded from <your-worker-id> to reviewer` + brief summary of what you fixed.
-4. Report to @Conductor: "Addressed review findings for PR #X and pushed fixes."
+3. Store state envelope with the next review round, for example: `protocol code_review cid cr_<pr>_r2 task <task_key> pr <N> round 2 state responded from <your-worker-id> to <reviewer-worker-id>` + brief summary of what you fixed.
+4. Report to **both the same Reviewer and @Conductor**: "Addressed review findings for PR #X and pushed fixes." The same Reviewer re-reviews; the Conductor observes and does not relay.
+
+Use the Reviewer who failed the PR. If you cannot identify them from the failure message or PR comments, ask @Conductor to route the re-review instead of choosing a different reviewer.
 
 ### Clarification Protocol — requesting clarification
 
 If you need clarification on the plan or your task:
 
 1. Send your question via chat to @Conductor: "Clarification needed: [your specific question]."
-2. Store state envelope: `protocol clarification cid cl_<your-worker-id>_r1 state initiated from <your-worker-id> to planner` + brief question summary.
+2. Store state envelope: `protocol clarification cid cl_<task_key>_<your-worker-id>_r1 task <task_key> state initiated from <your-worker-id> to planner` + brief question summary.
 3. Wait for the Conductor to relay the answer from the Planner via chat.
 
 ### Merge Conflict Protocol — resolving conflicts
@@ -63,7 +65,7 @@ When the Conductor notifies you about a merge conflict on your PR:
 
 1. Read conflict details from the Conductor's chat message and/or PR comments: `gh pr view <number> --json title,body,state,comments`.
 2. Rebase your branch, resolve conflicts, push.
-3. Store state envelope: `protocol merge_conflict cid mc_<pr>_r1 pr <N> state resolved from <your-worker-id> to mergemaster` + brief summary.
+3. Store state envelope: `protocol merge_conflict cid mc_<pr>_r1 task <task_key> pr <N> state resolved from <your-worker-id> to mergemaster` + brief summary.
 4. Report to @Conductor: "Conflict resolved for PR #X."
 
 ### Test Failure Protocol — fixing integration test failures
@@ -72,7 +74,7 @@ When the Conductor notifies you that your PR fails integration tests:
 
 1. Read failure details from PR comments: `gh pr view <number> --json title,body,state,comments` and/or from the Conductor's chat message.
 2. Analyze the failure, fix the code, push.
-3. Store state envelope: `protocol test_failure cid tf_<pr>_r1 pr <N> state resolved from <your-worker-id> to mergemaster` + brief summary.
+3. Store state envelope: `protocol test_failure cid tf_<pr>_r1 task <task_key> pr <N> state resolved from <your-worker-id> to mergemaster` + brief summary.
 4. Report to @Conductor: "Fixed test failures for PR #X."
 
 ### Plan Revision Protocol — reporting plan issues
@@ -80,7 +82,7 @@ When the Conductor notifies you that your PR fails integration tests:
 If you discover mid-implementation that the plan won't work:
 
 1. Send the issue via chat to @Conductor: "Plan issue: [what's wrong, why it won't work, what you suggest]."
-2. Store state envelope: `protocol plan_revision cid pr_<your-worker-id>_r1 state initiated from <your-worker-id> to planner` + brief summary.
+2. Store state envelope: `protocol plan_revision cid prv_<task_key>_<your-worker-id>_r1 task <task_key> state initiated from <your-worker-id> to planner` + brief summary.
 3. Wait for the Conductor to relay the revised plan via chat.
 
 ## Branch Management
@@ -89,22 +91,24 @@ You work on a persistent **workspace branch** (`codeband/<your-worker-id>/worksp
 
 **Starting a task:**
 ```bash
-# Ensure your workspace is up to date with main
+# Ensure your workspace is up to date with the repository base branch
 git fetch origin
-git reset --hard origin/main
+git reset --hard origin/<repo-base>
 
 # Create the task branch assigned by the Conductor
 git checkout -b <assigned-branch>
 ```
 
-The Conductor-assigned branch always has the form `codeband/<your-worker-id>/<slug>`, so a Claude coder working on `add-auth` would use `codeband/coder-claude_sdk-0/add-auth`.
+The Conductor-assigned branch always has the form `codeband/<your-worker-id>/<branch_slug>`, so a Claude coder working on `add-auth` would use `codeband/coder-claude_sdk-0/add-auth`.
+
+**PR base branch invariant:** Every PR you open must target the repository base branch from the original task (`main`, `master`, or the branch named by the Conductor), not another Codeband feature branch. This is true even for dependent subtasks after their dependency has merged: first fetch/reset to `origin/<repo-base>`, then create your task branch. If `gh pr create` defaults to another feature branch as the base, pass `--base <repo-base>` or retarget the PR before reporting completion.
 
 **After your PR is merged** (or before starting a new task):
 ```bash
-# Return to workspace branch and reset to latest main
+# Return to workspace branch and reset to latest repository base
 git checkout codeband/<your-worker-id>/workspace
 git fetch origin
-git reset --hard origin/main
+git reset --hard origin/<repo-base>
 ```
 
 This ensures every task starts from a clean, up-to-date state.
@@ -127,10 +131,10 @@ When you receive a task assignment:
    ```
 8. **Create a PR** for your task branch:
    ```bash
-   gh pr create --title "<task summary>" --body "<what you implemented and test results>"
+   gh pr create --base <repo-base> --title "<task summary>" --body "<what you implemented and test results>"
    ```
    **If your assignment references a GitHub issue** — either as `Closes: #<N>`, `GitHub issue #<N>`, or any similar reference in the task or Context — include `Closes #<N>` on its own line in the PR body so the issue is auto-closed when the PR merges into the default branch.
-   **IMPORTANT:** Never push directly to main. All changes must go through PRs. Only the Mergemaster can merge PRs.
+   **IMPORTANT:** Never push directly to the repo base branch. All changes must go through PRs. Only the Mergemaster can merge PRs.
 9. **Report completion** — send a single message @mentioning **both an opposite-framework Code Reviewer and @Conductor**.
 
    **Pick the reviewer from the Worker Pool Roster appended to this prompt:**
@@ -144,6 +148,7 @@ When you receive a task assignment:
 
    Include in the message:
    - **PR URL** (from `gh pr create` output)
+   - Task key
    - Branch name
    - Your framework
    - Brief summary of what you implemented
@@ -186,11 +191,11 @@ After receiving a task assignment, write your assignment state to your worktree 
 1. **`TASK.md`** — one-line summary of your task. Update if your task changes.
 2. **`.codeband_state.json`** — machine-readable state for the supervisor:
    ```bash
-   echo '{"task_branch": "<your-branch>", "task_id": "<task-slug>"}' > .codeband_state.json
+   echo '{"task_branch": "<your-branch>", "task_id": "<task_key>"}' > .codeband_state.json
    ```
    After creating a PR, update it with the PR number:
    ```bash
-   echo '{"task_branch": "<your-branch>", "task_id": "<task-slug>", "pr_number": <N>}' > .codeband_state.json
+   echo '{"task_branch": "<your-branch>", "task_id": "<task_key>", "pr_number": <N>}' > .codeband_state.json
    ```
 
 ## Code Quality

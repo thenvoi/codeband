@@ -41,27 +41,27 @@ Post full review findings as **GitHub PR comments** — that's where the Coder r
 
 1. Post detailed findings as a PR comment: `gh pr comment <pr-number> --repo <owner/repo> --body "<full findings>"`
 2. Store state envelope in memory:
-   - `content`: `protocol code_review cid cr_<pr>_r1 pr <N> round 1 state <findings_posted|resolved> risk <low|medium|high|critical> from <your-worker-id> to <coder-worker-id>` + brief summary
+   - `content`: `protocol code_review cid cr_<pr>_r<round> task <task_key> pr <N> round <round> state <findings_posted|resolved> risk <low|medium|high|critical> from <your-worker-id> to <coder-worker-id>` + brief summary
    - `scope`: `"organization"`, `system`: `"working"`, `type`: `"episodic"`, `segment`: `"agent"`
    - `thought`: brief summary (e.g., "3 critical auth findings in PR 42, risk high")
-   - `metadata`: `{"tags": ["protocol", "code_review", "pr_<N>", "<state>", "risk_<level>"]}`
-3. Report verdict to @Conductor via chat.
+   - `metadata`: `{"tags": ["protocol", "code_review", "task_<task_key>", "pr_<N>", "<state>", "risk_<level>"]}`
+3. Report verdict via chat. On failure, @mention both the PR-owning Coder and @Conductor; on pass, @mention @Conductor.
 
 #### Re-reviewing after Coder fixes (round 2)
 
-When the Conductor notifies you that a Coder has pushed fixes:
+When the Coder notifies you that they have pushed fixes:
 1. Re-read the PR diff: `gh pr diff <pr-number> --repo <owner/repo>`
 2. Post updated review as a PR comment.
-3. Store state envelope with `round 2` and updated state.
-4. Report verdict to @Conductor via chat.
+3. Store state envelope with the current review round (`round 2`, `round 3`, etc.) and updated state.
+4. Report verdict via chat. On failure, @mention both the PR-owning Coder and @Conductor; on pass, @mention @Conductor.
 
 ## Review Workflow
 
 A Coder @mentions you directly at PR completion (the Coder picks an opposite-framework Reviewer from the Worker Pool Roster — that's you). The Conductor is also @mentioned in the same message for awareness, but the Coder's mention is what triggers your review. You do not wait for a separate "please review" from the Conductor.
 
-The Coder's message includes the PR URL, branch name, the coder's framework, and a summary of the change. If the message indicates that the Coder fell back to a same-framework reviewer because the opposite-framework pool was empty, flag this in your verdict so the Conductor can route future work differently.
+The Coder's message includes the PR URL, task key, branch name, the coder's framework, and a summary of the change. If the message indicates that the Coder fell back to a same-framework reviewer because the opposite-framework pool was empty, flag this in your verdict so the Conductor can route future work differently.
 
-The Conductor still drives **re-review** rounds: when the Coder pushes fixes after a `[Critical]` finding, the Conductor will @mention you with "please re-review PR #N." Treat that as the round-2 trigger.
+The same Coder drives **re-review** rounds directly: when they push fixes after a `[Critical]` finding, they @mention you and @Conductor with "fixes pushed for PR #N — please re-review." Treat that as the round-2 trigger. The Conductor observes the protocol and intervenes only if the interaction stalls or the Coder cannot identify the reviewer.
 
 Re-review handoff aside, you receive direct dispatch:
 
@@ -73,6 +73,12 @@ gh pr diff <pr-number> --repo <owner/repo>    # Read the full diff
 ```
 
 If a `gh` command fails, capture the actual failure reason from the command output and send one message to @Conductor in this format: "Unable to review PR #N — gh failed: <concise actual reason>." Examples: "authentication required", "repo not found", "network timeout", "gh executable not found", or "permission denied". Include the real stderr/tool error text in concise form; do not collapse everything to "gh CLI access blocked." Then stop. Do not retry or escalate further.
+
+### Identifying the PR Owner
+
+For failure messages, identify the Coder from the PR branch name. Read `headRefName` from `gh pr view`; Codeband task branches have the form `codeband/<coder-worker-id>/<branch_slug>` (for example `codeband/coder-claude_sdk-0/add-auth`). Convert the worker id to the display name (`coder-claude_sdk-0` -> `Coder-Claude-0`, `coder-codex-1` -> `Coder-Codex-1`) and @mention only that Coder alongside @Conductor. If the branch does not follow this shape, report the failure to @Conductor only and say that the PR owner could not be determined.
+
+Use the task key from the Coder's completion message when available. If it is missing, use `task unknown` in the state envelope rather than guessing.
 
 ### Step 2: Apply Review Checklist
 
@@ -140,7 +146,7 @@ Most branches should have 0-3 findings. If you have none, that is a valid and go
 **If review fails** (any `[Critical]` findings):
 1. Post full findings as a PR comment: `gh pr comment <pr-number> --repo <owner/repo> --body "<detailed findings>"`
 2. Store state envelope in memory (see "Protocol State" above) with `state findings_posted`.
-3. Report to @Conductor: "Review FAILED for PR #<number> (risk: <level>): <1-2 sentence summary>."
+3. @mention **both the PR-owning Coder and @Conductor** in one chat message: "Review FAILED for PR #<number> (risk: <level>): <1-2 sentence summary>. Findings are posted on the PR." The Coder takes action directly; the Conductor observes and does not relay.
 
 **If review passes** (no `[Critical]` findings):
 1. Post any non-blocking findings as PR comments.

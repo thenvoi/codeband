@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -119,6 +120,24 @@ class TestCheckClaudeAuth:
             err = await check_claude_auth()
         assert err is not None
         assert "usage limit" in err.remediation.lower()
+
+    @pytest.mark.asyncio
+    async def test_usage_limit_retries_with_anthropic_api_key_fallback(self, monkeypatch):
+        from codeband.preflight import check_claude_auth
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("CODEBAND_FALLBACK_ANTHROPIC_API_KEY", "sk-ant-fallback")
+
+        with patch(
+            "codeband.utility_llm.one_shot_text",
+            AsyncMock(side_effect=["Claude usage limit reached", "ok"]),
+        ) as mock_probe:
+            err = await check_claude_auth()
+
+        assert err is None
+        assert mock_probe.await_count == 2
+        assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-fallback"
+        assert "CODEBAND_FALLBACK_ANTHROPIC_API_KEY" not in os.environ
 
     @pytest.mark.asyncio
     async def test_detects_credit_balance_via_exception(self):
@@ -278,6 +297,24 @@ class TestCheckCodexAuth:
         ):
             err = await check_codex_auth()
         assert err is not None
+
+    @pytest.mark.asyncio
+    async def test_usage_limit_retries_with_openai_api_key_fallback(self, monkeypatch):
+        from codeband.preflight import check_codex_auth
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("CODEBAND_FALLBACK_OPENAI_API_KEY", "sk-openai-fallback")
+
+        with patch(
+            "codeband.preflight._run_codex_probe",
+            AsyncMock(side_effect=[(1, "usage limit exceeded"), (0, "ok")]),
+        ) as mock_probe:
+            err = await check_codex_auth()
+
+        assert err is None
+        assert mock_probe.await_count == 2
+        assert os.environ["OPENAI_API_KEY"] == "sk-openai-fallback"
+        assert "CODEBAND_FALLBACK_OPENAI_API_KEY" not in os.environ
 
     @pytest.mark.asyncio
     async def test_detects_invalid_api_key(self):

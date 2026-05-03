@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import io
+import json
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -126,6 +128,48 @@ async def test_dispatch_diff_no_args_lists_workers_or_advises(tmp_path: Path):
     assert "/diff <worker>" in out or "No coder or mergemaster" in out
 
 
+@pytest.mark.asyncio
+async def test_pending_uses_slash_command_hints_in_shell(tmp_path: Path):
+    ctx = _make_ctx(tmp_path)
+    ctx.config.to_yaml(tmp_path / "codeband.yaml")
+
+    fake_result = type("Result", (), {
+        "returncode": 0,
+        "stdout": json.dumps([{
+            "number": 7,
+            "title": "Add review gate",
+            "labels": [],
+            "comments": [{"body": "Review PASSED (risk: high)"}],
+        }]),
+        "stderr": "",
+    })()
+
+    buf = io.StringIO()
+    with patch("subprocess.run", return_value=fake_result), redirect_stdout(buf):
+        result = await dispatch("/pending", ctx)
+
+    assert result is None
+    out = buf.getvalue()
+    assert "Approve:  /approve <number>" in out
+    assert "Reject:   /reject <number> --reason" in out
+    assert "cb approve" not in out
+
+
+@pytest.mark.asyncio
+async def test_approve_missing_room_uses_slash_task_hint(tmp_path: Path):
+    ctx = _make_ctx(tmp_path)
+    ctx.config.to_yaml(tmp_path / "codeband.yaml")
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        result = await dispatch("/approve 7", ctx)
+
+    assert result is None
+    out = buf.getvalue()
+    assert "Start a task first with '/task' or '/issue'" in out
+    assert "cb task" not in out
+
+
 # ── helpers ──────────────────────────────────────────────────────────────
 
 def _make_ctx(tmp_path: Path, *, compose_file: Path | None = None) -> SlashContext:
@@ -135,7 +179,7 @@ def _make_ctx(tmp_path: Path, *, compose_file: Path | None = None) -> SlashConte
     )
 
     config = CodebandConfig(
-        repo=RepoConfig(url="https://example.com/r.git", branch="main"),
+        repo=RepoConfig(url="https://github.com/example/r.git", branch="main"),
         agents=AgentsConfig(),
     )
     backend = _StubBackend()

@@ -10,7 +10,9 @@ from click.testing import CliRunner
 from codeband.cli import (
     _detect_codex_auth,
     _detect_github_auth,
+    _has_codex_subscription_auth,
     _resolve_claude_auth,
+    _resolve_codex_auth,
     cli,
 )
 
@@ -38,7 +40,7 @@ class TestInitEnvExample:
 
 
 class TestResolveClaudeAuth:
-    """OAuth sources take precedence over API key.
+    """OAuth sources take precedence over API key at startup.
 
     Keychain is a possible OAuth source on macOS developer machines; we mock
     the probe to False by default so tests run deterministically regardless
@@ -53,6 +55,7 @@ class TestResolveClaudeAuth:
             _resolve_claude_auth()
             assert "ANTHROPIC_API_KEY" not in os.environ
             assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == "tok-test"
+            assert os.environ["CODEBAND_FALLBACK_ANTHROPIC_API_KEY"] == "sk-ant-test"
 
     def test_api_key_kept_when_no_oauth_anywhere(self):
         env = {"ANTHROPIC_API_KEY": "sk-ant-test"}
@@ -80,18 +83,21 @@ class TestResolveClaudeAuth:
             os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
             _resolve_claude_auth()  # should not raise
 
-    def test_subscription_oauth_strips_api_key(self):
+    def test_subscription_oauth_strips_api_key_and_keeps_fallback(self):
         """If the host has stored subscription OAuth (macOS keychain OR Linux
         credentials file), ANTHROPIC_API_KEY must be stripped so the bundled
-        Claude CLI falls through to subscription OAuth.
+        Claude CLI falls through to subscription OAuth. Codeband keeps a
+        process-local fallback for usage-limit exhaustion.
         """
         env = {"ANTHROPIC_API_KEY": "sk-ant-test"}
         with patch.dict(os.environ, env, clear=False), patch(
             "codeband.cli._has_claude_subscription_oauth", return_value=True,
         ):
             os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            os.environ.pop("CODEBAND_FALLBACK_ANTHROPIC_API_KEY", None)
             _resolve_claude_auth()
             assert "ANTHROPIC_API_KEY" not in os.environ
+            assert os.environ["CODEBAND_FALLBACK_ANTHROPIC_API_KEY"] == "sk-ant-test"
 
     def test_subscription_probe_only_runs_when_api_key_set(self):
         """Don't waste a subprocess call when there's no API key to strip anyway."""
@@ -102,6 +108,65 @@ class TestResolveClaudeAuth:
             os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
             _resolve_claude_auth()
             mock_probe.assert_not_called()
+
+
+class TestResolveCodexAuth:
+    """Codex subscription auth wins at startup; API key is fallback only."""
+
+    def test_api_key_kept_when_no_subscription_auth(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+        monkeypatch.delenv("CODEBAND_FALLBACK_OPENAI_API_KEY", raising=False)
+
+        _resolve_codex_auth()
+
+        assert os.environ["OPENAI_API_KEY"] == "sk-test"
+        assert "CODEBAND_FALLBACK_OPENAI_API_KEY" not in os.environ
+
+    def test_subscription_auth_strips_api_key_and_keeps_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text(
+            '{"auth_mode": "ChatGPT", "tokens": {}}',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.delenv("CODEBAND_FALLBACK_OPENAI_API_KEY", raising=False)
+
+        _resolve_codex_auth()
+
+        assert "OPENAI_API_KEY" not in os.environ
+        assert os.environ["CODEBAND_FALLBACK_OPENAI_API_KEY"] == "sk-test"
+
+    def test_non_chatgpt_auth_file_does_not_strip_api_key(self, monkeypatch, tmp_path):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text(
+            '{"OPENAI_API_KEY": "sk-from-file"}',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.delenv("CODEBAND_FALLBACK_OPENAI_API_KEY", raising=False)
+
+        _resolve_codex_auth()
+
+        assert os.environ["OPENAI_API_KEY"] == "sk-test"
+        assert "CODEBAND_FALLBACK_OPENAI_API_KEY" not in os.environ
+
+    def test_detects_codex_subscription_auth(self, monkeypatch, tmp_path):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text(
+            '{"auth_mode": "ChatGPT"}',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        assert _has_codex_subscription_auth() is True
 
 
 class TestHasClaudeSubscriptionOAuth:

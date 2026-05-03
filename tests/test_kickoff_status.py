@@ -72,6 +72,28 @@ class TestQueryStatus:
         assert "CODEBAND STATUS" in out
         assert "auth feature" in out
         assert "test command" in out
+        assert "Tip: Use 'cb log'" in out
+
+    async def test_shell_mode_uses_slash_command_tips(
+        self, project_dir: Path, capsys: pytest.CaptureFixture,
+    ):
+        config = _make_config(project_dir, memory_mode="local")
+
+        workspace_path = Path(config.workspace.path)
+        store = LocalMemoryStore(workspace_path / "state" / "memories.jsonl")
+        await store.store(
+            content="protocol plan cid plan_r1 state ready "
+                    "from planner to conductor auth feature",
+            system="working", type="episodic", segment="agent",
+            scope="organization", thought="plan ready",
+        )
+
+        with patch("thenvoi_rest.AsyncRestClient"):
+            await query_status(config, project_dir, command_style="slash")
+
+        out = capsys.readouterr().out
+        assert "Tip: Use '/log'" in out
+        assert "cb log" not in out
 
     async def test_local_mode_prints_empty_state(
         self, project_dir: Path, capsys: pytest.CaptureFixture,

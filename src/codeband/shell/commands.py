@@ -277,10 +277,8 @@ def _resolve_worker_id(candidate: str, keys: list[str]) -> str | None:
 
 @register("status", "Query task status from Band.ai memory")
 async def _status(args: str, ctx: SlashContext) -> HandlerResult:
-    from codeband.cli import status as status_cmd
-    await asyncio.to_thread(
-        _safe_callback_call, status_cmd.callback, project_dir=str(ctx.project_dir),
-    )
+    from codeband.orchestration.kickoff import query_status
+    await query_status(ctx.config, ctx.project_dir, command_style="slash")
     return None
 
 
@@ -288,7 +286,10 @@ async def _status(args: str, ctx: SlashContext) -> HandlerResult:
 async def _pending(args: str, ctx: SlashContext) -> HandlerResult:
     from codeband.cli import pending as pending_cmd
     await asyncio.to_thread(
-        _safe_callback_call, pending_cmd.callback, project_dir=str(ctx.project_dir),
+        _safe_callback_call,
+        pending_cmd.callback,
+        project_dir=str(ctx.project_dir),
+        command_style="slash",
     )
     return None
 
@@ -305,6 +306,7 @@ async def _approve(args: str, ctx: SlashContext) -> HandlerResult:
         approve_cmd.callback,
         number=int(positional[0]),
         project_dir=str(ctx.project_dir),
+        command_style="slash",
     )
     return None
 
@@ -322,6 +324,7 @@ async def _reject(args: str, ctx: SlashContext) -> HandlerResult:
         number=int(positional[0]),
         reason=flags.get("reason") if isinstance(flags.get("reason"), str) else None,
         project_dir=str(ctx.project_dir),
+        command_style="slash",
     )
     return None
 

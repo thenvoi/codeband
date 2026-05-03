@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -120,6 +121,12 @@ _CLAUDE_ERROR_PATTERNS: list[tuple[str, str]] = [
     ),
 ]
 
+_CLAUDE_USAGE_LIMIT_PATTERNS = (
+    "usage limit reached",
+    "hit your limit",
+    "status=rejected",
+)
+
 
 # Codex failures bubble up through the CLI's stdout/stderr rather than as
 # typed errors — same pattern-matching approach as Claude.
@@ -162,6 +169,8 @@ _CODEX_ERROR_PATTERNS: list[tuple[str, str]] = [
         ),
     ),
 ]
+
+_CODEX_USAGE_LIMIT_PATTERNS = ("usage limit",)
 
 
 async def _run_codex_probe() -> tuple[int, str]:
@@ -217,6 +226,8 @@ async def check_codex_auth() -> PreflightError | None:
         )
 
     haystack = output.lower()
+    if _is_codex_usage_limit(haystack) and _restore_openai_api_key_fallback():
+        return await check_codex_auth()
     for pattern, remediation in _CODEX_ERROR_PATTERNS:
         if pattern in haystack:
             # Extract a short preview for the summary — truncate long output.
@@ -239,6 +250,22 @@ async def check_codex_auth() -> PreflightError | None:
     return None
 
 
+def _is_codex_usage_limit(haystack: str) -> bool:
+    return any(pattern in haystack for pattern in _CODEX_USAGE_LIMIT_PATTERNS)
+
+
+def _restore_openai_api_key_fallback() -> bool:
+    """Restore stripped OpenAI API-key auth after Codex subscription exhaustion."""
+    fallback_key = os.environ.pop("CODEBAND_FALLBACK_OPENAI_API_KEY", "")
+    if not fallback_key or os.environ.get("OPENAI_API_KEY"):
+        return False
+    os.environ["OPENAI_API_KEY"] = fallback_key
+    logger.info(
+        "Codex subscription usage limit reached; retrying preflight with OPENAI_API_KEY"
+    )
+    return True
+
+
 async def check_claude_auth() -> PreflightError | None:
     """Send one tiny Claude SDK call to verify auth works end-to-end.
 
@@ -258,6 +285,8 @@ async def check_claude_auth() -> PreflightError | None:
         # "check auth" hint.
         message = f"{type(exc).__name__}: {exc}"
         haystack = message.lower()
+        if _is_claude_usage_limit(haystack) and _restore_anthropic_api_key_fallback():
+            return await check_claude_auth()
         for pattern, remediation in _CLAUDE_ERROR_PATTERNS:
             if pattern in haystack:
                 return PreflightError(
@@ -275,6 +304,8 @@ async def check_claude_auth() -> PreflightError | None:
         )
 
     haystack = result.lower()
+    if _is_claude_usage_limit(haystack) and _restore_anthropic_api_key_fallback():
+        return await check_claude_auth()
     for pattern, remediation in _CLAUDE_ERROR_PATTERNS:
         if pattern in haystack:
             return PreflightError(
@@ -284,6 +315,28 @@ async def check_claude_auth() -> PreflightError | None:
             )
 
     return None
+
+
+def _is_claude_usage_limit(haystack: str) -> bool:
+    return any(pattern in haystack for pattern in _CLAUDE_USAGE_LIMIT_PATTERNS)
+
+
+def _restore_anthropic_api_key_fallback() -> bool:
+    """Restore stripped API-key auth after subscription usage-limit exhaustion.
+
+    ``codeband.cli._resolve_claude_auth`` strips ``ANTHROPIC_API_KEY`` so the
+    subscription path wins by default, but stores a process-local backup. This
+    fallback is intentionally narrow: we restore the key only after the Claude
+    subscription path reports a usage limit.
+    """
+    fallback_key = os.environ.pop("CODEBAND_FALLBACK_ANTHROPIC_API_KEY", "")
+    if not fallback_key or os.environ.get("ANTHROPIC_API_KEY"):
+        return False
+    os.environ["ANTHROPIC_API_KEY"] = fallback_key
+    logger.info(
+        "Claude subscription usage limit reached; retrying preflight with ANTHROPIC_API_KEY"
+    )
+    return True
 
 
 def _config_uses_codex(config: CodebandConfig) -> bool:

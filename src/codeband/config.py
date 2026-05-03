@@ -105,11 +105,12 @@ class WatchdogConfig(_StrictModel):
     role_stale_thresholds: dict[str, int] = Field(
         default_factory=lambda: {"coder": 900, "mergemaster": 900},
     )
-    # When the Conductor records that the user-facing task is complete via a
-    # `swarm status complete …` memory envelope, suppress all nudging for
-    # this long. Prevents the watchdog from poking correctly-idle agents
-    # between user tasks. Falls back to time-based behavior if no envelope
-    # is present (e.g. Conductor crashed before writing one).
+    # When the Conductor records that the user-facing task is complete or
+    # waiting on human merge approval via a `swarm status …` memory envelope,
+    # suppress all nudging for this long. Prevents the watchdog from poking
+    # correctly-idle agents between actionable steps. Falls back to time-based
+    # behavior if no envelope is present (e.g. Conductor crashed before writing
+    # one).
     swarm_idle_grace_seconds: int = 1800
 
 

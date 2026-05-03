@@ -221,18 +221,16 @@ def check_claude_auth(_ctx: Context) -> CheckResult:
         return CheckResult(
             Status.INFO,
             "Both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN set — "
-            "Codeband will strip the API key so OAuth wins",
+            "Codeband will start with OAuth and keep the API key as a usage-limit fallback",
         )
     if api and has_sub and not oauth:
         return CheckResult(
             Status.WARN,
             "ANTHROPIC_API_KEY set alongside host subscription OAuth — "
-            "currently paying per-token when a subscription is available",
+            "Codeband will start with the subscription and keep the API key as a fallback",
             remediation=(
-                "Codeband auto-prefers the subscription at `cb run` startup, but "
-                "removing ANTHROPIC_API_KEY from .env makes this explicit and "
-                "avoids surprises in other environments (e.g. Docker) where the "
-                "host keychain isn't accessible."
+                "This is valid. ANTHROPIC_API_KEY is used only if the Claude "
+                "Pro/Max subscription path reports a usage-limit error."
             ),
         )
     if oauth:

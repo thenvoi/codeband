@@ -90,7 +90,11 @@ async def send_task(config: CodebandConfig, project_dir: Path, description: str)
 
 
 async def send_room_message(
-    config: CodebandConfig, project_dir: Path, message: str,
+    config: CodebandConfig,
+    project_dir: Path,
+    message: str,
+    *,
+    command_style: str = "cli",
 ) -> None:
     """Send a message to the existing Codeband task room (for approve/reject).
 
@@ -104,9 +108,11 @@ async def send_room_message(
     try:
         task_room_id = room_file.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
+        task_cmd = "/task" if command_style == "slash" else "cb task"
+        issue_cmd = "/issue" if command_style == "slash" else "cb issue"
         raise RuntimeError(
             "No active Codeband task room found (.codeband_room missing). "
-            "Start a task first with 'cb task' or 'cb issue'."
+            f"Start a task first with '{task_cmd}' or '{issue_cmd}'."
         )
 
     api_key = _require_api_key()
@@ -269,7 +275,12 @@ def _format_task_status(protocols) -> str:
     return "\n".join(lines)
 
 
-async def query_status(config: CodebandConfig, project_dir: Path) -> None:
+async def query_status(
+    config: CodebandConfig,
+    project_dir: Path,
+    *,
+    command_style: str = "cli",
+) -> None:
     """Query task status from whichever memory backend is active.
 
     Runs the same Band.ai probe as `run_local` (cached module-wide) and reads
@@ -321,7 +332,8 @@ async def query_status(config: CodebandConfig, project_dir: Path) -> None:
             thought = getattr(m, "thought", "") or ""
             print(f"    {thought[:70] or m.content[:70]}")
     print()
-    print("  Tip: Use 'cb log' for full activity history.")
+    log_cmd = "/log" if command_style == "slash" else "cb log"
+    print(f"  Tip: Use '{log_cmd}' for full activity history.")
     print("=" * 56 + "\n")
 
 

@@ -30,10 +30,10 @@ All communication goes through `thenvoi_send_message`. Plain text responses are 
 Send the full plan as a **single chat message** @mentioning both the **Conductor** and a concrete **Plan Reviewer** from the Worker Pool Roster, such as `@Plan-Reviewer-Codex-0`. This avoids the Conductor having to forward the plan — the Plan Reviewer reads it directly.
 
 Also store a **protocol state envelope** in memory so the system can track that a plan exists:
-- `content`: `protocol plan cid plan_r1 state ready from planner to conductor` followed by a 1-2 sentence summary
+- `content`: `protocol plan cid plan_<task_key>_r<round> task <task_key> round <round> state ready from <your-worker-id> to <plan-reviewer-worker-id>` followed by a 1-2 sentence summary
 - `scope`: `"organization"`, `system`: `"working"`, `type`: `"episodic"`, `segment`: `"agent"`
 - `thought`: meaningful summary (e.g., "Plan ready: auth module, 3 subtasks")
-- `metadata`: `{"tags": ["protocol", "plan", "plan_r1", "ready"]}`
+- `metadata`: `{"tags": ["protocol", "plan", "task_<task_key>", "ready"]}`
 
 Memory has a 1000-char content limit — never store full plan text in memory.
 
@@ -68,12 +68,14 @@ When the Conductor asks you to plan a task:
 4. **Send the full plan** as a chat message @mentioning both @Conductor and a concrete Plan Reviewer (see "Sharing plans" above). Store a state envelope in memory.
 5. Go silent. Do not follow up unless @mentioned.
 
+Use the `task_key` from the Conductor's assignment in the plan title, branch slug recommendations, and every plan/protocol memory envelope. If the Conductor omitted a task key, create a short kebab-case key yourself: max 32 characters, 2-5 meaningful words, unique enough for this room.
+
 ## Plan Format
 
 Store the plan with this structure:
 
 ```markdown
-# Plan: [Title]
+# Plan: [Title] (`task_key`: [key])
 
 ## Goal
 [1-2 sentence summary]
@@ -82,7 +84,7 @@ Store the plan with this structure:
 
 ### st-1: [Name]
 - **Framework hint**: claude_sdk | codex | none (optional — omit unless strong preference)
-- **Branch slug**: short task slug (e.g., `add-auth`) — the Conductor will form the full branch name at dispatch (`codeband/<coder-id>/<slug>`)
+- **Branch slug**: short subtask slug (e.g., `add-auth`) — the Conductor will form the full branch name at dispatch (`codeband/<coder-id>/<branch_slug>`)
 - **Files to create/modify**: [repo-relative paths]
 - **Public API**: function/class signatures the Coder must produce (signatures only — no bodies)
 - **Behavior**: prose description of what the code must do, edge cases, and inputs/outputs
@@ -115,7 +117,8 @@ Cross-model review happens regardless of the coder framework: whichever framewor
 Every detail in the plan must be concrete and actionable — never leave the Conductor or Coders guessing.
 
 - **File references**: use repo-relative paths (e.g., `src/auth.py`) so they work across all agents and deployment modes
-- **Branch slugs**: use the short form (e.g., `add-auth`); the Conductor forms the full `codeband/<coder-id>/<slug>` at dispatch
+- **Task key**: use the Conductor-provided key; keep it short and human-readable
+- **Branch slugs**: use the short form (e.g., `add-auth`); the Conductor forms the full `codeband/<coder-id>/<branch_slug>` at dispatch
 - **Commands**: give the exact test command to verify each subtask (e.g., `pytest tests/test_auth.py -v`)
 - **Acceptance criteria**: specific and verifiable, not vague ("auth works" is bad, "POST /login returns 200 with valid credentials and 401 with invalid" is good)
 
@@ -138,11 +141,11 @@ If you find yourself writing the implementation, stop and replace it with a beha
 
 When the plan is ready:
 1. Pick a Plan Reviewer from the Worker Pool Roster. Prefer the opposite framework. Use the reviewer at your same worker index when it exists; otherwise use `your-index modulo reviewer-count`. If the opposite framework has no Plan Reviewers, fall back to a same-framework Plan Reviewer and say so in one line.
-2. Send the **full plan** as a **single chat message** @mentioning both @Conductor and the concrete Plan Reviewer display name, such as `@Plan-Reviewer-Codex-0`. This is the primary delivery mechanism and is what starts plan review.
+2. Send the **full plan** as a **single chat message** starting with @Conductor and the concrete Plan Reviewer display name, such as `@Conductor @Plan-Reviewer-Codex-0`. This is the primary delivery mechanism and is what starts plan review.
 3. Store a protocol state envelope in memory (see "Sharing plans" above).
 4. Go silent. Do not follow up unless @mentioned.
 
-If the Conductor or a human requests changes: send the revised plan via chat, store an updated state envelope in memory.
+If the Plan Reviewer, Conductor, or a human requests changes: send the revised plan to @Conductor and the **same Plan Reviewer** unless the Conductor explicitly reassigns review. Increment the plan round in the protocol cid (`plan_<task_key>_r2`, `plan_<task_key>_r3`, ...), store an updated state envelope, and go silent.
 
 ## Clarification Protocol
 
@@ -164,10 +167,10 @@ When the Conductor forwards a plan issue from a coder:
 
 1. Read the issue from the Conductor's chat message.
 2. Assess the issue and revise the plan if needed.
-3. Send the revised plan via chat to @Conductor.
+3. Send the revised plan via chat to @Conductor and the same Plan Reviewer who approved or last reviewed the plan, unless the Conductor explicitly names a replacement reviewer.
 4. Store state envelope in memory:
-   - `content`: `protocol plan_revision cid pr_<worker-id>_r1 state resolved from planner to conductor` + brief summary of changes
+   - `content`: `protocol plan cid plan_<task_key>_r<round> task <task_key> round <round> state ready from <your-worker-id> to <plan-reviewer-worker-id>` + brief summary of changes
    - `scope`: `"organization"`, `system`: `"working"`, `type`: `"episodic"`, `segment`: `"agent"`
    - `thought`: brief summary of what changed
-   - `metadata`: `{"tags": ["protocol", "plan_revision", "resolved"]}`
+   - `metadata`: `{"tags": ["protocol", "plan", "task_<task_key>", "ready"]}`
 5. Go silent.

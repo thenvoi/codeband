@@ -1069,6 +1069,34 @@ class TestSwarmStatusGate:
         assert daemon._idle_skip_logged is False
 
     @pytest.mark.asyncio
+    async def test_no_nudge_when_waiting_on_human_approval(
+        self, watchdog_config, mock_rest_client,
+    ):
+        """Agents are correctly idle while the Conductor waits for merge approval."""
+        from codeband.agents.watchdog import WatchdogDaemon
+
+        mock_rest_client.agent_api_memories.list_agent_memories = AsyncMock(
+            return_value=_make_memory_list_response([
+                _make_memory_record(
+                    "swarm status waiting_human_approval task add-redact pr 1",
+                    datetime.now(UTC) - timedelta(seconds=60),
+                ),
+            ]),
+        )
+
+        daemon = WatchdogDaemon(
+            config=watchdog_config,
+            rest_client=mock_rest_client,
+            agent_id="agent-wd",
+            conductor_id="agent-cond",
+        )
+
+        await daemon._patrol()
+
+        mock_rest_client.agent_api_messages.create_agent_chat_message.assert_not_called()
+        assert daemon._idle_skip_logged is True
+
+    @pytest.mark.asyncio
     async def test_no_swarm_envelope_falls_back_to_time_based(
         self, watchdog_config, mock_rest_client,
     ):
