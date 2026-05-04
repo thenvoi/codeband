@@ -282,13 +282,20 @@ def _prepare_task_branch_inner(
     except WorkspaceError:
         reset_ref = base_branch
     logger.info("Preparing task branch %s from %s", task_branch, reset_ref)
+
+    # A coder worktree can survive a previous interrupted assignment. Reset
+    # tracked changes, remove untracked files, detach from any stale branch, and
+    # then recreate the requested task branch from the requested base ref.
+    _run_git(["reset", "--hard", reset_ref], cwd=worktree_path)
+    _run_git(["clean", "-fd"], cwd=worktree_path)
+    _run_git(["checkout", "--detach", reset_ref], cwd=worktree_path)
     _run_git(["reset", "--hard", reset_ref], cwd=worktree_path)
     # Delete stale local task branch if it exists
     try:
         _run_git(["branch", "-D", task_branch], cwd=worktree_path)
     except WorkspaceError:
         pass  # Branch doesn't exist locally, fine
-    _run_git(["checkout", "-b", task_branch], cwd=worktree_path)
+    _run_git(["checkout", "-b", task_branch, reset_ref], cwd=worktree_path)
 
 
 def fetch_latest(repo_path: Path, remote: str = "origin") -> None:

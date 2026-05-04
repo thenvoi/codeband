@@ -80,6 +80,10 @@ You are worker {worker_id}, session #{session_num}. {error_line}{branch_line}{pr
 ### Instructions
 - Review the git history to understand what you've already done
 - Check the chat for any messages you may have missed
+- If a newer Conductor assignment names a different branch than this recovery
+  context, treat this recovery context as stale. The latest Conductor assignment
+  wins: reset/clean the worktree from the requested repo base branch and create
+  the assigned branch from that base before editing.
 - Continue your work from where you left off
 - Do NOT redo work that's already committed
 """

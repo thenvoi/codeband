@@ -91,15 +91,27 @@ You work on a persistent **workspace branch** (`codeband/<your-worker-id>/worksp
 
 **Starting a task:**
 ```bash
-# Ensure your workspace is up to date with the repository base branch
+# Ensure your workspace is exactly on the repository base branch
 git fetch origin
+git checkout --detach origin/<repo-base>
 git reset --hard origin/<repo-base>
+git clean -fd
 
 # Create the task branch assigned by the Conductor
+git branch -D <assigned-branch> 2>/dev/null || true
 git checkout -b <assigned-branch>
 ```
 
 The Conductor-assigned branch always has the form `codeband/<your-worker-id>/<branch_slug>`, so a Claude coder working on `add-auth` would use `codeband/coder-claude_sdk-0/add-auth`.
+
+Before editing files, verify the branch setup:
+```bash
+git branch --show-current
+git status --short
+git rev-parse HEAD
+git rev-parse origin/<repo-base>
+```
+If the current branch is not the assigned branch, `HEAD` is not the same commit as `origin/<repo-base>` immediately before your first edit, or `git status --short` shows unexpected files after the reset/clean, do not continue coding. Escalate to @Conductor with the exact current branch, expected branch, base ref, and dirty paths.
 
 **PR base branch invariant:** Every PR you open must target the repository base branch from the original task (`main`, `master`, or the branch named by the Conductor), not another Codeband feature branch. This is true even for dependent subtasks after their dependency has merged: first fetch/reset to `origin/<repo-base>`, then create your task branch. If `gh pr create` defaults to another feature branch as the base, pass `--base <repo-base>` or retarget the PR before reporting completion.
 
@@ -181,6 +193,8 @@ If you encounter a problem you cannot resolve after reasonable effort:
    Tried: <what you already attempted>
    Need: <specific help required>
    ```
+
+Never send a generic completion failure such as "I stopped before completing this request." If you stop without a PR, use the escalation format above and include the concrete stop reason, including current branch, expected branch, dirty paths, and the last failing command when branch/worktree state is involved.
 
 3. After escalating, **go silent** and wait for the Conductor's response. Do not retry the same failing approach.
 

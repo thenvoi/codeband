@@ -14,6 +14,7 @@ from codeband.workspace.git import (
     commit_and_push,
     create_worktree,
     list_worktrees,
+    prepare_task_branch,
     remove_worktree,
 )
 from codeband.workspace.init import (
@@ -120,6 +121,61 @@ class TestGitOperations:
         create_worktree(bare, wt, "codeband/player-0/test")
         assert wt.exists()
         assert (wt / "README.md").exists()
+
+    def test_prepare_task_branch_recreates_checked_out_stale_branch(
+        self, source_repo: Path, tmp_path: Path,
+    ):
+        """Fresh task prep must discard stale task state before coding starts.
+
+        Regression: a coder could resume in a stale checked-out task branch
+        with uncommitted and untracked files. ``git branch -D`` then failed
+        because the task branch was checked out, and untracked stale files
+        survived the reset.
+        """
+        bare = tmp_path / "bare.git"
+        clone_bare(str(source_repo), bare)
+
+        default = subprocess.run(
+            ["git", "-C", str(source_repo), "branch", "--show-current"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        wt = tmp_path / "wt" / "coder-codex-0"
+        create_worktree(
+            bare, wt, "codeband/coder-codex-0/workspace",
+            base_branch=default,
+        )
+
+        task_branch = "codeband/coder-codex-0/test-redact-helper"
+        prepare_task_branch(wt, task_branch, default)
+
+        # Simulate stale local state from a previous interrupted assignment.
+        (wt / "README.md").write_text("# Dirty\n")
+        (wt / "stale-test.py").write_text("stale = True\n")
+
+        prepare_task_branch(wt, task_branch, default)
+
+        current_branch = subprocess.run(
+            ["git", "-C", str(wt), "branch", "--show-current"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "-C", str(wt), "status", "--porcelain"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        head = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        base = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", f"origin/{default}"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        assert current_branch == task_branch
+        assert head == base
+        assert status == ""
+        assert not (wt / "stale-test.py").exists()
 
     def test_recreate_worktree_preserves_when_base_ref_missing(
         self, source_repo: Path, tmp_path: Path,

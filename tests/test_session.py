@@ -176,6 +176,25 @@ class TestBuildRecoveryContext:
         assert "session" in context.lower()
         assert "coder-claude_sdk-0" in context
 
+    def test_recovery_context_latest_assignment_overrides_stale_state(
+        self, worktree_with_history: Path,
+    ):
+        """Latest chat assignment must beat stale persisted branch state."""
+        from codeband.session.context import build_recovery_context
+
+        identity = WorkerIdentity(
+            worker_id="coder-codex-0",
+            agent_id="agent-123",
+            worktree_path=str(worktree_with_history),
+            session_count=1,
+        )
+
+        context = build_recovery_context("coder-codex-0", worktree_with_history, identity)
+
+        assert "newer Conductor assignment names a different branch" in context
+        assert "latest Conductor assignment" in context
+        assert "reset/clean the worktree from the requested repo base branch" in context
+
     def test_returns_none_when_worktree_missing(self, tmp_path: Path):
         """If the worktree directory is gone (e.g. recreate failed mid-flight),
         return None instead of letting subprocess raise FileNotFoundError.

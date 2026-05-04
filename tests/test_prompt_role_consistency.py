@@ -184,6 +184,24 @@ def test_prs_must_target_repo_base_before_merge_routing():
     assert "gh pr create --base <repo-base>" in coder
 
 
+def test_coder_starts_tasks_from_clean_assigned_branch():
+    coder = Path("src/codeband/prompts/coder.md").read_text(encoding="utf-8")
+
+    assert "git checkout --detach origin/<repo-base>" in coder
+    assert "git clean -fd" in coder
+    assert "git branch -D <assigned-branch>" in coder
+    assert "If the current branch is not the assigned branch" in coder
+    assert "current branch, expected branch, base ref, and dirty paths" in coder
+
+
+def test_coder_stop_reports_include_concrete_reason():
+    coder = Path("src/codeband/prompts/coder.md").read_text(encoding="utf-8")
+
+    assert "Never send a generic completion failure" in coder
+    assert "I stopped before completing this request" in coder
+    assert "include the concrete stop reason" in coder
+
+
 def test_conductor_cleans_up_superseded_prs_on_reassignment():
     conductor = Path("src/codeband/prompts/conductor.md").read_text(encoding="utf-8")
 
