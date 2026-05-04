@@ -280,13 +280,21 @@ class WatchdogDaemon:
         # don't need older records to make a decision.
         since = now - self._max_window() * 2
 
+        from thenvoi_rest.core.api_error import ApiError
+        from thenvoi_rest.errors.not_found_error import NotFoundError
+
         try:
             rooms = await self._list_rooms()
+        except ApiError as e:
+            logger.warning(
+                "Watchdog: skipping patrol — list-chats returned HTTP %s%s",
+                e.status_code,
+                " (rate-limited by Band.ai)" if e.status_code == 429 else "",
+            )
+            return
         except Exception:
             logger.exception("Failed to list chats during patrol")
             return
-
-        from thenvoi_rest.errors.not_found_error import NotFoundError
 
         for room in rooms:
             room_id = room.id
@@ -313,6 +321,14 @@ class WatchdogDaemon:
                         "Run 'cb reset' to clean up stale session state.",
                         room_id,
                     )
+                continue
+            except ApiError as e:
+                logger.warning(
+                    "Watchdog: skipping room %s — HTTP %s%s",
+                    room_id,
+                    e.status_code,
+                    " (rate-limited by Band.ai)" if e.status_code == 429 else "",
+                )
                 continue
             except Exception:
                 logger.exception("Failed to inspect room %s during patrol", room_id)

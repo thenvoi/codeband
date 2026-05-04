@@ -493,6 +493,103 @@ class TestWatchdogDaemon:
         assert len(warn_b) == 1, f"Expected 1 warning for dead-b, got {len(warn_b)}"
 
     @pytest.mark.asyncio
+    async def test_patrol_handles_rate_limit_without_traceback(
+        self, watchdog_config, mock_rest_client, caplog,
+    ):
+        """A 429 from Band.ai logs a one-line warning, not a stack trace.
+
+        Regression: Cloudflare's rate limiter returns 429 with an empty body,
+        which the SDK wraps as ``ApiError``. The bare ``except Exception``
+        branch used to dump a multi-screen traceback per room per cycle.
+        """
+        import logging
+
+        from thenvoi_rest.core.api_error import ApiError
+
+        from codeband.agents.watchdog import WatchdogDaemon
+
+        live_room = _make_chat_room("live-room")
+        rl_room = _make_chat_room("rl-room")
+        mock_rest_client.agent_api_chats.list_agent_chats = AsyncMock(
+            return_value=_make_chats_response([rl_room, live_room]),
+        )
+        rate_limited = ApiError(status_code=429, headers={}, body="")
+        # First call (rl-room) hits 429, second (live-room) succeeds.
+        default_msgs = mock_rest_client.agent_api_messages.list_agent_messages
+        mock_rest_client.agent_api_messages.list_agent_messages = AsyncMock(
+            side_effect=[
+                rate_limited,
+                _make_messages_response([_make_message("agent-cond", minutes_ago=1)]),
+            ],
+        )
+        del default_msgs
+        mock_rest_client.agent_api_messages.create_agent_chat_message = AsyncMock()
+
+        daemon = WatchdogDaemon(
+            config=watchdog_config,
+            rest_client=mock_rest_client,
+            agent_id="agent-wd",
+            conductor_id="agent-cond",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="codeband.agents.watchdog"):
+            await daemon._patrol()
+
+        # No ERROR-level traceback record.
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert error_records == [], (
+            f"Expected no ERROR records, got: {[r.getMessage() for r in error_records]}"
+        )
+        # A WARNING that mentions the rate-limited room and the 429 status.
+        rl_warns = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "rl-room" in r.getMessage()
+            and "429" in r.getMessage()
+        ]
+        assert len(rl_warns) == 1, (
+            f"Expected one 429 warning for rl-room, got {len(rl_warns)}"
+        )
+        assert "rate-limited" in rl_warns[0].getMessage().lower()
+
+    @pytest.mark.asyncio
+    async def test_patrol_handles_list_chats_rate_limit(
+        self, watchdog_config, mock_rest_client, caplog,
+    ):
+        """A 429 on the top-level list_chats call aborts the cycle with a warning."""
+        import logging
+
+        from thenvoi_rest.core.api_error import ApiError
+
+        from codeband.agents.watchdog import WatchdogDaemon
+
+        rate_limited = ApiError(status_code=429, headers={}, body="")
+        mock_rest_client.agent_api_chats.list_agent_chats = AsyncMock(
+            side_effect=rate_limited,
+        )
+
+        daemon = WatchdogDaemon(
+            config=watchdog_config,
+            rest_client=mock_rest_client,
+            agent_id="agent-wd",
+            conductor_id="agent-cond",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="codeband.agents.watchdog"):
+            await daemon._patrol()
+
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert error_records == [], (
+            f"Expected no ERROR records, got: {[r.getMessage() for r in error_records]}"
+        )
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "429" in r.getMessage()
+        ]
+        assert len(warn_records) == 1
+        assert "rate-limited" in warn_records[0].getMessage().lower()
+
+    @pytest.mark.asyncio
     async def test_skips_senders_not_in_room(self, watchdog_config, mock_rest_client):
         """Stale senders who are no longer room participants must not be nudged.
 
