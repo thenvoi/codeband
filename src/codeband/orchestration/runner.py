@@ -465,7 +465,11 @@ async def _ensure_agents_registered(
         logger.info("No agent_config.yaml found — registering all agents...")
         try:
             from codeband.orchestration.setup import register_all_agents
-            await register_all_agents(config, project_dir)
+            # Auto-bootstrap during `cb run` — `detect_drift=False` so that
+            # starting a swarm cannot rotate credentials of agents another
+            # swarm (in another terminal / on another machine) is currently
+            # using. Drift correction is reserved for explicit `cb setup-agents`.
+            await register_all_agents(config, project_dir, detect_drift=False)
             return load_agent_config(project_dir)
         except Exception as e:
             raise RuntimeError(
@@ -486,7 +490,9 @@ async def _ensure_agents_registered(
         )
         try:
             from codeband.orchestration.setup import register_all_agents
-            await register_all_agents(config, project_dir)
+            # Same reasoning as above — auto-bootstrap must not rotate
+            # credentials of agents that may be in use elsewhere.
+            await register_all_agents(config, project_dir, detect_drift=False)
             agent_config = load_agent_config(project_dir)
         except Exception as e:
             raise RuntimeError(
@@ -964,8 +970,8 @@ def _build_worker_roster(config: CodebandConfig) -> str:
     deterministic opposite-framework reviewer without relying on a relay.
     """
     lines = ["## Worker Pool Roster", ""]
-    lines.append("| Role | Framework | Count | Workers | Description |")
-    lines.append("|------|-----------|-------|---------|-------------|")
+    lines.append("| Role | Framework | Count | Workers |")
+    lines.append("|------|-----------|-------|---------|")
 
     display_role = {
         WorkerRole.CODER: "Coder",
@@ -983,10 +989,9 @@ def _build_worker_roster(config: CodebandConfig) -> str:
             entry: PoolEntry = pool.entry_for(fw)
             if entry.count == 0:
                 continue
-            desc = entry.description or ""
             workers = ", ".join(_display_name(role, fw, i) for i in range(entry.count))
             lines.append(
-                f"| {role_label} | {fw.value} | {entry.count} | {workers} | {desc} |",
+                f"| {role_label} | {fw.value} | {entry.count} | {workers} |",
             )
 
     _rows(WorkerRole.CODER, "Coder", config.agents.coders)
@@ -1023,6 +1028,40 @@ def _create_planner(
     return ClaudePlannerRunner(**kwargs).adapter
 
 
+def _build_repo_pin(config: CodebandConfig) -> str | None:
+    """Build the Conductor's "Configured Repository" prompt section.
+
+    The Conductor uses this to verify every reported PR URL lands in the
+    configured repo — and to close + reroute any PR that does not. Returns
+    None for non-GitHub repo URLs (the verification rule does not apply).
+    """
+    try:
+        from codeband.github.prs import repo_slug
+        slug = repo_slug(config.repo.url)
+    except ValueError:
+        return None
+    return (
+        "## Configured Repository\n"
+        "\n"
+        f"- URL: {config.repo.url}\n"
+        f"- Slug: `{slug}`\n"
+        "\n"
+        "**PR destination invariant.** Every PR that any agent in this swarm "
+        "opens MUST land in the repo above. When a Coder reports a PR URL, "
+        "you MUST run\n"
+        "\n"
+        f"  `gh pr view <num> --repo <pr-url-derived-slug> --json url,headRepository,headRepositoryOwner,baseRefName,state`\n"
+        "\n"
+        "and verify that `headRepositoryOwner.login + \"/\" + headRepository.name` "
+        f"equals `{slug}`. If it does not, immediately close the wrong PR with\n"
+        "\n"
+        "  `gh pr close <num> --repo <wrong-owner>/<wrong-repo> --comment \"Closed by Codeband: wrong destination. Configured repo is "
+        f"{slug}.\"`\n"
+        "\n"
+        f"and notify the originating Coder: \"PR #X targeted <wrong>; configured repo is `{slug}`. Re-open against the configured repo from the same branch.\" Do NOT route the wrong PR to the Code Reviewer or Mergemaster under any circumstances."
+    )
+
+
 def _create_conductor(
     config: CodebandConfig,
     *,
@@ -1038,6 +1077,7 @@ def _create_conductor(
         model=config.agents.conductor.model,
         worker_roster=worker_roster,
         auto_merge=config.agents.mergemaster.auto_merge.value,
+        repo_pin=_build_repo_pin(config),
     )
 
     if config.agents.conductor.framework == Framework.CODEX:

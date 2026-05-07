@@ -85,7 +85,15 @@ def test_coder_dispatches_review_directly_to_opposite_framework_reviewer():
         "@mentioning **both an opposite-framework Code Reviewer and @Conductor**"
         in coder
     )
-    assert "Pick the reviewer from the Worker Pool Roster" in coder
+    # Coder picks the reviewer themselves via peer discovery — not via a
+    # Conductor relay, and not from a static hard-coded roster (lazy invites).
+    # Discovery filters on `description` (the semantic field), not on a name
+    # pattern, since names are an internal convention and descriptions carry
+    # the role + framework signal we actually want to match on.
+    assert "Pick the reviewer through discovery on `description`" in coder
+    assert "thenvoi_lookup_peers()" in coder
+    assert "role=code_review_agent" in coder
+    assert "framework=Codex" in coder
 
     # Code Reviewer side: expects direct dispatch from the Coder and direct
     # failure reporting back to the PR owner.
@@ -234,3 +242,78 @@ def test_mergemaster_hard_resets_to_remote_base_before_every_merge():
     assert "git clean -fd" in mergemaster
     assert "git status --short" in mergemaster
     assert "local base branch that is ahead of `origin/<repo-base>`" in mergemaster
+
+
+def test_coder_prompt_forbids_repo_and_head_flags_on_gh_pr_create():
+    """Hard guarantee: PR #1469 was opened against Delgan/loguru because the
+    Coder's recovery path used `--head ofermend:<branch>` without `--repo`,
+    so `gh pr create` defaulted to the upstream parent. The fix makes the
+    canonical command plain (no `--repo`, no `--head`) and the prompt now
+    explicitly forbids those flags. Any regression here re-opens the bug.
+    """
+    coder = Path("src/codeband/prompts/coder.md").read_text(encoding="utf-8")
+
+    assert "PR destination invariant" in coder
+    assert "Codeband pre-pins your worktree's `gh` default repo" in coder
+    # The forbidden-flag rule must name both flags by name.
+    assert "Do **not** add `--repo` or `--head <owner>:<branch>` flags" in coder
+    # The canonical command is the plain form — no `--repo` after `gh pr create`.
+    canonical_block_present = (
+        "gh pr create --base <repo-base> --title \"<task summary>\" --body" in coder
+    )
+    assert canonical_block_present, "Plain `gh pr create` form must remain canonical"
+    # Post-creation destination check — Coder must verify the PR landed in the
+    # configured repo before reporting completion.
+    assert "headRepositoryOwner" in coder and "headRepository" in coder
+    assert "gh pr close --repo <wrong-owner/wrong-repo>" in coder
+
+
+def test_conductor_repo_pin_section_renders():
+    """Conductor's prompt must receive a Configured Repository section that
+    forbids routing wrong-repo PRs. Built by `runner._build_repo_pin`."""
+    from codeband.config import (
+        AgentsConfig, BandConfig, CodebandConfig, FrameworkPool, PoolEntry,
+        RepoConfig, ReviewersConfig, WorkspaceConfig,
+    )
+    from codeband.orchestration.runner import _build_repo_pin
+
+    config = CodebandConfig(
+        repo=RepoConfig(url="https://github.com/ofermend/loguru.git"),
+        workspace=WorkspaceConfig(path="/tmp/ws"),
+        band=BandConfig(),
+        agents=AgentsConfig(
+            coders=FrameworkPool(claude_sdk=PoolEntry(count=1)),
+            reviewers=ReviewersConfig(claude_sdk=PoolEntry(count=1)),
+            planners=FrameworkPool(claude_sdk=PoolEntry(count=1)),
+        ),
+    )
+    pin = _build_repo_pin(config)
+    assert pin is not None
+    assert "## Configured Repository" in pin
+    assert "ofermend/loguru" in pin
+    assert "headRepositoryOwner.login" in pin
+    # The Conductor MUST close wrong-repo PRs and refuse to route them.
+    assert "gh pr close <num> --repo <wrong-owner>/<wrong-repo>" in pin
+    assert "Do NOT route the wrong PR" in pin
+
+
+def test_conductor_repo_pin_skips_non_github_url():
+    """Non-GitHub URLs (GitLab, self-hosted) → no repo pin (gh's destination
+    invariant doesn't apply to non-GitHub)."""
+    from codeband.config import (
+        AgentsConfig, BandConfig, CodebandConfig, FrameworkPool, PoolEntry,
+        RepoConfig, ReviewersConfig, WorkspaceConfig,
+    )
+    from codeband.orchestration.runner import _build_repo_pin
+
+    config = CodebandConfig(
+        repo=RepoConfig(url="https://gitlab.example.com/group/proj.git"),
+        workspace=WorkspaceConfig(path="/tmp/ws"),
+        band=BandConfig(),
+        agents=AgentsConfig(
+            coders=FrameworkPool(claude_sdk=PoolEntry(count=1)),
+            reviewers=ReviewersConfig(claude_sdk=PoolEntry(count=1)),
+            planners=FrameworkPool(claude_sdk=PoolEntry(count=1)),
+        ),
+    )
+    assert _build_repo_pin(config) is None

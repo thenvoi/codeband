@@ -227,7 +227,6 @@ class TestConfigPoolPrimitives:
         e = PoolEntry()
         assert e.count == 0
         assert e.model is None
-        assert e.description is None
         assert e.max_restarts == 5
 
     def test_framework_pool_active_frameworks(self):
@@ -256,11 +255,11 @@ class TestConfigPoolPrimitives:
         from codeband.config import FrameworkPool, PoolEntry
 
         fp = FrameworkPool(
-            claude_sdk=PoolEntry(count=2, description="refactoring"),
+            claude_sdk=PoolEntry(count=2, model="claude-x"),
             codex=PoolEntry(count=1),
         )
         dumped = yaml.safe_dump(fp.model_dump(mode="json"))
         loaded = FrameworkPool.model_validate(yaml.safe_load(dumped))
         assert loaded.claude_sdk.count == 2
-        assert loaded.claude_sdk.description == "refactoring"
+        assert loaded.claude_sdk.model == "claude-x"
         assert loaded.codex.count == 1

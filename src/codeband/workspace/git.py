@@ -37,6 +37,50 @@ def clone_bare(repo_url: str, dest: Path) -> None:
     _run_git(["fetch", "origin"], cwd=dest)
 
 
+def pin_gh_default_repo(worktree: Path, repo_url: str) -> None:
+    """Pin gh's default repo for `worktree` to the slug derived from `repo_url`.
+
+    Hard guarantee: a Coder running `gh pr create` from this worktree without
+    flags will target the configured repo, not the upstream parent. Without
+    this pinning, gh defaults base-repo resolution to the parent fork, which
+    silently opens PRs against the upstream public repo (the bug that hit
+    PR #1469 against Delgan/loguru). `gh repo set-default` writes the pinned
+    slug to `.git/config` under `[remote "origin"] gh-resolved`.
+
+    Idempotent — safe to call repeatedly. No-ops when:
+      - `gh` is not installed (Coder will see a clear error at PR time).
+      - The URL is not a recognizable GitHub URL (gh only knows GitHub).
+      - The set-default call returns non-zero — logged at WARN, not raised,
+        so a missing gh-config does not block workspace setup.
+    """
+    if shutil.which("gh") is None:
+        logger.debug("gh CLI not found; skipping repo set-default for %s", worktree)
+        return
+    try:
+        from codeband.github.prs import repo_slug
+        slug = repo_slug(repo_url)
+    except ValueError:
+        logger.debug("repo URL %r is not GitHub; skipping gh set-default", repo_url)
+        return
+    try:
+        subprocess.run(
+            ["gh", "repo", "set-default", slug],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=15,
+        )
+        logger.info("Pinned gh default repo for %s to %s", worktree, slug)
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            "gh repo set-default failed in %s (slug=%s): %s",
+            worktree, slug, (exc.stderr or "").strip(),
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("gh repo set-default timed out in %s", worktree)
+
+
 def create_worktree(
     bare_repo: Path,
     worktree_path: Path,

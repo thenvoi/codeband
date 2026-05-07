@@ -43,23 +43,6 @@ class AgentCredentials(_StrictModel):
     api_key: str
 
 
-_DEFAULT_DESCRIPTIONS = {
-    Framework.CLAUDE_SDK: (
-        "Claude Code agent. Strong at complex reasoning, refactoring, "
-        "test writing, and multi-step problem solving."
-    ),
-    Framework.CODEX: (
-        "Codex agent. Fast at bulk code generation, boilerplate, "
-        "and straightforward implementation tasks."
-    ),
-}
-
-
-def default_coder_description(framework: Framework) -> str:
-    """Return a sensible default description for a coder framework."""
-    return _DEFAULT_DESCRIPTIONS.get(framework, "General-purpose coding agent.")
-
-
 class ConductorConfig(_StrictModel):
     """Configuration for the conductor agent (single-instance coordinator)."""
 
@@ -120,16 +103,22 @@ class WatchdogConfig(_StrictModel):
 # `AgentsConfig` to declare capacity for each pool role (planners,
 # plan_reviewers, coders, reviewers) as `{framework: {count, model, …}}`.
 
-class PoolEntry(_StrictModel):
+class PoolEntry(BaseModel):
     """Capacity for one (role, framework) combination in a worker pool.
 
     `count: 0` opts out of this framework for this role. `model=None`
     falls back to a framework-appropriate default at spawn time.
     """
 
+    # `extra="ignore"` (instead of the project-default `extra="forbid"`) so
+    # codeband.yaml files written by an older version still load. The 0.1.0
+    # series wrote a `description` field here; 0.1.1 removed the field but
+    # forbidding it on load would break every existing install. Unknown keys
+    # are silently dropped on read and disappear from the file on next save.
+    model_config = ConfigDict(extra="ignore")
+
     count: int = Field(default=0, ge=0)
     model: str | None = None
-    description: str | None = None
     # Deprecated — no longer honored. Coders now reconnect forever under
     # WorkerSupervisor; only SIGINT/SIGTERM ends a session. Kept for backward
     # compatibility so existing codeband.yaml files don't fail to parse.
@@ -207,16 +196,8 @@ def _default_coders_pool() -> FrameworkPool:
     # mergemaster stay on Sonnet, which is a better cost/latency fit for
     # their lighter workloads.
     return FrameworkPool(
-        claude_sdk=PoolEntry(
-            count=1,
-            model="claude-opus-4-7",
-            description=default_coder_description(Framework.CLAUDE_SDK),
-        ),
-        codex=PoolEntry(
-            count=1,
-            model="gpt-5.4",
-            description=default_coder_description(Framework.CODEX),
-        ),
+        claude_sdk=PoolEntry(count=1, model="claude-opus-4-7"),
+        codex=PoolEntry(count=1, model="gpt-5.4"),
     )
 
 
@@ -365,8 +346,8 @@ def scale_pool(
     """Set the capacity of a (pool, framework) entry in an existing config.
 
     `pool` must be one of "planners" / "plan_reviewers" / "coders" / "reviewers".
-    Preserves model/description/restart settings on the pool entry. Saves
-    the updated config back to disk and returns it.
+    Preserves model/restart settings on the pool entry. Saves the updated
+    config back to disk and returns it.
     """
     if count < 0:
         raise ValueError("count must be >= 0")

@@ -34,6 +34,7 @@ from codeband.doctor import (
     check_gh,
     check_gh_auth,
     check_git,
+    check_active_room_membership,
     check_memory_mode,
     check_python_version,
     check_workspace_writable,
@@ -354,6 +355,85 @@ class TestMemoryMode:
         ctx = Context(project_dir=tmp_path, config=cfg, agent_config=acfg)
         result = await check_memory_mode(ctx)
         assert result.status == Status.SKIP
+
+
+class TestActiveRoomMembership:
+    """Lazy-invite visibility check: which agents are in the active task room."""
+
+    async def test_skips_without_config(self, tmp_path):
+        result = await check_active_room_membership(Context(project_dir=tmp_path))
+        assert result.status == Status.SKIP
+
+    async def test_skips_without_room_pointer(self, tmp_path):
+        cfg = _make_config(tmp_path)
+        acfg = AgentConfigFile(
+            agents={"conductor": AgentCredentials(agent_id="cond", api_key="k")}
+        )
+        ctx = Context(project_dir=tmp_path, config=cfg, agent_config=acfg)
+        result = await check_active_room_membership(ctx)
+        assert result.status == Status.SKIP
+        assert ".codeband_room not found" in result.message
+
+    async def test_reports_present_and_pending_agents(self, tmp_path):
+        """Conductor present, others pending — the expected fresh-room state."""
+        cfg = _make_config(tmp_path)
+        acfg = AgentConfigFile(
+            agents={
+                "conductor": AgentCredentials(agent_id="cond-id", api_key="k1"),
+                "coder-claude_sdk-0": AgentCredentials(agent_id="cc0-id", api_key="k2"),
+                "reviewer-codex-0": AgentCredentials(agent_id="rx0-id", api_key="k3"),
+            }
+        )
+        (tmp_path / ".codeband_room").write_text(
+            "deadbeef-1234-5678-9abc-def012345678", encoding="utf-8",
+        )
+        ctx = Context(project_dir=tmp_path, config=cfg, agent_config=acfg)
+
+        # Mock the participants response: only the Conductor is in the room.
+        fake_participant = type("P", (), {"id": "cond-id"})()
+        fake_resp = type("R", (), {"data": [fake_participant]})()
+
+        async def fake_list(chat_id):
+            return fake_resp
+
+        def fake_client(**_):
+            c = type("C", (), {})()
+            c.agent_api_participants = type("A", (), {})()
+            c.agent_api_participants.list_agent_chat_participants = fake_list
+            return c
+
+        with patch("thenvoi_rest.AsyncRestClient", side_effect=fake_client):
+            result = await check_active_room_membership(ctx)
+
+        assert result.status == Status.INFO
+        assert "conductor" in result.message
+        assert "not yet invited" in result.message
+        assert "coder-claude_sdk-0" in result.message
+        assert "reviewer-codex-0" in result.message
+
+    async def test_warns_on_room_lookup_failure(self, tmp_path):
+        """A deleted-on-Band room or transient REST failure becomes WARN, not FAIL."""
+        cfg = _make_config(tmp_path)
+        acfg = AgentConfigFile(
+            agents={"conductor": AgentCredentials(agent_id="cond", api_key="k")}
+        )
+        (tmp_path / ".codeband_room").write_text("ghost-room", encoding="utf-8")
+        ctx = Context(project_dir=tmp_path, config=cfg, agent_config=acfg)
+
+        async def fake_list(chat_id):
+            raise RuntimeError("404 Not Found")
+
+        def fake_client(**_):
+            c = type("C", (), {})()
+            c.agent_api_participants = type("A", (), {})()
+            c.agent_api_participants.list_agent_chat_participants = fake_list
+            return c
+
+        with patch("thenvoi_rest.AsyncRestClient", side_effect=fake_client):
+            result = await check_active_room_membership(ctx)
+
+        assert result.status == Status.WARN
+        assert "ghost-ro" in result.message  # truncated room id appears
 
 
 # ─── run_all / exit code ────────────────────────────────────────────────────

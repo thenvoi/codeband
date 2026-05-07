@@ -157,7 +157,7 @@ class TestWorkerRosterFormat:
 
         roster = _build_worker_roster(config)
 
-        assert "| Role | Framework | Count | Workers | Description |" in roster
+        assert "| Role | Framework | Count | Workers |" in roster
         assert "Coder-Claude-0, Coder-Claude-1" in roster
         assert "Reviewer-Codex-0, Reviewer-Codex-1" in roster
         assert "Planner-Claude-0" in roster

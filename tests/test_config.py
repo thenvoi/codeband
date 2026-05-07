@@ -133,15 +133,47 @@ class TestPoolEntry:
         e = PoolEntry()
         assert e.count == 0
         assert e.model is None
-        assert e.description is None
         assert e.max_restarts == 5
 
     def test_with_overrides(self):
-        e = PoolEntry(count=3, model="x", description="y", max_restarts=10)
+        e = PoolEntry(count=3, model="x", max_restarts=10)
         assert e.count == 3
         assert e.model == "x"
-        assert e.description == "y"
         assert e.max_restarts == 10
+
+    def test_ignores_legacy_description_field_for_back_compat(self):
+        """0.1.0 wrote a `description` field here; 0.1.1 removed it. Old
+        codeband.yaml files must still load without raising — the field is
+        silently dropped, not preserved."""
+        e = PoolEntry(count=1, description="old 0.1.0 description")
+        assert e.count == 1
+        assert not hasattr(e, "description")
+        # Round-tripping through model_dump() also drops the legacy field, so
+        # the next `to_yaml` write produces a clean 0.1.1 file.
+        assert "description" not in e.model_dump()
+
+    def test_ignores_unknown_legacy_fields_yaml_roundtrip(self):
+        """End-to-end: yaml with a `description: null` (the most common 0.1.0
+        shape) round-trips through FrameworkPool without raising."""
+        import yaml as _yaml
+
+        legacy_yaml = """
+claude_sdk:
+  count: 2
+  model: claude-x
+  description: null
+codex:
+  count: 1
+  model: gpt-5
+  description: Some old prose from 0.1.0
+"""
+        loaded = FrameworkPool.model_validate(_yaml.safe_load(legacy_yaml))
+        assert loaded.claude_sdk.count == 2
+        assert loaded.claude_sdk.model == "claude-x"
+        assert loaded.codex.count == 1
+        # Round-trip dumps a clean 0.1.1 file with no `description` key.
+        dumped = _yaml.safe_dump(loaded.model_dump(mode="json"))
+        assert "description" not in dumped
 
 
 class TestFrameworkPool:
@@ -172,13 +204,13 @@ class TestFrameworkPool:
         import yaml
 
         fp = FrameworkPool(
-            claude_sdk=PoolEntry(count=2, description="refactoring"),
+            claude_sdk=PoolEntry(count=2, model="claude-x"),
             codex=PoolEntry(count=1),
         )
         dumped = yaml.safe_dump(fp.model_dump(mode="json"))
         loaded = FrameworkPool.model_validate(yaml.safe_load(dumped))
         assert loaded.claude_sdk.count == 2
-        assert loaded.claude_sdk.description == "refactoring"
+        assert loaded.claude_sdk.model == "claude-x"
         assert loaded.codex.count == 1
 
 
@@ -275,16 +307,13 @@ class TestScalePool:
         assert updated.agents.coders.codex.count == 0
         assert updated.agents.coders.active_frameworks() == [Framework.CLAUDE_SDK]
 
-    def test_preserves_model_and_description(self, tmp_path: Path):
-        """Scaling keeps the existing entry's model/description settings."""
+    def test_preserves_model(self, tmp_path: Path):
+        """Scaling keeps the existing entry's model setting."""
         config = CodebandConfig(
             repo=RepoConfig(url="https://github.com/a/b.git"),
             agents=AgentsConfig(
                 coders=FrameworkPool(
-                    claude_sdk=PoolEntry(
-                        count=1, model="claude-opus-4-7",
-                        description="My custom Claude",
-                    ),
+                    claude_sdk=PoolEntry(count=1, model="claude-opus-4-7"),
                 ),
             ),
         )
@@ -293,7 +322,6 @@ class TestScalePool:
 
         updated = scale_pool(path, "coders", Framework.CLAUDE_SDK, 3)
         assert updated.agents.coders.claude_sdk.model == "claude-opus-4-7"
-        assert updated.agents.coders.claude_sdk.description == "My custom Claude"
         assert updated.agents.coders.claude_sdk.count == 3
 
     def test_negative_count_rejected(self, tmp_path: Path):

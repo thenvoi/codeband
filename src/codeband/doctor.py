@@ -444,21 +444,31 @@ def check_workspace_writable(ctx: Context) -> CheckResult:
     return CheckResult(Status.OK, f"Workspace writable ({ws_path})")
 
 
-async def check_band_rest(ctx: Context) -> CheckResult:
+def _conductor_rest_client(ctx: Context):
+    """Return an AsyncRestClient using the Conductor's creds, or a CheckResult to short-circuit.
+
+    Three checks below need the same setup: config + agent_config + conductor creds
+    + the deferred thenvoi_rest import. Caller does `isinstance(r, CheckResult)`
+    to decide whether to return early.
+    """
     if ctx.config is None or ctx.agent_config is None:
         return CheckResult(Status.SKIP, "codeband.yaml or agent_config.yaml not loaded")
     conductor = ctx.agent_config.agents.get("conductor")
     if conductor is None:
-        return CheckResult(
-            Status.SKIP, "Conductor creds not registered — can't probe Band.ai",
-        )
+        return CheckResult(Status.SKIP, "Conductor creds not registered")
     try:
         from thenvoi_rest import AsyncRestClient
     except ImportError as exc:
         return CheckResult(Status.FAIL, f"thenvoi_rest not importable: {exc}")
-    client = AsyncRestClient(
+    return AsyncRestClient(
         api_key=conductor.api_key, base_url=ctx.config.band.rest_url,
     )
+
+
+async def check_band_rest(ctx: Context) -> CheckResult:
+    client = _conductor_rest_client(ctx)
+    if isinstance(client, CheckResult):
+        return client
     try:
         identity = await asyncio.wait_for(
             client.agent_api_identity.get_agent_me(), timeout=5,
@@ -484,23 +494,67 @@ async def check_band_rest(ctx: Context) -> CheckResult:
     )
 
 
-async def check_memory_mode(ctx: Context) -> CheckResult:
-    if ctx.config is None or ctx.agent_config is None:
-        return CheckResult(Status.SKIP, "codeband.yaml or agent_config.yaml not loaded")
-    conductor = ctx.agent_config.agents.get("conductor")
-    if conductor is None:
-        return CheckResult(Status.SKIP, "Conductor creds not registered")
-    try:
-        from thenvoi_rest import AsyncRestClient
+async def check_active_room_membership(ctx: Context) -> CheckResult:
+    """INFO: report which configured agents are present in the active task room.
 
+    With lazy invites, agents are added to the room on demand by the inviting
+    agent (Conductor → Planner; Planner → Plan Reviewer; Coder → Reviewer; …).
+    A fresh task room contains only the Conductor; everyone else appears as the
+    workflow recruits them. This check makes that visible while debugging.
+    """
+    room_file = ctx.project_dir / ".codeband_room"
+    if not room_file.exists():
+        return CheckResult(Status.SKIP, "No active task room (.codeband_room not found)")
+    try:
+        room_id = room_file.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return CheckResult(Status.WARN, f"Could not read .codeband_room: {exc}")
+    if not room_id:
+        return CheckResult(Status.SKIP, ".codeband_room is empty")
+
+    client = _conductor_rest_client(ctx)
+    if isinstance(client, CheckResult):
+        return client
+    try:
+        resp = await asyncio.wait_for(
+            client.agent_api_participants.list_agent_chat_participants(chat_id=room_id),
+            timeout=5,
+        )
+    except asyncio.TimeoutError:
+        return CheckResult(
+            Status.WARN,
+            f"Timed out listing participants for room {room_id[:8]}…",
+            remediation="Check Band.ai REST connectivity (band.rest_url in codeband.yaml).",
+        )
+    except Exception as exc:
+        return CheckResult(
+            Status.WARN,
+            f"Could not list participants for room {room_id[:8]}…: "
+            f"{type(exc).__name__}: {exc}",
+            remediation="The room may have been deleted on Band.ai. Run `cb reset` to clear .codeband_room.",
+        )
+
+    present_ids = {p.id for p in (resp.data or []) if getattr(p, "id", None)}
+    present, pending = [], []
+    for key, creds in ctx.agent_config.agents.items():
+        (present if creds.agent_id in present_ids else pending).append(key)
+    msg = (
+        f"Room {room_id[:8]}… — in: {', '.join(sorted(present)) or '(none)'}; "
+        f"not yet invited: {', '.join(sorted(pending)) or '(none)'}"
+    )
+    return CheckResult(Status.INFO, msg)
+
+
+async def check_memory_mode(ctx: Context) -> CheckResult:
+    client = _conductor_rest_client(ctx)
+    if isinstance(client, CheckResult):
+        return client
+    try:
         from codeband.memory import probe_memory_backend, reset_memory_mode
     except ImportError as exc:
         return CheckResult(Status.FAIL, f"Memory module not importable: {exc}")
 
     reset_memory_mode()  # ensure the doctor probes fresh even if another command cached
-    client = AsyncRestClient(
-        api_key=conductor.api_key, base_url=ctx.config.band.rest_url,
-    )
     override = (
         ctx.config.band.memory_mode
         if ctx.config.band.memory_mode != "auto"
@@ -538,6 +592,7 @@ _CHECKS: list[Check] = [
     Check("Agent count vs Band.ai tier", "Config", check_agent_count_vs_tier),
     Check("Band.ai REST reachable", "Connectivity", check_band_rest),
     Check("Memory backend", "Connectivity", check_memory_mode),
+    Check("Active room membership", "Connectivity", check_active_room_membership),
 ]
 
 

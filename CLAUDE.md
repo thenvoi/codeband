@@ -34,7 +34,7 @@ All LLM calls — including the `cb prs --smart` / `cb issues --smart` CLI helpe
 
 ### Worker pool architecture
 
-Coders, Code Reviewers, Planners, and Plan Reviewers are **pool roles** — each is declared in `codeband.yaml` as `{framework: {count, model, description?}}` under `agents.{coders, reviewers, planners, plan_reviewers}`. Conductor and Mergemaster are **singletons**. Pool member identities follow `{role}-{framework}-{index}` (e.g., `coder-claude_sdk-0`); Band.ai display names are title-cased (`Coder-Claude-0`). The default `cb init` config is 8 agents total — fits Band.ai's free-tier 10-agent cap.
+Coders, Code Reviewers, Planners, and Plan Reviewers are **pool roles** — each is declared in `codeband.yaml` as `{framework: {count, model}}` under `agents.{coders, reviewers, planners, plan_reviewers}`. Conductor and Mergemaster are **singletons**. Pool member identities follow `{role}-{framework}-{index}` (e.g., `coder-claude_sdk-0`); Band.ai display names are title-cased (`Coder-Claude-0`). The default `cb init` config is 8 agents total — fits Band.ai's free-tier 10-agent cap.
 
 The `codeband/workers/pool.py:WorkerPool` is a thread-safe in-memory allocator with `acquire(role, framework)`, `release(worker_id)`, and `pair_for_task(coder_role, coder_framework)` which atomically reserves a coder and an opposite-framework reviewer (adversarial cross-model review is the primary value prop — a Claude coder's PR routes to a Codex reviewer, and vice versa). The allocator is defined but not yet wired into the Conductor's LLM prompt — allocation is currently prompt-enforced via `runner._build_worker_roster()` which surfaces the pool to the Conductor. Code-backed allocation is on the roadmap.
 

@@ -14,6 +14,7 @@ from codeband.workspace.git import (
     commit_and_push,
     create_worktree,
     list_worktrees,
+    pin_gh_default_repo,
     prepare_task_branch,
     remove_worktree,
 )
@@ -676,3 +677,79 @@ class TestValidateWorkspaceRoot:
         # /nonexistent walks up to /, which is read-only on macOS
         with pytest.raises(RuntimeError, match="not writable"):
             _validate_workspace_root(Path("/nonexistent_workspace"))
+
+
+class TestPinGhDefaultRepo:
+    """The PR-destination guarantee depends on this helper running once per
+    worktree at workspace setup. If it ever stops being called (or stops
+    pinning correctly), an agent's plain `gh pr create` will silently target
+    the upstream parent of a fork — the bug that opened PR #1469 against
+    Delgan/loguru."""
+
+    def test_skips_when_gh_not_installed(self, tmp_path: Path, monkeypatch):
+        """No `gh` binary on PATH → no-op, no error."""
+        monkeypatch.setattr("codeband.workspace.git.shutil.which", lambda _: None)
+        called = []
+        monkeypatch.setattr(
+            "codeband.workspace.git.subprocess.run",
+            lambda *a, **kw: called.append(a) or None,
+        )
+        pin_gh_default_repo(tmp_path, "https://github.com/owner/repo.git")
+        assert called == []
+
+    def test_skips_for_non_github_url(self, tmp_path: Path, monkeypatch):
+        """gh only knows GitHub. SSH-to-GitLab, self-hosted, etc. → no-op."""
+        monkeypatch.setattr(
+            "codeband.workspace.git.shutil.which", lambda _: "/usr/bin/gh",
+        )
+        called = []
+        monkeypatch.setattr(
+            "codeband.workspace.git.subprocess.run",
+            lambda *a, **kw: called.append(a) or None,
+        )
+        pin_gh_default_repo(tmp_path, "https://gitlab.example.com/group/proj.git")
+        assert called == []
+
+    def test_invokes_gh_repo_set_default_with_correct_slug(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """The happy path: gh available + GitHub URL → exactly one
+        `gh repo set-default <owner>/<name>` invocation in the worktree's cwd."""
+        monkeypatch.setattr(
+            "codeband.workspace.git.shutil.which", lambda _: "/usr/bin/gh",
+        )
+        captured = {}
+
+        class _Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            captured["cwd"] = kwargs.get("cwd")
+            return _Result()
+
+        monkeypatch.setattr("codeband.workspace.git.subprocess.run", fake_run)
+        pin_gh_default_repo(tmp_path, "https://github.com/ofermend/loguru.git")
+        assert captured["args"] == ["gh", "repo", "set-default", "ofermend/loguru"]
+        assert captured["cwd"] == tmp_path
+
+    def test_warns_but_does_not_raise_on_gh_failure(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """A failed `gh repo set-default` (e.g., gh not authed) must NOT
+        block workspace setup. Worktree creation should complete; the Coder
+        will see a clear error at PR-creation time instead."""
+        monkeypatch.setattr(
+            "codeband.workspace.git.shutil.which", lambda _: "/usr/bin/gh",
+        )
+
+        def fake_run(args, **kwargs):
+            raise subprocess.CalledProcessError(
+                1, args, output="", stderr="not authenticated",
+            )
+
+        monkeypatch.setattr("codeband.workspace.git.subprocess.run", fake_run)
+        # Must not raise.
+        pin_gh_default_repo(tmp_path, "https://github.com/ofermend/loguru.git")

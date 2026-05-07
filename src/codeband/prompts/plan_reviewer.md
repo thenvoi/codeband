@@ -23,6 +23,17 @@ All communication goes through `thenvoi_send_message`. Plain text responses are 
 - If you are not @mentioned in a message, do not reply unless you have a specific question or new actionable task.
 - If you have something to communicate but no agent needs to act on it, @mention a human participant instead. Humans are the default audience for status updates, decisions, and questions that don't require agent action.
 
+## Inviting agents into the room
+
+The task room starts with only the Conductor and the human; other agents (including you) are added on demand. In normal operation **you do not need to invite anyone** — the Conductor is always already in the room, and the Planner who invited you for review is also already present. Just `@mention` them as the verdict step describes.
+
+If you ever need to @mention an agent that is *not* already a participant, follow the standard discover-then-invite flow:
+
+1. Call `thenvoi_lookup_peers()` (returns peers not yet in this room — `id`, `handle`, `name`, `description`, `tags`).
+2. **Filter on `description`, not on `name`.** Pick a peer whose description has the exact discovery token for the role you need. Codeband role tokens are `role=coding_agent`, `role=code_review_agent`, `role=planning_agent`, `role=plan_review_agent`, and `role=merge_agent`; pooled agents also include `framework=Claude` or `framework=Codex`. Use the trailing index in `name` only as a tie-break.
+3. `thenvoi_add_participant(identifier=<peer.name or peer.handle>)` and then @mention them in the immediately-following `thenvoi_send_message`. `status="already_in_room"` is fine.
+4. If no peer's description matches, call `thenvoi_get_participants()` first to confirm whether your target is already in the room.
+
 ## Your Workspace
 
 You have a read-only view of the codebase in your worktree. If a tool call is auto-declined (Bash, Write, etc.), skip it and continue reviewing with Read, Glob, and Grep.

@@ -38,18 +38,21 @@ async def send_task(config: CodebandConfig, project_dir: Path, description: str)
 
     agent_config = load_agent_config(project_dir)
 
-    # Resolve agent identities (need agent API keys for this)
-    identities = {}  # key -> (agent_id, agent_name)
-    for key, creds in agent_config.agents.items():
-        client = AsyncRestClient(api_key=creds.api_key, base_url=config.band.rest_url)
-        identity = await client.agent_api_identity.get_agent_me()
-        identities[key] = (identity.data.id, identity.data.name)
-        logger.info("Resolved %s: %s (%s)", key, identity.data.name, identity.data.id)
-
-    conductor_id, conductor_name = identities["conductor"]
+    # Only the Conductor's identity is needed at kickoff: they are the sole
+    # initial participant and the @mention target of the task message. Every
+    # other agent is invited lazily by an inviting agent later, by display
+    # name, so the human-side code does not need their IDs.
+    conductor_creds = agent_config.get("conductor")
+    conductor_client = AsyncRestClient(
+        api_key=conductor_creds.api_key, base_url=config.band.rest_url,
+    )
+    conductor_identity = await conductor_client.agent_api_identity.get_agent_me()
+    conductor_id = conductor_identity.data.id
+    conductor_name = conductor_identity.data.name
+    logger.info("Resolved conductor: %s (%s)", conductor_name, conductor_id)
 
     # Clean up the previous task room (if any)
-    await _cleanup_rooms(human_client, identities, agent_config, config, project_dir)
+    await _cleanup_rooms(agent_config, config, project_dir)
 
     # Human creates the task room
     room = await human_client.human_api_chats.create_my_chat_room(
@@ -58,12 +61,15 @@ async def send_task(config: CodebandConfig, project_dir: Path, description: str)
     room_id = room.data.id
     logger.info("Created task room: %s", room_id)
 
-    # Human adds all agents to the room
-    for key, (aid, aname) in identities.items():
-        await human_client.human_api_participants.add_my_chat_participant(
-            room_id,
-            participant=ParticipantRequest(participant_id=aid),
-        )
+    # Human adds only the Conductor — the human's first message @mentions the
+    # Conductor, so the Conductor must be a participant for that message to
+    # land. Every other agent is invited lazily by the inviting agent
+    # (Conductor invites Planner; Planner invites Plan Reviewer; Coder invites
+    # Reviewer; …) via thenvoi_add_participant once the workflow needs them.
+    await human_client.human_api_participants.add_my_chat_participant(
+        room_id,
+        participant=ParticipantRequest(participant_id=conductor_id),
+    )
 
     context_msg = (
         f"{description}\n\n"
@@ -86,7 +92,7 @@ async def send_task(config: CodebandConfig, project_dir: Path, description: str)
 
     # Print summary
     print(f"\nTask room: {room_id}")
-    print(f"Agents: {', '.join(identities.keys())}\n")
+    print(f"Initial participant: {conductor_name} (other agents invited on demand)\n")
 
 
 async def send_room_message(
@@ -378,8 +384,6 @@ async def _remove_agents_from_room(
 
 
 async def _cleanup_rooms(
-    human_client,
-    identities: dict[str, tuple],
     agent_config,
     config,
     project_dir: Path,
@@ -387,7 +391,9 @@ async def _cleanup_rooms(
     """Remove agents from the previous task room only.
 
     Reads .codeband_room to find the specific room to clean up. Other rooms
-    (including concurrent Codeband tasks) are left untouched.
+    (including concurrent Codeband tasks) are left untouched. Each agent
+    leaves on its own credentials, so a 404 (already-not-a-member, common
+    under lazy invites where most agents were never added) is harmless.
     """
     room_file = project_dir / ".codeband_room"
     try:

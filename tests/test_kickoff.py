@@ -376,9 +376,14 @@ class TestSendTask:
         # Human created the room
         human_client.human_api_chats.create_my_chat_room.assert_called_once()
 
-        # Human added all 8 agents as participants (including conductor).
-        # Watchdog is not a platform agent — no participant slot for it.
-        assert human_client.human_api_participants.add_my_chat_participant.call_count == 8
+        # Lazy invites: only the Conductor is added at room creation. Every
+        # other agent is invited later by the inviting agent (Conductor →
+        # Planner; Coder → Reviewer; …) via thenvoi_add_participant once the
+        # workflow needs them.
+        human_client.human_api_participants.add_my_chat_participant.assert_called_once()
+        add_call = human_client.human_api_participants.add_my_chat_participant.call_args
+        assert add_call[0][0] == "room-123"
+        assert add_call[1]["participant"].participant_id == "cond-0"
 
         # Human sent the task message
         human_client.human_api_messages.send_my_chat_message.assert_called_once()
