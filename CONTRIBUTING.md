@@ -24,6 +24,8 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
+If you prefer [`uv`](https://docs.astral.sh/uv/), the equivalent is `uv venv && source .venv/bin/activate && uv pip install -e ".[dev]"`.
+
 Run the checks before opening a pull request:
 
 ```bash

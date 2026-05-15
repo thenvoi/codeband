@@ -101,7 +101,7 @@ If local state is disposable, delete the workspace and let Codeband rebuild it o
 
 ### `cb up` cannot find `docker-compose.yml`
 
-`cb up` needs the Docker assets from the source repository. If you installed with `pip install codeband`, clone the repository and run from that checkout, or copy the `docker/` directory into your project.
+`cb up` needs the Docker assets from the source repository. If you installed Codeband from PyPI (via `uv tool`, `pipx`, or `pip`), clone the repository and run from that checkout, or copy the `docker/` directory into your project.
 
 ### Git clone or fetch timeouts
 

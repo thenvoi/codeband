@@ -102,11 +102,13 @@ Distributed mode requires paid Band.ai memory. On free-tier Band.ai, use local o
 ## Quick Start
 
 ```bash
-pip install codeband
+uv tool install codeband   # or: pipx install codeband / pip install codeband
 cd my-project
 cb init --repo https://github.com/myorg/myrepo.git
 cp .env.example .env
 ```
+
+We recommend [`uv tool`](https://docs.astral.sh/uv/concepts/tools/) because it auto-manages the Python toolchain and installs `codeband` into its own isolated venv, avoiding conflicts with other tools in your environment. `pipx install codeband` is the equivalent pre-uv option. Plain `pip install codeband` also works if you are installing into an existing venv you manage. Don't have `uv`? Install it from [astral.sh/uv](https://docs.astral.sh/uv/getting-started/installation/) (one-liner curl) and run `uv tool update-shell` once so `cb` lands on your PATH.
 
 Edit `.env`:
 
@@ -218,7 +220,7 @@ Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), and pl
 ```bash
 git clone https://github.com/thenvoi/codeband.git
 cd codeband
-pip install -e ".[dev]"
+pip install -e ".[dev]"          # or: uv pip install -e ".[dev]"
 
 pytest
 ruff check src/ tests/

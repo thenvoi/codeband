@@ -346,7 +346,7 @@ docker run -d --name mergemaster \
 **Without Docker (Python directly):**
 
 ```bash
-pip install codeband
+uv tool install codeband   # or: pipx install codeband / pip install codeband
 cb run --agent coder-claude_sdk-0
 ```
 
