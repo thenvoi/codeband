@@ -25,15 +25,8 @@ agents:
     codex:      { count: 1, model: gpt-5.4 }
     # review_guidelines: "Optional project-wide plan-review policy"
   coders:
-    claude_sdk:
-      count: 1
-      model: claude-opus-4-7
-      description: "Strong at refactoring, testing, complex logic"
-      restart_delay_seconds: 5.0
-    codex:
-      count: 1
-      model: gpt-5.4
-      description: "Fast at bulk generation, boilerplate"
+    claude_sdk: { count: 1, model: claude-opus-4-7 }
+    codex:      { count: 1, model: gpt-5.4 }
   reviewers:
     claude_sdk: { count: 1, model: claude-sonnet-4-6 }
     codex:      { count: 1, model: gpt-5.4 }
@@ -43,6 +36,9 @@ agents:
     check_interval_seconds: 120
     stale_threshold_seconds: 300
     nudge_grace_seconds: 60
+    nudge_suppression_seconds: 1800
+    role_stale_thresholds: { coder: 900, mergemaster: 900 }
+    swarm_idle_grace_seconds: 1800
 
 workspace:
   path: ".codeband"
@@ -53,6 +49,10 @@ band:
   rest_url: "https://app.band.ai"
   ws_url: "wss://app.band.ai/api/v1/socket/websocket"
   memory_mode: "auto"
+  liveness_mode: "auto"
+
+claude:
+  auth_mode: "api_key"   # or: subscription
 ```
 
 ## Agent Count
@@ -175,6 +175,20 @@ or:
 band:
   memory_mode: local
 ```
+
+## Claude Authentication
+
+`claude.auth_mode` controls how Claude agents authenticate:
+
+```yaml
+claude:
+  auth_mode: "api_key"   # or: subscription
+```
+
+- `api_key` (default): use `ANTHROPIC_API_KEY`. The Anthropic API (Commercial Terms) is the supported path for automated, parallel agents. Subscription OAuth is never used implicitly — `cb run` fails fast if no key is set.
+- `subscription`: bill a Claude Pro/Max plan via OAuth (`CLAUDE_CODE_OAUTH_TOKEN` or a host `claude` login). Anthropic's Consumer Terms restrict automated subscription use, so this is an explicit opt-in. `cb doctor` warns when it is active.
+
+See [Authentication](AUTHENTICATION.md#claude) for credential setup and Docker notes.
 
 ## Manual Agent Registration (Free Tier)
 

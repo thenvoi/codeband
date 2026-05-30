@@ -11,6 +11,15 @@ import pytest
 class TestCheckClaudeAuth:
     """Detect known auth/billing failures before spawning agents."""
 
+    @pytest.fixture(autouse=True)
+    def _api_key_present(self, monkeypatch):
+        """Default these probe tests to api_key mode with a key set, so the
+        fast no-key gate passes and the live-probe classification is exercised.
+        Tests that need the no-key path override this explicitly.
+        """
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-probe")
+        monkeypatch.delenv("CODEBAND_FALLBACK_ANTHROPIC_API_KEY", raising=False)
+
     @pytest.mark.asyncio
     async def test_ok_on_normal_reply(self):
         from codeband.preflight import check_claude_auth
@@ -20,6 +29,35 @@ class TestCheckClaudeAuth:
             AsyncMock(return_value="ok"),
         ):
             assert await check_claude_auth() is None
+
+    @pytest.mark.asyncio
+    async def test_api_key_mode_no_key_fails_fast(self, monkeypatch):
+        """api_key mode with no ANTHROPIC_API_KEY → classified error, no API call.
+        Subscription OAuth is never taken implicitly."""
+        from codeband.preflight import check_claude_auth
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        probe = AsyncMock(return_value="ok")
+        with patch("codeband.utility_llm.one_shot_text", probe):
+            err = await check_claude_auth(auth_mode="api_key")
+        assert err is not None
+        assert err.classified
+        assert "ANTHROPIC_API_KEY" in err.summary
+        assert "subscription" in err.remediation.lower()
+        probe.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_subscription_mode_skips_no_key_gate(self, monkeypatch):
+        """subscription mode does not require ANTHROPIC_API_KEY — the gate is
+        scoped to api_key mode, so the probe still runs."""
+        from codeband.preflight import check_claude_auth
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with patch(
+            "codeband.utility_llm.one_shot_text",
+            AsyncMock(return_value="ok"),
+        ):
+            assert await check_claude_auth(auth_mode="subscription") is None
 
     @pytest.mark.asyncio
     async def test_detects_credit_balance_too_low(self):
@@ -128,11 +166,13 @@ class TestCheckClaudeAuth:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setenv("CODEBAND_FALLBACK_ANTHROPIC_API_KEY", "sk-ant-fallback")
 
+        # Fallback restore only happens in subscription mode (where the key was
+        # stripped). Pass auth_mode explicitly so the api_key no-key gate doesn't fire.
         with patch(
             "codeband.utility_llm.one_shot_text",
             AsyncMock(side_effect=["Claude usage limit reached", "ok"]),
         ) as mock_probe:
-            err = await check_claude_auth()
+            err = await check_claude_auth(auth_mode="subscription")
 
         assert err is None
         assert mock_probe.await_count == 2
@@ -410,7 +450,7 @@ class TestRunPreflight:
 
         from codeband.preflight import run_preflight
 
-        async def slow_ok():
+        async def slow_ok(*args):
             await asyncio.sleep(0.5)
             return None
 

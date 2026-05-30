@@ -262,6 +262,22 @@ class BandConfig(_StrictModel):
     liveness_mode: Literal["auto", "human", "agent"] = "auto"
 
 
+class ClaudeConfig(_StrictModel):
+    """Claude authentication policy.
+
+    ``api_key`` (default): authenticate with ``ANTHROPIC_API_KEY`` (Anthropic
+    Commercial Terms — the supported path for automated, parallel agents).
+    Subscription OAuth is never used automatically.
+
+    ``subscription``: deliberately opt into Claude Pro/Max OAuth. Codeband
+    strips ``ANTHROPIC_API_KEY`` so the Claude CLI bills the subscription,
+    keeping the key as a usage-limit fallback. Anthropic's Consumer Terms
+    restrict automated subscription use — see ``docs/AUTHENTICATION.md``.
+    """
+
+    auth_mode: Literal["api_key", "subscription"] = "api_key"
+
+
 class CodebandConfig(_StrictModel):
     """Root configuration for a Codeband project."""
 
@@ -269,6 +285,7 @@ class CodebandConfig(_StrictModel):
     agents: AgentsConfig = AgentsConfig()
     workspace: WorkspaceConfig = WorkspaceConfig()
     band: BandConfig = BandConfig()
+    claude: ClaudeConfig = ClaudeConfig()
 
     @classmethod
     def from_yaml(cls, path: Path) -> CodebandConfig:

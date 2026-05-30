@@ -39,74 +39,102 @@ class TestInitEnvExample:
         assert "GH_TOKEN=ghp_..." in env_example
 
 
+def _write_config(project_dir, auth_mode: str | None) -> str:
+    """Write a minimal codeband.yaml with the given claude.auth_mode.
+
+    ``auth_mode=None`` omits the ``claude:`` block entirely (legacy file).
+    Returns the project dir as a string for passing to _resolve_claude_auth.
+    """
+    lines = ["repo:\n", "  url: https://github.com/example/repo.git\n"]
+    if auth_mode is not None:
+        lines += ["claude:\n", f"  auth_mode: {auth_mode}\n"]
+    (project_dir / "codeband.yaml").write_text("".join(lines), encoding="utf-8")
+    return str(project_dir)
+
+
 class TestResolveClaudeAuth:
-    """OAuth sources take precedence over API key at startup.
+    """Default (api_key) keeps ANTHROPIC_API_KEY; subscription mode opts into OAuth.
 
     Keychain is a possible OAuth source on macOS developer machines; we mock
     the probe to False by default so tests run deterministically regardless
     of host state.
     """
 
-    def test_oauth_env_preferred_over_api_key(self):
+    def test_api_key_mode_keeps_key_even_with_oauth(self, tmp_path):
+        """Default mode never strips the key — even when OAuth is also present."""
+        project = _write_config(tmp_path, "api_key")
+        env = {"ANTHROPIC_API_KEY": "sk-ant-test", "CLAUDE_CODE_OAUTH_TOKEN": "tok-test"}
+        with patch.dict(os.environ, env, clear=False), patch(
+            "codeband.cli._has_claude_subscription_oauth", return_value=True,
+        ):
+            os.environ.pop("CODEBAND_FALLBACK_ANTHROPIC_API_KEY", None)
+            _resolve_claude_auth(project)
+            assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test"
+            assert "CODEBAND_FALLBACK_ANTHROPIC_API_KEY" not in os.environ
+
+    def test_missing_config_defaults_to_api_key(self, tmp_path):
+        """No codeband.yaml → api_key default → key is preserved."""
+        env = {"ANTHROPIC_API_KEY": "sk-ant-test", "CLAUDE_CODE_OAUTH_TOKEN": "tok-test"}
+        with patch.dict(os.environ, env, clear=False), patch(
+            "codeband.cli._has_claude_subscription_oauth", return_value=True,
+        ):
+            _resolve_claude_auth(str(tmp_path))  # no config file present
+            assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test"
+
+    def test_legacy_config_without_claude_block_defaults_to_api_key(self, tmp_path):
+        project = _write_config(tmp_path, None)
         env = {"ANTHROPIC_API_KEY": "sk-ant-test", "CLAUDE_CODE_OAUTH_TOKEN": "tok-test"}
         with patch.dict(os.environ, env, clear=False), patch(
             "codeband.cli._has_claude_subscription_oauth", return_value=False,
         ):
-            _resolve_claude_auth()
+            _resolve_claude_auth(project)
+            assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test"
+
+    def test_subscription_mode_strips_api_key_with_oauth_env(self, tmp_path):
+        project = _write_config(tmp_path, "subscription")
+        env = {"ANTHROPIC_API_KEY": "sk-ant-test", "CLAUDE_CODE_OAUTH_TOKEN": "tok-test"}
+        with patch.dict(os.environ, env, clear=False), patch(
+            "codeband.cli._has_claude_subscription_oauth", return_value=False,
+        ):
+            os.environ.pop("CODEBAND_FALLBACK_ANTHROPIC_API_KEY", None)
+            _resolve_claude_auth(project)
             assert "ANTHROPIC_API_KEY" not in os.environ
             assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == "tok-test"
             assert os.environ["CODEBAND_FALLBACK_ANTHROPIC_API_KEY"] == "sk-ant-test"
 
-    def test_api_key_kept_when_no_oauth_anywhere(self):
-        env = {"ANTHROPIC_API_KEY": "sk-ant-test"}
-        with patch.dict(os.environ, env, clear=False), patch(
-            "codeband.cli._has_claude_subscription_oauth", return_value=False,
-        ):
-            os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
-            _resolve_claude_auth()
-            assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test"
-
-    def test_oauth_kept_when_no_api_key(self):
-        env = {"CLAUDE_CODE_OAUTH_TOKEN": "tok-test"}
-        with patch.dict(os.environ, env, clear=False), patch(
-            "codeband.cli._has_claude_subscription_oauth", return_value=False,
-        ):
-            os.environ.pop("ANTHROPIC_API_KEY", None)
-            _resolve_claude_auth()
-            assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == "tok-test"
-
-    def test_noop_when_neither_set(self):
-        with patch.dict(os.environ, {}, clear=False), patch(
-            "codeband.cli._has_claude_subscription_oauth", return_value=False,
-        ):
-            os.environ.pop("ANTHROPIC_API_KEY", None)
-            os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
-            _resolve_claude_auth()  # should not raise
-
-    def test_subscription_oauth_strips_api_key_and_keeps_fallback(self):
-        """If the host has stored subscription OAuth (macOS keychain OR Linux
-        credentials file), ANTHROPIC_API_KEY must be stripped so the bundled
-        Claude CLI falls through to subscription OAuth. Codeband keeps a
-        process-local fallback for usage-limit exhaustion.
-        """
+    def test_subscription_mode_strips_api_key_with_host_oauth(self, tmp_path):
+        """Subscription mode + host keychain/credentials → strip + keep fallback."""
+        project = _write_config(tmp_path, "subscription")
         env = {"ANTHROPIC_API_KEY": "sk-ant-test"}
         with patch.dict(os.environ, env, clear=False), patch(
             "codeband.cli._has_claude_subscription_oauth", return_value=True,
         ):
             os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
             os.environ.pop("CODEBAND_FALLBACK_ANTHROPIC_API_KEY", None)
-            _resolve_claude_auth()
+            _resolve_claude_auth(project)
             assert "ANTHROPIC_API_KEY" not in os.environ
             assert os.environ["CODEBAND_FALLBACK_ANTHROPIC_API_KEY"] == "sk-ant-test"
 
-    def test_subscription_probe_only_runs_when_api_key_set(self):
-        """Don't waste a subprocess call when there's no API key to strip anyway."""
-        with patch.dict(os.environ, {}, clear=False), patch(
+    def test_subscription_mode_keeps_key_when_no_oauth_anywhere(self, tmp_path):
+        """Subscription mode but no OAuth source — nothing to fall through to,
+        so leave the key in place (preflight will surface the misconfig)."""
+        project = _write_config(tmp_path, "subscription")
+        env = {"ANTHROPIC_API_KEY": "sk-ant-test"}
+        with patch.dict(os.environ, env, clear=False), patch(
+            "codeband.cli._has_claude_subscription_oauth", return_value=False,
+        ):
+            os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            _resolve_claude_auth(project)
+            assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test"
+
+    def test_api_key_mode_skips_subscription_probe(self, tmp_path):
+        """Default mode never strips, so it must not even probe for host OAuth."""
+        project = _write_config(tmp_path, "api_key")
+        env = {"ANTHROPIC_API_KEY": "sk-ant-test"}
+        with patch.dict(os.environ, env, clear=False), patch(
             "codeband.cli._has_claude_subscription_oauth",
         ) as mock_probe:
-            os.environ.pop("ANTHROPIC_API_KEY", None)
-            os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
-            _resolve_claude_auth()
+            _resolve_claude_auth(project)
             mock_probe.assert_not_called()
 
 

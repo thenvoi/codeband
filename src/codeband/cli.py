@@ -52,7 +52,7 @@ def _init_project_env(project_dir: str) -> None:
     only the subcommand sees the user's actual ``--dir``.
     """
     _load_project_dotenv(project_dir)
-    _resolve_claude_auth()
+    _resolve_claude_auth(project_dir)
     _resolve_codex_auth()
 
 
@@ -134,23 +134,54 @@ def _has_claude_subscription_oauth() -> bool:
 
 
 
-def _resolve_claude_auth() -> None:
-    """Prefer Claude subscription OAuth over API key when both are available.
+def _claude_auth_mode(project_dir: str) -> str:
+    """Read ``claude.auth_mode`` from ``codeband.yaml``; default ``"api_key"``.
 
-    The Claude CLI's own precedence (per its docs) puts ``ANTHROPIC_API_KEY``
-    *above* subscription OAuth — so without intervention, a user with both a
-    subscription and an API key in ``.env`` would silently pay per token.
-    We strip ``ANTHROPIC_API_KEY`` when any OAuth source is present, but keep
-    a process-local backup so preflight can fall back only if the subscription
-    path reports a usage-limit exhaustion:
+    Auth resolves at CLI entry, before the full config is loaded, and
+    ``codeband.yaml`` may not exist yet (e.g. during ``cb init``). Read just
+    this one field defensively with a direct ``yaml.safe_load`` — any
+    missing-file / parse / unknown-value case falls back to ``"api_key"`` (the
+    safe, compliant default). We deliberately avoid ``load_config`` here: it
+    raises on a missing file and strict-validates the whole document, and auth
+    resolution must not crash the CLI over an unrelated config error.
+    """
+    config_path = Path(project_dir) / "codeband.yaml"
+    if not config_path.is_file():
+        return "api_key"
+    try:
+        import yaml
+
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        mode = (data.get("claude") or {}).get("auth_mode", "api_key")
+    except (OSError, yaml.YAMLError, AttributeError):
+        return "api_key"
+    return mode if mode in ("api_key", "subscription") else "api_key"
+
+
+def _resolve_claude_auth(project_dir: str) -> None:
+    """Resolve Claude auth per ``claude.auth_mode`` (default ``"api_key"``).
+
+    ``api_key`` (default): leave the environment alone. The Claude CLI's native
+    precedence uses ``ANTHROPIC_API_KEY`` — Anthropic's Commercial Terms, the
+    supported path for automated/parallel agents. Subscription OAuth is never
+    taken implicitly; ``cb run`` preflight fails fast when no key is present
+    (see ``preflight.check_claude_auth``) so the ToS-restricted subscription
+    path is never used by accident.
+
+    ``subscription`` (explicit opt-in): prefer Claude Pro/Max OAuth. The Claude
+    CLI would otherwise put ``ANTHROPIC_API_KEY`` *above* subscription OAuth, so
+    when both are present we strip the key — keeping a process-local backup so
+    preflight can fall back only on a subscription usage-limit exhaustion:
       1. ``CLAUDE_CODE_OAUTH_TOKEN`` env var, or
       2. subscription credential on disk / keychain (see
          ``_has_claude_subscription_oauth``).
 
-    The env-var branch of this logic also runs in ``docker/entrypoint.sh``.
+    Mirrored in ``docker/entrypoint.sh``, which reads the same config field.
     Subscription-credential detection is host-only — containers generally
     can't access host keychains or ``~/.claude``.
     """
+    if _claude_auth_mode(project_dir) != "subscription":
+        return
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return
     if (
@@ -284,25 +315,22 @@ def init(repo: str, branch: str, project_dir: str) -> None:
         "# Used by every Claude-based agent (Conductor, Planner, Coders,\n"
         "# Reviewers, Mergemaster) and the cb prs/issues --smart helpers.\n"
         "#\n"
-        "# Codeband starts with subscription auth when available:\n"
-        "#   1. CLAUDE_CODE_OAUTH_TOKEN env var (from `claude setup-token`)\n"
-        "#   2. Host subscription OAuth, picked up automatically:\n"
-        "#        macOS: Keychain entry from `claude` login\n"
-        "#        Linux/Windows: $CLAUDE_CONFIG_DIR/.credentials.json\n"
-        "#        (default ~/.claude/.credentials.json)\n"
-        "#   3. ANTHROPIC_API_KEY fallback only if subscription usage is exhausted\n"
-        "# Codeband auto-strips ANTHROPIC_API_KEY while subscription auth is usable,\n"
-        "# then restores it only after a Claude Pro/Max usage-limit error.\n"
-        "#\n"
-        "# Option A: Anthropic API key — pay-per-token, no subscription caps.\n"
+        "# Codeband defaults to API-key auth (claude.auth_mode: api_key in\n"
+        "# codeband.yaml). The Anthropic API (Commercial Terms) is the supported\n"
+        "# path for automated, parallel agents.\n"
         "ANTHROPIC_API_KEY=sk-ant-...\n"
-        "# Option B: long-lived Claude OAuth token — required for Docker/CI\n"
-        "# where the host keychain isn't accessible. Generate with:\n"
-        "#   claude setup-token\n"
+        "#\n"
+        "# To deliberately bill a Claude Pro/Max subscription instead, set\n"
+        "#   claude:\n"
+        "#     auth_mode: subscription\n"
+        "# in codeband.yaml, then provide a subscription credential below.\n"
+        "# NOTE: Anthropic's Consumer Terms restrict automated subscription use\n"
+        "# (see docs/AUTHENTICATION.md) — this is an explicit opt-in.\n"
+        "#   - CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) — required for\n"
+        "#     Docker/CI where the host keychain isn't accessible:\n"
         "# CLAUDE_CODE_OAUTH_TOKEN=...\n"
-        "# (Option C — no env var — works on your own host if you've run\n"
-        "# `claude` login: Codeband will detect and use the subscription\n"
-        "# automatically.)\n"
+        "#   - or, on your own host, run `claude` login and Codeband picks up the\n"
+        "#     subscription automatically (macOS Keychain or ~/.claude).\n"
         "#\n"
         "# ── Codex authentication (optional, for Codex agents) ───────────\n"
         "# Codeband starts with ChatGPT subscription auth when available\n"
@@ -347,7 +375,7 @@ def init(repo: str, branch: str, project_dir: str) -> None:
 @click.argument("spec")
 @click.option("--dir", "project_dir", default=".", help="Project directory")
 @_project_aware
-def scale(spec: str, project_dir: str) -> None:
+def scale(spec: str, project_dir: str, command_style: str = "cli") -> None:
     """Scale a worker-pool entry.
 
     SPEC format: `<pool>.<framework>=<count>`
@@ -403,9 +431,13 @@ def scale(spec: str, project_dir: str) -> None:
             "Warning: agent count > 10 exceeds Band.ai free-tier cap.",
             err=True,
         )
-    click.echo("\nNext steps:")
-    click.echo("  cb setup-agents   # Register any new pool identities")
-    click.echo("  cb                # Restart the interactive shell to pick up changes")
+    # The slash handler (`/scale`) prints its own context-aware next steps
+    # (docker rebuild vs shell restart), so only emit the cli-worded block
+    # when invoked as `cb scale`.
+    if command_style == "cli":
+        click.echo("\nNext steps:")
+        click.echo("  cb setup-agents   # Register any new pool identities")
+        click.echo("  cb                # Restart the interactive shell to pick up changes")
 
 
 @cli.command("setup-agents")
@@ -1148,11 +1180,12 @@ def feed(agent: str | None, event_type: str | None, no_thoughts: bool,
         sys.exit(1)
 
     from codeband.config import load_agent_config
+    from codeband.monitoring.activity_log import parse_type_filter
     from codeband.monitoring.feed import FeedFormatter, LiveFeed
 
     agent_config = load_agent_config(project)
     agent_names = {v.agent_id: k for k, v in agent_config.agents.items()}
-    type_filter = set(event_type.split(",")) if event_type else None
+    type_filter = parse_type_filter(event_type)
 
     formatter = FeedFormatter(
         agent_names,
@@ -1220,7 +1253,8 @@ def usage(agent: str | None, since: str | None, project_dir: str) -> None:
 
 @cli.command()
 @click.option("--agent", default=None, help="Filter by agent name")
-@click.option("--type", "event_type", default=None, help="Filter by event type")
+@click.option("--type", "event_type", default=None,
+              help="Filter by event type(s), comma-separated (e.g. NUDGE,ERROR)")
 @click.option("--since", default=None, help="Show events since (e.g. 1h, 30m)")
 @click.option("--all", "show_all", is_flag=True, help="Include LLM_USAGE events (hidden by default)")
 @click.option("--dir", "project_dir", default=".", help="Project directory")
@@ -1231,7 +1265,7 @@ def log(agent: str | None, event_type: str | None, since: str | None,
 
     By default hides LLM_USAGE noise. Use --all or --type LLM_USAGE to see it.
     """
-    from codeband.monitoring.activity_log import EventType
+    from codeband.monitoring.activity_log import EventType, parse_type_filter
     from codeband.shell.fs import make_backend
 
     project = Path(project_dir).resolve()
@@ -1240,17 +1274,17 @@ def log(agent: str | None, event_type: str | None, since: str | None,
     reader = make_backend(config, project).make_activity_reader()
 
     since_dt = _parse_since(since) if since else None
-    events = reader.read(agent=agent, event_type=event_type, since=since_dt)
+    type_filter = parse_type_filter(event_type)
+    events = reader.read(agent=agent, since=since_dt)
 
-    if not events:
-        click.echo("No activity events found.")
-        return
-
-    if not show_all and event_type is None:
+    if type_filter is not None:
+        events = [e for e in events if e.event_type in type_filter]
+    elif not show_all:
         events = [e for e in events if e.event_type != EventType.LLM_USAGE]
 
     if not events:
-        click.echo("No activity events found (use --all to include LLM usage).")
+        hint = "" if type_filter is not None else " (use --all to include LLM usage)"
+        click.echo(f"No activity events found{hint}.")
         return
 
     for event in events:
@@ -1270,17 +1304,31 @@ def log(agent: str | None, event_type: str | None, since: str | None,
 
 
 def _parse_since(value: str):
-    """Parse a --since value like '1h', '30m', or ISO date."""
+    """Parse a --since value like '1h', '30m', '2d', or an ISO date.
+
+    Raises ``click.BadParameter`` on malformed input so the CLI reports a
+    clean error instead of an uncaught ValueError traceback.
+    """
     from datetime import UTC, datetime as dt, timedelta
 
     value = value.strip()
-    if value.endswith("h"):
-        return dt.now(UTC) - timedelta(hours=float(value[:-1]))
-    if value.endswith("m"):
-        return dt.now(UTC) - timedelta(minutes=float(value[:-1]))
-    if value.endswith("d"):
-        return dt.now(UTC) - timedelta(days=float(value[:-1]))
-    return dt.fromisoformat(value)
+    units = {"h": "hours", "m": "minutes", "d": "days"}
+    unit = value[-1:] if value else ""
+    if unit in units:
+        try:
+            amount = float(value[:-1])
+        except ValueError:
+            raise click.BadParameter(
+                f"{value!r} — expected a number before '{unit}', e.g. 1h, 30m, 2d."
+            ) from None
+        return dt.now(UTC) - timedelta(**{units[unit]: amount})
+    try:
+        return dt.fromisoformat(value)
+    except ValueError:
+        raise click.BadParameter(
+            f"{value!r} — use a relative span (1h, 30m, 2d) or an ISO date "
+            "(YYYY-MM-DD)."
+        ) from None
 
 
 

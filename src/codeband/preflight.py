@@ -266,13 +266,32 @@ def _restore_openai_api_key_fallback() -> bool:
     return True
 
 
-async def check_claude_auth() -> PreflightError | None:
+async def check_claude_auth(auth_mode: str = "api_key") -> PreflightError | None:
     """Send one tiny Claude SDK call to verify auth works end-to-end.
 
     Returns ``None`` on success; a ``PreflightError`` describing the
     failure otherwise. The probe uses ``utility_llm.one_shot_text`` so it
     exercises the exact same auth path as every coding agent.
+
+    In the default ``api_key`` mode, an absent ``ANTHROPIC_API_KEY`` is a
+    fast, classified failure (no API call): subscription OAuth is never used
+    implicitly, so we refuse rather than silently take the Consumer-Terms-
+    restricted path. To use a subscription, set ``claude.auth_mode:
+    subscription`` in ``codeband.yaml``.
     """
+    if auth_mode == "api_key" and not os.environ.get("ANTHROPIC_API_KEY"):
+        return PreflightError(
+            summary="claude.auth_mode is 'api_key' but ANTHROPIC_API_KEY is not set",
+            remediation=(
+                "Set ANTHROPIC_API_KEY in .env (Anthropic API — the supported "
+                "path for automated/parallel agents).\n"
+                "To deliberately use a Claude Pro/Max subscription instead, set "
+                "claude.auth_mode: subscription in codeband.yaml — note that "
+                "Anthropic's Consumer Terms restrict automated subscription use."
+            ),
+            classified=True,
+        )
+
     from codeband.utility_llm import one_shot_text
 
     try:
@@ -286,7 +305,7 @@ async def check_claude_auth() -> PreflightError | None:
         message = f"{type(exc).__name__}: {exc}"
         haystack = message.lower()
         if _is_claude_usage_limit(haystack) and _restore_anthropic_api_key_fallback():
-            return await check_claude_auth()
+            return await check_claude_auth(auth_mode)
         for pattern, remediation in _CLAUDE_ERROR_PATTERNS:
             if pattern in haystack:
                 return PreflightError(
@@ -305,7 +324,7 @@ async def check_claude_auth() -> PreflightError | None:
 
     haystack = result.lower()
     if _is_claude_usage_limit(haystack) and _restore_anthropic_api_key_fallback():
-        return await check_claude_auth()
+        return await check_claude_auth(auth_mode)
     for pattern, remediation in _CLAUDE_ERROR_PATTERNS:
         if pattern in haystack:
             return PreflightError(
@@ -324,10 +343,12 @@ def _is_claude_usage_limit(haystack: str) -> bool:
 def _restore_anthropic_api_key_fallback() -> bool:
     """Restore stripped API-key auth after subscription usage-limit exhaustion.
 
-    ``codeband.cli._resolve_claude_auth`` strips ``ANTHROPIC_API_KEY`` so the
-    subscription path wins by default, but stores a process-local backup. This
-    fallback is intentionally narrow: we restore the key only after the Claude
-    subscription path reports a usage limit.
+    In ``subscription`` mode, ``codeband.cli._resolve_claude_auth`` strips
+    ``ANTHROPIC_API_KEY`` so the subscription path wins, but stores a
+    process-local backup. This fallback is intentionally narrow: we restore the
+    key only after the Claude subscription path reports a usage limit. (In the
+    default ``api_key`` mode nothing is stripped, so there's no backup to
+    restore and this is a no-op.)
     """
     fallback_key = os.environ.pop("CODEBAND_FALLBACK_ANTHROPIC_API_KEY", "")
     if not fallback_key or os.environ.get("ANTHROPIC_API_KEY"):
@@ -370,7 +391,7 @@ async def run_preflight(config: CodebandConfig) -> PreflightError | None:
     """
     import asyncio
 
-    tasks = [check_claude_auth()]
+    tasks = [check_claude_auth(config.claude.auth_mode)]
     if _config_uses_codex(config):
         tasks.append(check_codex_auth())
 

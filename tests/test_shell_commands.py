@@ -170,6 +170,80 @@ async def test_approve_missing_room_uses_slash_task_hint(tmp_path: Path):
     assert "cb task" not in out
 
 
+@pytest.mark.asyncio
+async def test_scale_omits_cli_next_steps_in_shell(tmp_path: Path):
+    """`/scale` prints the shell-tailored next steps, not the cli-worded block."""
+    ctx = _make_ctx(tmp_path)  # compose_file=None → local/shell restart hint
+    ctx.config.to_yaml(tmp_path / "codeband.yaml")
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        result = await dispatch("/scale coders.claude_sdk=2", ctx)
+
+    assert result is None
+    out = buf.getvalue()
+    assert "Scaled coders.claude_sdk to 2" in out          # printed in both modes
+    assert "Restart the interactive shell to pick up changes" not in out  # cli block gated
+    assert "/quit and re-run" in out                        # shell-tailored hint
+
+
+@pytest.mark.asyncio
+async def test_log_bad_since_prints_clean_error(tmp_path: Path):
+    """A malformed /log --since must not crash the shell or dump a traceback."""
+    ctx = _make_ctx(tmp_path)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        result = await dispatch("/log --since garbage", ctx)
+
+    assert result is None
+    out = buf.getvalue()
+    assert "Error:" in out
+    assert "ISO date" in out
+    assert "Command crashed" not in out
+
+
+def test_shell_parse_since_accepts_relative_and_iso():
+    from codeband.shell.commands import _parse_since
+
+    assert _parse_since("2h") is not None
+    assert _parse_since("2026-05-01") is not None
+
+
+def test_shell_parse_since_rejects_garbage():
+    from codeband.shell.commands import _parse_since
+
+    with pytest.raises(ValueError):
+        _parse_since("garbage")
+    with pytest.raises(ValueError):
+        _parse_since("1x")
+
+
+@pytest.mark.asyncio
+async def test_log_type_filter_is_comma_separated(tmp_path: Path, monkeypatch):
+    """`/log --type A,B` filters to the union of types (aligned with feed)."""
+    import codeband.shell.commands as cmds
+    from codeband.monitoring.activity_log import ActivityEvent
+
+    ctx = _make_ctx(tmp_path)
+    ctx.backend.events = [
+        ActivityEvent(timestamp="2026-05-30T00:00:00+00:00", event_type="NUDGE",
+                      agent="a", summary="n"),
+        ActivityEvent(timestamp="2026-05-30T00:00:01+00:00", event_type="ERROR",
+                      agent="a", summary="e"),
+        ActivityEvent(timestamp="2026-05-30T00:00:02+00:00", event_type="LLM_USAGE",
+                      agent="a", summary="u"),
+    ]
+
+    captured: list = []
+    monkeypatch.setattr(cmds, "render_activity_events", lambda evs: captured.append(list(evs)))
+
+    result = await dispatch("/log --type NUDGE,ERROR", ctx)
+
+    assert result is None
+    assert {e.event_type for e in captured[0]} == {"NUDGE", "ERROR"}
+
+
 # ── helpers ──────────────────────────────────────────────────────────────
 
 def _make_ctx(tmp_path: Path, *, compose_file: Path | None = None) -> SlashContext:
@@ -193,6 +267,8 @@ def _make_ctx(tmp_path: Path, *, compose_file: Path | None = None) -> SlashConte
 
 
 class _StubBackend:
+    events: list = []
+
     def list_worktrees(self):
         return {}
 
@@ -200,7 +276,9 @@ class _StubBackend:
         raise NotImplementedError
 
     def read_activity_events(self, **kwargs):
-        return []
+        # The /log handler now reads all events and filters client-side, so
+        # the stub ignores any event_type kwarg and returns everything.
+        return list(self.events)
 
     def make_activity_reader(self):
         raise NotImplementedError

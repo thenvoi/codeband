@@ -44,7 +44,7 @@ Codeband needs these in every deployment mode:
    Used for agent communication and orchestration.
 
 3. **Claude authentication**
-   Required for Claude agents. You can use either an Anthropic API key or Claude Code subscription login. Codeband shells out to the `claude` CLI.
+   Required for Claude agents. Defaults to an Anthropic API key (`ANTHROPIC_API_KEY`); a Claude Pro/Max subscription is an explicit opt-in via `claude.auth_mode: subscription` (see [Authentication](docs/AUTHENTICATION.md)). Codeband shells out to the `claude` CLI.
 
 4. **Codex/OpenAI authentication**
    Required if you use Codex agents. The default config does, so set `OPENAI_API_KEY` or log in with Codex locally. Codeband shells out to the `codex` CLI.

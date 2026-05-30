@@ -200,46 +200,52 @@ def _has_claude_subscription_oauth() -> bool:
     return probe()
 
 
-def check_claude_auth(_ctx: Context) -> CheckResult:
+def check_claude_auth(ctx: Context) -> CheckResult:
     api = os.environ.get("ANTHROPIC_API_KEY")
     oauth = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
     has_sub = _has_claude_subscription_oauth()
+    mode = ctx.config.claude.auth_mode if ctx.config else "api_key"
 
-    if not api and not oauth and not has_sub:
-        return CheckResult(
-            Status.FAIL,
-            "No Claude auth — neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN set, "
-            "and no subscription OAuth on host",
-            remediation=(
-                "Set one in your .env, or log in once on this host:\n"
-                "  ANTHROPIC_API_KEY=sk-ant-...  (pay-per-token)\n"
-                "  CLAUDE_CODE_OAUTH_TOKEN=...   (long-lived; `claude setup-token`)\n"
-                "  Or run `claude` and log in (stores subscription OAuth locally)."
-            ),
-        )
-    if api and oauth:
-        return CheckResult(
-            Status.INFO,
-            "Both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN set — "
-            "Codeband will start with OAuth and keep the API key as a usage-limit fallback",
-        )
-    if api and has_sub and not oauth:
+    if mode == "subscription":
+        # Explicit opt-in to the Consumer-Terms-restricted path — always flag it.
+        if not oauth and not has_sub:
+            return CheckResult(
+                Status.FAIL,
+                "claude.auth_mode is 'subscription' but no subscription credential found "
+                "(no CLAUDE_CODE_OAUTH_TOKEN and no host OAuth)",
+                remediation=(
+                    "Provide a subscription credential:\n"
+                    "  CLAUDE_CODE_OAUTH_TOKEN=...   (`claude setup-token`), or\n"
+                    "  run `claude` and log in on this host.\n"
+                    "Or set claude.auth_mode: api_key and use ANTHROPIC_API_KEY."
+                ),
+            )
+        which = "CLAUDE_CODE_OAUTH_TOKEN" if oauth else "host subscription OAuth"
+        fallback = " (ANTHROPIC_API_KEY kept as a usage-limit fallback)" if api else ""
         return CheckResult(
             Status.WARN,
-            "ANTHROPIC_API_KEY set alongside host subscription OAuth — "
-            "Codeband will start with the subscription and keep the API key as a fallback",
+            f"claude.auth_mode is 'subscription' — using {which}{fallback}",
             remediation=(
-                "This is valid. ANTHROPIC_API_KEY is used only if the Claude "
-                "Pro/Max subscription path reports a usage-limit error."
+                "Anthropic's Consumer Terms restrict automated/parallel use of "
+                "Pro/Max subscriptions. ANTHROPIC_API_KEY (claude.auth_mode: api_key) "
+                "is the supported path for orchestration."
             ),
         )
-    if oauth:
-        which = "CLAUDE_CODE_OAUTH_TOKEN"
-    elif api:
-        which = "ANTHROPIC_API_KEY"
-    else:
-        which = "host subscription OAuth (keychain or ~/.claude/.credentials.json)"
-    return CheckResult(Status.OK, f"Claude auth: {which}")
+
+    # Default: api_key mode. Subscription OAuth is never used implicitly.
+    if not api:
+        return CheckResult(
+            Status.FAIL,
+            "claude.auth_mode is 'api_key' but ANTHROPIC_API_KEY is not set",
+            remediation=(
+                "Set ANTHROPIC_API_KEY=sk-ant-... in your .env (the supported path "
+                "for automated/parallel agents).\n"
+                "To deliberately bill a Claude Pro/Max subscription instead, set "
+                "claude.auth_mode: subscription in codeband.yaml — note Anthropic's "
+                "Consumer Terms restrict automated subscription use."
+            ),
+        )
+    return CheckResult(Status.OK, "Claude auth: ANTHROPIC_API_KEY (auth_mode=api_key)")
 
 
 def _needs_codex(ctx: Context) -> bool:

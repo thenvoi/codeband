@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pydantic
 import pytest
 
 from codeband.config import (
     AgentConfigFile,
     AgentCredentials,
     AgentsConfig,
+    ClaudeConfig,
     CodebandConfig,
     ConductorConfig,
     DeploymentMode,
@@ -459,3 +461,44 @@ class TestMergemasterConfig:
         config.to_yaml(yaml_path)
         loaded = CodebandConfig.from_yaml(yaml_path)
         assert loaded.agents.mergemaster.review_guidelines == "Must have tests"
+
+
+class TestClaudeConfig:
+    """Claude auth policy — API-key-first by default, subscription as opt-in."""
+
+    def test_default_is_api_key(self):
+        config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
+        assert config.claude.auth_mode == "api_key"
+
+    def test_legacy_config_without_claude_block_loads(self, tmp_path: Path):
+        """Existing codeband.yaml files predate the `claude:` block."""
+        yaml_path = tmp_path / "codeband.yaml"
+        yaml_path.write_text(
+            "repo:\n  url: https://github.com/a/b.git\n", encoding="utf-8",
+        )
+        loaded = CodebandConfig.from_yaml(yaml_path)
+        assert loaded.claude.auth_mode == "api_key"
+
+    def test_subscription_roundtrip(self, tmp_path: Path):
+        config = CodebandConfig(
+            repo=RepoConfig(url="https://github.com/a/b.git"),
+            claude=ClaudeConfig(auth_mode="subscription"),
+        )
+        yaml_path = tmp_path / "codeband.yaml"
+        config.to_yaml(yaml_path)
+        loaded = CodebandConfig.from_yaml(yaml_path)
+        assert loaded.claude.auth_mode == "subscription"
+
+    def test_init_default_yaml_emits_api_key(self, tmp_path: Path):
+        """A freshly written default config persists auth_mode: api_key."""
+        config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
+        yaml_path = tmp_path / "codeband.yaml"
+        config.to_yaml(yaml_path)
+        assert "auth_mode: api_key" in yaml_path.read_text(encoding="utf-8")
+
+    def test_invalid_auth_mode_rejected(self):
+        with pytest.raises(pydantic.ValidationError):
+            CodebandConfig.model_validate({
+                "repo": {"url": "https://github.com/a/b.git"},
+                "claude": {"auth_mode": "subscriptions"},
+            })

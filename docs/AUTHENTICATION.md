@@ -16,15 +16,29 @@ OPENAI_API_KEY=sk-...
 
 ## Claude
 
-Claude agents can authenticate in three ways. Codeband resolves them in this order at `cb run` startup:
+Codeband defaults to API-key auth and treats subscription OAuth as an explicit opt-in. This is set by `claude.auth_mode` in `codeband.yaml`:
 
-1. `CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token`. Recommended for Docker and CI.
+```yaml
+claude:
+  auth_mode: api_key      # default; or: subscription
+```
+
+### `api_key` (default)
+
+Authenticate with `ANTHROPIC_API_KEY`. The Anthropic API runs under Anthropic's Commercial Terms, which permit automated, parallel, programmatic use — the pattern Codeband's agent swarm uses. Subscription OAuth is never used automatically: if `ANTHROPIC_API_KEY` is missing, `cb run` preflight fails fast with a clear message rather than silently falling back to a subscription.
+
+### `subscription` (explicit opt-in)
+
+Bill a Claude Pro/Max subscription. Set `claude.auth_mode: subscription`, then provide a credential, resolved in this order:
+
+1. `CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token`. Required for Docker and CI.
 2. Host subscription OAuth:
    - macOS: Keychain entry written by `claude` login.
    - Linux/Windows: `$CLAUDE_CONFIG_DIR/.credentials.json`, defaulting to `~/.claude/.credentials.json`.
-3. `ANTHROPIC_API_KEY`, for pay-per-token usage.
 
-When subscription auth is available, Codeband strips `ANTHROPIC_API_KEY` from the spawned Claude process so the Claude CLI does not silently prefer API-key billing over subscription auth. `cb doctor` warns when both are present.
+In this mode, when `ANTHROPIC_API_KEY` is also set, Codeband strips it from the spawned Claude process (the CLI would otherwise prefer it) and keeps it only as a fallback used if the subscription path reports a usage-limit error.
+
+**Terms note.** Anthropic's [Consumer Terms](https://www.anthropic.com/legal/consumer-terms) (which govern Claude Pro/Max) restrict accessing the service "through automated or non-human means" except via an API key or where Anthropic explicitly permits it. Driving a multi-agent orchestration tool off a subscription is at best a grey area. `subscription` mode is provided for users who knowingly accept that; the supported path for orchestration is `api_key`. `cb doctor` warns whenever `subscription` mode is active.
 
 ## Codex
 

@@ -80,7 +80,7 @@ Parallelism is a secondary, weaker benefit — Claude Code and Codex both alread
 
 | Role | Description | Frameworks |
 |------|-------------|------------|
-| **Planner** | Task analyst. Reads the codebase, decomposes tasks into parallelizable subtasks with optional `framework_hint`, sends plans via chat. Emits abstract subtask specs — the Conductor binds specific coders at dispatch. | `claude_sdk` today; Codex planned |
+| **Planner** | Task analyst. Reads the codebase, decomposes tasks into parallelizable subtasks with optional `framework_hint`, sends plans via chat. Emits abstract subtask specs — the Conductor binds specific coders at dispatch. | `claude_sdk`, `codex` |
 | **Plan Reviewer** | Plan validation gate. Reviews plans before coders begin — decomposition quality, file conflict risk, acceptance criteria. Paired with Planner on the opposite framework. Read-only codebase access. | `claude_sdk`, `codex` |
 | **Coder** | Coding worker. Executes subtasks in an isolated git worktree (`workspace/worktrees/<worker-id>/`). Auto-restarted by `WorkerSupervisor` on crash. | `claude_sdk`, `codex` |
 | **Code Reviewer** | Code quality gate. Reviews PRs, posts findings as PR comments, assigns a risk level. Directly @mentioned by the Coder on the framework **opposite** the coder. | `claude_sdk`, `codex` |

@@ -94,50 +94,62 @@ class TestClaudeAuth:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
 
-    def test_no_auth_fails(self):
-        result = check_claude_auth(Context(project_dir=Path.cwd()))
-        assert result.status == Status.FAIL
-        assert "CLAUDE_CODE_OAUTH_TOKEN" in result.remediation
+    @staticmethod
+    def _ctx(auth_mode: str | None = None) -> Context:
+        """Context with a config at the given auth_mode (None → no config → api_key)."""
+        cfg = None
+        if auth_mode is not None:
+            cfg = CodebandConfig.model_validate({
+                "repo": {"url": "https://github.com/x/y"},
+                "claude": {"auth_mode": auth_mode},
+            })
+        return Context(project_dir=Path.cwd(), config=cfg)
 
-    def test_api_key_ok(self, monkeypatch):
+    def test_api_key_mode_with_key_ok(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
-        result = check_claude_auth(Context(project_dir=Path.cwd()))
+        result = check_claude_auth(self._ctx("api_key"))
         assert result.status == Status.OK
         assert "ANTHROPIC_API_KEY" in result.message
 
-    def test_oauth_ok(self, monkeypatch):
-        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
-        result = check_claude_auth(Context(project_dir=Path.cwd()))
+    def test_no_config_defaults_to_api_key(self, monkeypatch):
+        """ctx.config is None (no codeband.yaml) → api_key default."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+        result = check_claude_auth(self._ctx(None))
         assert result.status == Status.OK
-        assert "CLAUDE_CODE_OAUTH_TOKEN" in result.message
 
-    def test_both_env_vars_set_is_info(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
-        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
-        result = check_claude_auth(Context(project_dir=Path.cwd()))
-        assert result.status == Status.INFO
-
-    def test_api_key_plus_host_subscription_warns(self, monkeypatch):
-        """API key set + subscription creds available on host (keychain or
-        .credentials.json) → WARN. Codeband will auto-prefer subscription at
-        run-time, but the user should make it explicit in .env.
-        """
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
-        monkeypatch.setattr(
-            "codeband.doctor._has_claude_subscription_oauth", lambda: True,
-        )
-        result = check_claude_auth(Context(project_dir=Path.cwd()))
-        assert result.status == Status.WARN
-        assert "subscription" in result.message.lower()
+    def test_api_key_mode_no_key_fails(self):
+        result = check_claude_auth(self._ctx("api_key"))
+        assert result.status == Status.FAIL
         assert "ANTHROPIC_API_KEY" in result.remediation
+        assert "subscription" in result.remediation.lower()
 
-    def test_host_subscription_only_is_ok(self, monkeypatch):
-        """No env vars, but host has keychain/file creds — that's a valid setup."""
+    def test_api_key_mode_ignores_host_subscription(self, monkeypatch):
+        """In api_key mode a host subscription does not satisfy the requirement —
+        the subscription path is never taken implicitly, so this still FAILs."""
         monkeypatch.setattr(
             "codeband.doctor._has_claude_subscription_oauth", lambda: True,
         )
-        result = check_claude_auth(Context(project_dir=Path.cwd()))
-        assert result.status == Status.OK
+        result = check_claude_auth(self._ctx("api_key"))
+        assert result.status == Status.FAIL
+
+    def test_subscription_mode_with_oauth_warns(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
+        result = check_claude_auth(self._ctx("subscription"))
+        assert result.status == Status.WARN
+        assert "consumer terms" in result.remediation.lower()
+        assert "subscription" in result.message.lower()
+
+    def test_subscription_mode_with_host_oauth_warns(self, monkeypatch):
+        monkeypatch.setattr(
+            "codeband.doctor._has_claude_subscription_oauth", lambda: True,
+        )
+        result = check_claude_auth(self._ctx("subscription"))
+        assert result.status == Status.WARN
+
+    def test_subscription_mode_no_credential_fails(self):
+        """subscription mode but no OAuth token and no host creds → FAIL."""
+        result = check_claude_auth(self._ctx("subscription"))
+        assert result.status == Status.FAIL
         assert "subscription" in result.message.lower()
 
 

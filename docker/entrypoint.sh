@@ -36,21 +36,30 @@ echo "Role:  ${AGENT_ROLE:-unknown}"
 echo "Workspace: ${WORKSPACE}"
 
 # ── Validate Claude Code authentication ────────────────────────────────
-# The Claude CLI checks ANTHROPIC_API_KEY before CLAUDE_CODE_OAUTH_TOKEN.
-# When both are set, prefer the OAuth token (subscription = fixed cost) by
-# unsetting the API key so the CLI falls through to OAuth.
-if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-    echo "Claude auth: both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN set"
-    echo "  Using CLAUDE_CODE_OAUTH_TOKEN (subscription, fixed cost); unsetting ANTHROPIC_API_KEY"
+# Codeband defaults to API-key auth (claude.auth_mode: api_key). The Claude
+# CLI checks ANTHROPIC_API_KEY before CLAUDE_CODE_OAUTH_TOKEN, so in api_key
+# mode we keep the key and the CLI uses it natively. Only in the explicit
+# `subscription` opt-in do we unset the key so the CLI falls through to OAuth.
+CLAUDE_AUTH_MODE="${CLAUDE_AUTH_MODE:-}"
+if [ -z "${CLAUDE_AUTH_MODE}" ] && [ -f "${CODEBAND_CONFIG}" ]; then
+    CLAUDE_AUTH_MODE=$("${VENV_PYTHON}" -c "import yaml; c=yaml.safe_load(open('${CODEBAND_CONFIG}')) or {}; print((c.get('claude') or {}).get('auth_mode','api_key'))" 2>/dev/null || echo "api_key")
+fi
+CLAUDE_AUTH_MODE="${CLAUDE_AUTH_MODE:-api_key}"
+
+if [ "${CLAUDE_AUTH_MODE}" = "subscription" ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "Claude auth (subscription mode): both keys set; unsetting ANTHROPIC_API_KEY to use CLAUDE_CODE_OAUTH_TOKEN"
     unset ANTHROPIC_API_KEY
 elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-    echo "Claude auth: ANTHROPIC_API_KEY configured (API key)"
-elif [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-    echo "Claude auth: CLAUDE_CODE_OAUTH_TOKEN configured (subscription)"
+    echo "Claude auth: ANTHROPIC_API_KEY configured (API key, auth_mode=${CLAUDE_AUTH_MODE})"
+elif [ "${CLAUDE_AUTH_MODE}" = "subscription" ] && [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    echo "Claude auth: CLAUDE_CODE_OAUTH_TOKEN configured (subscription mode)"
+elif [ "${CLAUDE_AUTH_MODE}" = "api_key" ]; then
+    echo "WARNING: auth_mode=api_key but ANTHROPIC_API_KEY is not set."
+    echo "  Set ANTHROPIC_API_KEY in .env, or set claude.auth_mode: subscription in codeband.yaml"
+    echo "  and provide CLAUDE_CODE_OAUTH_TOKEN (from: claude setup-token)."
 else
     echo "WARNING: No Claude Code authentication found."
-    echo "  Set ANTHROPIC_API_KEY (API key) or CLAUDE_CODE_OAUTH_TOKEN (subscription) in .env"
-    echo "  To get an OAuth token, run: claude setup-token"
+    echo "  auth_mode=subscription requires CLAUDE_CODE_OAUTH_TOKEN (run: claude setup-token)."
 fi
 
 # ── Configure GitHub auth for gh CLI ────────────────────────────────────

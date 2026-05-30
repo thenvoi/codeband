@@ -22,30 +22,30 @@ This creates:
 cp .env.example .env
 ```
 
-Edit `.env`. Claude Code supports two authentication methods — choose one:
+Edit `.env`. Codeband defaults to API-key auth for Claude (`claude.auth_mode: api_key` in `codeband.yaml`):
 
-**Option A: Anthropic API key** (pay-per-token, no subscription rate limits)
+**Default: Anthropic API key** (pay-per-token, the supported path for parallel agents)
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-**Option B: Claude subscription OAuth token** (uses your Claude Pro/Max plan)
+**Opt-in: Claude subscription OAuth token** (uses your Claude Pro/Max plan)
+
+Set `claude.auth_mode: subscription` in `codeband.yaml`, then generate and add a token:
 
 ```bash
 # Generate a long-lived token (run once, locally):
 claude setup-token
 ```
 
-Then add it to `.env`:
-
 ```
 CLAUDE_CODE_OAUTH_TOKEN=...
 ```
 
-> **Note:** Subscription plans have rate limits designed for individual use. Running multiple agents in parallel may hit these limits. API keys offer more predictable scaling for multi-agent workloads.
+> **Note:** Anthropic's Consumer Terms restrict automated/parallel use of Pro/Max subscriptions, and subscription rate limits are designed for individual use. The API key (Commercial Terms) is the supported path for multi-agent workloads, so it is the default. `subscription` mode is an explicit opt-in.
 >
-> If both `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are set, Codeband prefers the OAuth token (fixed-cost subscription) and ignores the API key.
+> In `subscription` mode, if both `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are set, Codeband strips the API key so the CLI uses the subscription, keeping it as a usage-limit fallback. In the default `api_key` mode the key is always used.
 
 **Codex authentication:**
 

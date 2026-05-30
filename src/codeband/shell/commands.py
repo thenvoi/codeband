@@ -25,7 +25,7 @@ from pathlib import Path
 import click
 
 from codeband.config import CodebandConfig
-from codeband.monitoring.activity_log import EventType
+from codeband.monitoring.activity_log import EventType, parse_type_filter
 from codeband.shell.fs import FSBackend
 from codeband.shell.render import (
     println,
@@ -114,14 +114,26 @@ def _safe_callback_call(callback: Callable, **kwargs) -> None:
 
 
 def _parse_since(value: str):
+    """Parse a /log or /usage --since value. Raises ValueError with a friendly
+    message on malformed input (callers catch it and println cleanly)."""
     value = value.strip()
-    if value.endswith("h"):
-        return datetime.now(UTC) - timedelta(hours=float(value[:-1]))
-    if value.endswith("m"):
-        return datetime.now(UTC) - timedelta(minutes=float(value[:-1]))
-    if value.endswith("d"):
-        return datetime.now(UTC) - timedelta(days=float(value[:-1]))
-    return datetime.fromisoformat(value)
+    units = {"h": "hours", "m": "minutes", "d": "days"}
+    unit = value[-1:] if value else ""
+    if unit in units:
+        try:
+            amount = float(value[:-1])
+        except ValueError:
+            raise ValueError(
+                f"{value!r} — expected a number before '{unit}', e.g. 1h, 30m, 2d."
+            ) from None
+        return datetime.now(UTC) - timedelta(**{units[unit]: amount})
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(
+            f"{value!r} — use a relative span (1h, 30m, 2d) or an ISO date "
+            "(YYYY-MM-DD)."
+        ) from None
 
 
 def _parse_kv_args(args: str, known_flags: set[str]) -> tuple[list[str], dict[str, str | bool]]:
@@ -329,20 +341,27 @@ async def _reject(args: str, ctx: SlashContext) -> HandlerResult:
     return None
 
 
-@register("log", "View activity history: /log [--agent x] [--since 1h] [--all]")
+@register("log", "View activity history: /log [--agent x] [--type A,B] [--since 1h] [--all]")
 async def _log(args: str, ctx: SlashContext) -> HandlerResult:
     _, flags = _parse_kv_args(args, known_flags={"all"})
     agent = flags.get("agent") if isinstance(flags.get("agent"), str) else None
     event_type = flags.get("type") if isinstance(flags.get("type"), str) else None
+    type_filter = parse_type_filter(event_type)
     since_str = flags.get("since") if isinstance(flags.get("since"), str) else None
-    since_dt = _parse_since(since_str) if since_str else None
+    try:
+        since_dt = _parse_since(since_str) if since_str else None
+    except ValueError as e:
+        println(f"Error: {e}")
+        return None
     show_all = bool(flags.get("all", False))
 
     events = await asyncio.to_thread(
         ctx.backend.read_activity_events,
-        agent=agent, event_type=event_type, since=since_dt,
+        agent=agent, since=since_dt,
     )
-    if not show_all and event_type is None:
+    if type_filter is not None:
+        events = [e for e in events if e.event_type in type_filter]
+    elif not show_all:
         events = [e for e in events if e.event_type != EventType.LLM_USAGE]
     render_activity_events(events)
     return None
@@ -353,7 +372,11 @@ async def _usage(args: str, ctx: SlashContext) -> HandlerResult:
     _, flags = _parse_kv_args(args, known_flags=set())
     agent = flags.get("agent") if isinstance(flags.get("agent"), str) else None
     since_str = flags.get("since") if isinstance(flags.get("since"), str) else None
-    since_dt = _parse_since(since_str) if since_str else None
+    try:
+        since_dt = _parse_since(since_str) if since_str else None
+    except ValueError as e:
+        println(f"Error: {e}")
+        return None
 
     events = await asyncio.to_thread(
         ctx.backend.read_activity_events,
@@ -409,6 +432,7 @@ async def _scale(args: str, ctx: SlashContext) -> HandlerResult:
         scale_cmd.callback,
         spec=args.strip(),
         project_dir=str(ctx.project_dir),
+        command_style="slash",
     )
     # Apply hint depends on what's actually running, not what the yaml
     # says — same reasoning as /down: cb up may have attached this shell

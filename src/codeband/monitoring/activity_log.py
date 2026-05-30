@@ -16,6 +16,20 @@ class EventType:
     LLM_USAGE: Final[str] = "LLM_USAGE"
 
 
+def parse_type_filter(value: str | None) -> set[str] | None:
+    """Parse a comma-separated ``--type`` value into a set of event types.
+
+    Shared by ``cb log`` / ``/log`` and ``cb feed`` so the flag behaves
+    identically: ``--type NUDGE,ERROR`` filters to either type. Whitespace
+    around each token is stripped; an empty or all-blank value yields
+    ``None`` (no filter).
+    """
+    if not value:
+        return None
+    tokens = {t.strip() for t in value.split(",") if t.strip()}
+    return tokens or None
+
+
 @dataclasses.dataclass
 class ActivityEvent:
     """A single activity event."""
