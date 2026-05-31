@@ -10,9 +10,10 @@ through a fixed lifecycle:
                             ↘ abandoned
 
 :data:`VALID_TRANSITIONS` encodes every legal edge keyed by
-``(current_state, caller_role)`` — exactly the RFC table. The Conductor may
-*abandon* any non-terminal subtask regardless of its current state; that one
-wildcard is enforced in :func:`transition` rather than enumerated per state.
+``(current_state, caller_role)`` — exactly the RFC table. Two cross-cutting
+wildcards are enforced in :func:`_is_allowed` rather than enumerated per state:
+the Conductor may *abandon*, and the Watchdog may *block*, any non-terminal
+subtask regardless of its current state.
 
 :func:`transition` is the only mutation path. It auto-creates the subtask row
 (via :meth:`StateStore.ensure_subtask`), then — inside a single
@@ -24,13 +25,10 @@ role raises :class:`InvalidTransitionError` and writes nothing.
 
 from __future__ import annotations
 
-import logging
 import sqlite3
 from contextlib import closing
 
 from codeband.state.store import StateStore, TERMINAL_STATES, _now_iso
-
-logger = logging.getLogger(__name__)
 
 
 class InvalidTransitionError(Exception):
@@ -44,9 +42,9 @@ class InvalidTransitionError(Exception):
 
 # Static transition table, keyed by ``(current_state, caller_role)`` → the set
 # of states that role may move the subtask to from that state. This is the RFC
-# Workstream 2 table verbatim. The ``(any, conductor) → abandoned`` rule is the
-# one exception and is handled in :func:`transition` (it would otherwise need an
-# entry for every state).
+# Workstream 2 table verbatim. The ``(any, conductor) → abandoned`` and
+# ``(any, watchdog) → blocked`` rules are cross-cutting and handled in
+# :func:`_is_allowed` (they would otherwise need an entry for every state).
 VALID_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     ("planned", "conductor"): frozenset({"assigned"}),
     ("assigned", "coder"): frozenset({"in_progress"}),
@@ -62,12 +60,15 @@ VALID_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
 def _is_allowed(current_state: str, caller_role: str, new_state: str) -> bool:
     """Return ``True`` if the transition is permitted.
 
-    Encodes the static table plus the conductor-may-abandon-anything wildcard.
+    Encodes the static table plus two cross-cutting wildcards — the Conductor
+    may abandon, and the Watchdog may block, any non-terminal subtask.
     Transitions out of a terminal state are never allowed.
     """
     if current_state in TERMINAL_STATES:
         return False
     if new_state == "abandoned" and caller_role == "conductor":
+        return True
+    if new_state == "blocked" and caller_role == "watchdog":
         return True
     return new_state in VALID_TRANSITIONS.get((current_state, caller_role), frozenset())
 

@@ -127,7 +127,10 @@ planned → assigned → in_progress → verify_pending → review_pending → r
 | `(review_failed, coder)` | `in_progress` |
 | `(review_passed, mergemaster)` | `merge_pending` |
 | `(merge_pending, mergemaster)` | `merged` |
-| `(any, conductor)` | `abandoned` |
+| `(any non-terminal, conductor)` | `abandoned` |
+| `(any non-terminal, watchdog)` | `blocked` |
+
+The last two are cross-cutting wildcards (enforced in `_is_allowed`, not enumerated per state): the Conductor may abandon, and the Watchdog (WS4) may block, any non-terminal subtask.
 
 ```python
 def transition(subtask_id: str, task_id: str, new_state: str,

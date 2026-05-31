@@ -11,8 +11,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
-import sys
-import types
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
@@ -131,10 +129,12 @@ async def test_cycle_cap_marks_blocked_after_no_progress(tmp_path, monkeypatch):
     events = [call.args[0] for call in activity.log.call_args_list]
     assert "SUBTASK_BLOCKED" in events
 
-    # FSM (Phase 2) is not merged here, so the alert flags a deferred transition.
+    # The FSM applies the blocked transition, so the alert carries no deferral suffix
+    # and the subtask is durably blocked.
     msg = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
-    assert "FSM unavailable" in msg.content
     assert SUBTASK_ID in msg.content
+    assert "could not be applied" not in msg.content
+    assert store.get_subtask(SUBTASK_ID).state == "blocked"
 
 
 @pytest.mark.asyncio
@@ -180,18 +180,17 @@ async def test_new_transition_resets_counter(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fsm_transition_called_when_present(tmp_path, monkeypatch):
-    """When the FSM is importable, the blocked transition is delegated to it."""
-    store = _seed_store(tmp_path)
+    """The stall→blocked transition is applied by the REAL FSM, not a mock.
+
+    No FSM mock here: this exercises the real caller-role authorization and the
+    ``store=`` plumbing end-to-end. If the ``(any non-terminal, watchdog) →
+    blocked`` edge or the ``store=`` argument is missing, the real transition
+    raises, the subtask stays ``in_progress``, and this test fails — exactly the
+    regression we want guarded.
+    """
+    store = _seed_store(tmp_path)  # subtask seeded 'in_progress'
     signals = {"head": "abc123", "pr_updated": BASELINE_PR_TS}
     monkeypatch.setattr(subprocess, "run", _make_run(signals))
-
-    # Inject a stand-in codeband.state.fsm module (Phase 2 not merged yet).
-    import codeband.state as state_pkg
-
-    fake_fsm = types.ModuleType("codeband.state.fsm")
-    fake_fsm.transition = MagicMock()
-    monkeypatch.setitem(sys.modules, "codeband.state.fsm", fake_fsm)
-    monkeypatch.setattr(state_pkg, "fsm", fake_fsm, raising=False)
 
     rest = _mock_rest()
     daemon = _daemon(store, config=WatchdogConfig(max_phase_visits=2), rest=rest)
@@ -199,11 +198,20 @@ async def test_fsm_transition_called_when_present(tmp_path, monkeypatch):
     for _ in range(3):
         await daemon._check_subtask_progress(now)
 
-    fake_fsm.transition.assert_called_once_with(
-        SUBTASK_ID, TASK_ID, "blocked", caller_role="watchdog",
+    # Durable, real effect: the subtask is actually blocked and audit-logged.
+    assert store.get_subtask(SUBTASK_ID).state == "blocked"
+    conn = sqlite3.connect(store.db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT to_state, caller_role FROM transition_log WHERE subtask_id = ?",
+        (SUBTASK_ID,),
+    ).fetchall()
+    conn.close()
+    assert any(
+        r["to_state"] == "blocked" and r["caller_role"] == "watchdog" for r in rows
     )
     msg = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
-    assert "FSM unavailable" not in msg.content
+    assert "could not be applied" not in msg.content
 
 
 # ── graceful degradation ────────────────────────────────────────────────────

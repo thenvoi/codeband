@@ -652,10 +652,9 @@ class WatchdogDaemon:
     async def _send_blocked_escalation(self, sub: Any) -> None:
         """Mark a stalled subtask blocked and notify the Conductor + human.
 
-        The FSM (Workstream 2) owns the canonical ``blocked`` transition; when
-        it is importable we call it, otherwise we log + notify only and leave
-        the transition to the FSM once that phase lands. Either way the human
-        and Conductor are alerted via a chat message in the task's room.
+        The FSM owns the canonical ``blocked`` transition; we apply it via
+        :meth:`_mark_blocked_via_fsm`. Either way (applied or not) the human and
+        Conductor are alerted via a chat message in the task's room.
         """
         import asyncio
 
@@ -688,7 +687,7 @@ class WatchdogDaemon:
 
         from thenvoi_rest.types import ChatMessageRequest
 
-        suffix = "" if fsm_applied else " (FSM unavailable — transition deferred)"
+        suffix = "" if fsm_applied else " (blocked-transition could not be applied)"
         try:
             await self._rest.agent_api_messages.create_agent_chat_message(
                 chat_id=room_id,
@@ -708,25 +707,19 @@ class WatchdogDaemon:
             )
 
     def _mark_blocked_via_fsm(self, sub: Any) -> bool:
-        """Transition the subtask to ``blocked`` via the FSM when available.
+        """Transition the subtask to ``blocked`` via the FSM.
 
-        Returns ``True`` if the FSM applied the transition, ``False`` when the
-        FSM (Workstream 2) is not importable yet — the watchdog must work with
-        or without it. TODO(WS2): once the FSM lands, this is the canonical
-        blocked-transition path; do not add an FSM here (that is WS2's lane).
+        Returns ``True`` if the FSM applied the transition, ``False`` if it
+        could not — no store available, or the transition raised (e.g. the
+        subtask was already terminal). The chat alert fires either way.
         """
-        try:
-            from codeband.state import fsm  # noqa: PLC0415 — guarded optional dep
-        except ImportError:
-            logger.info(
-                "FSM not available (Phase 2 not merged) — TODO: mark %s blocked "
-                "via fsm.transition once it lands; notified only for now",
-                sub.subtask_id,
-            )
+        if self._store is None:
             return False
+        from codeband.state import fsm  # noqa: PLC0415 — keep watchdog import light
         try:
             fsm.transition(
-                sub.subtask_id, sub.task_id, "blocked", caller_role="watchdog",
+                sub.subtask_id, sub.task_id, "blocked",
+                caller_role="watchdog", store=self._store,
             )
             return True
         except Exception:
