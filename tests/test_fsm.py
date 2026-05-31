@@ -38,7 +38,10 @@ def test_valid_transitions_matches_rfc_table():
         ("planned", "conductor"): frozenset({"assigned"}),
         ("assigned", "coder"): frozenset({"in_progress"}),
         ("in_progress", "coder"): frozenset({"verify_pending", "blocked"}),
-        ("verify_pending", "coder"): frozenset({"review_pending"}),
+        # ``blocked`` is the coder's escalation escape once the verify-attempt
+        # cap is hit (the ``cb-phase`` CLI drives it; the ``review_pending``
+        # advance is gated by the verify gates at runtime).
+        ("verify_pending", "coder"): frozenset({"review_pending", "blocked"}),
         ("review_pending", "reviewer"): frozenset({"review_passed", "review_failed"}),
         # ``blocked`` is the coder's escalation escape once the review-round cap
         # is hit (the ``in_progress`` rework is then gated at runtime).

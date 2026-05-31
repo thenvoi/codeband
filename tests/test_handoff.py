@@ -25,6 +25,7 @@ def patch_gates(monkeypatch, store):
     """Wire the handoff helpers to controllable defaults (all gates pass)."""
     monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
     monkeypatch.setattr(handoff, "_verify_command", lambda project_dir: "verify-cmd")
+    monkeypatch.setattr(handoff, "_max_verify_attempts", lambda project_dir: 20)
     monkeypatch.setattr(handoff, "_git_tree_clean", lambda worktree: True)
     monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
     monkeypatch.setattr(handoff, "_run_verify_command", lambda cmd, cwd: 0)

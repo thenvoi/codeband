@@ -248,6 +248,18 @@ class AgentsConfig(_StrictModel):
     # ``fsm.MAX_REVIEW_ROUNDS``); the live caller lands with P5 activation.
     max_review_rounds: int = 3
 
+    # Per-subtask verify-attempt cap (RFC two-level model). Once a subtask has
+    # had this many ``cb-phase verify`` attempts *rejected* (a failed gate: dirty
+    # tree / PR not open / verify command non-zero), the handoff CLI refuses a
+    # further attempt and escalates the subtask to ``blocked``. Bounds a verify
+    # loop where the coder commits real code each attempt — git HEAD advances, so
+    # the watchdog's stall cap (``watchdog.max_phase_visits``) by design never
+    # fires, and the review-round cap (``max_review_rounds``) never sees it (the
+    # subtask never reaches ``review_failed``). Read by ``cli/handoff.py`` (the
+    # already-live enforcement seam); default 20 matches ``fsm`` /
+    # ``cli.handoff.MAX_VERIFY_ATTEMPTS``.
+    max_verify_attempts: int = 20
+
     def total_agent_count(self) -> int:
         """Band.ai seats used (excluding Watchdog — reuses Conductor creds)."""
         return (

@@ -37,6 +37,14 @@ Coverage map:
   round, HEAD advancing) is bounded in code, the count is durable across a store
   reopen, the counters are per-subtask, and the cap is a mechanism *distinct*
   from the watchdog stall cap (which never fires on a progressing loop).
+* ``TestVerifyAttemptCap`` — the handoff CLI's per-subtask verify-attempt cap:
+  a *productive* ``cb-phase verify`` rejection loop (a real commit each attempt,
+  HEAD advancing, the verify command failing every time) is bounded in code at
+  ``MAX_VERIFY_ATTEMPTS`` → escalated ``verify_pending → blocked``; the count is
+  durable across a store reopen, per-subtask, configurable, and *distinct* from
+  BOTH the watchdog stall cap (never fires on the progressing loop) and the
+  review-round cap (the subtask never reaches ``review_failed`` at all). Mirrors
+  ``TestReviewRoundCap`` on the verify leg of the pipeline.
 
 The two caps are disjoint by construction. The watchdog's ``max_phase_visits``
 is a *mechanical stall cap* (RFC line 178): it fires on the *absence* of
@@ -69,6 +77,7 @@ from codeband.config import (
     WorkspaceConfig,
 )
 from codeband.state import StateStore
+from codeband.cli.handoff import MAX_VERIFY_ATTEMPTS
 from codeband.state.fsm import MAX_REVIEW_ROUNDS, InvalidTransitionError, transition
 from codeband.state.rehydration import build_agent_recovery_context
 
@@ -851,3 +860,273 @@ class TestReviewRoundCap:
             transition("st-x", "room-1", "in_progress", caller_role="coder",
                        store=store)
         assert _log_count(store, "st-x") == before
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Per-subtask verify-attempt cap — bounds a PROGRESSING verify loop in code
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestVerifyAttemptCap:
+    """The handoff CLI's durable per-subtask verify-attempt cap.
+
+    This is the verify-leg sibling of ``TestReviewRoundCap``. The loop it bounds:
+    a coder parked at ``verify_pending`` calls ``cb-phase verify``, a gate fails
+    (here: the verify command exits non-zero), the coder *edits and commits*
+    (git HEAD advances — it looks like progress), and tries again — forever. The
+    watchdog's stall cap reads git HEAD, so a HEAD-advancing loop resets its
+    counter every patrol and it never fires; the review-round cap counts
+    ``review_failed`` re-entries, which this subtask never reaches. The cap is
+    enforced in ``cli/handoff.py`` against a durable ``verify_attempts`` count
+    (cumulative, never reset), so it survives a crash/reopen and is per-subtask.
+
+    Semantics (a faithful mirror of the review-round cap): each *rejected* verify
+    attempt increments ``verify_attempts`` (a *success* never does); once the
+    count has reached ``MAX_VERIFY_ATTEMPTS``, the *next* call escalates
+    ``verify_pending → blocked`` and writes nothing but that transition — exactly
+    as the review-round cap records ``MAX_REVIEW_ROUNDS`` failures before refusing
+    the next rework.
+    """
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _project(self, tmp_path, *, verify_command="exit 1", max_verify_attempts=None):
+        """Build a project dir with codeband.yaml + a store (no subtasks yet).
+
+        ``verify_command`` defaults to ``exit 1`` so every verify attempt is
+        *rejected* at the (real subprocess) verify gate while the tree stays
+        clean and the PR is reported OPEN — isolating the cap from the other
+        gates. project_dir is kept separate from the git worktree so writing
+        codeband.yaml never dirties the tree. Returns ``(project_dir, store)``.
+        """
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        workspace = tmp_path / "workspace"
+        agents_kwargs = {"handoff_verify_command": verify_command}
+        if max_verify_attempts is not None:
+            agents_kwargs["max_verify_attempts"] = max_verify_attempts
+        cfg = CodebandConfig(
+            repo=RepoConfig(url="https://github.com/example/repo.git",
+                            branch="main"),
+            agents=AgentsConfig(**agents_kwargs),
+            workspace=WorkspaceConfig(path=str(workspace)),
+        )
+        cfg.to_yaml(project_dir / "codeband.yaml")
+        store = StateStore(workspace / "state" / "orchestration.db")
+        store.create_task("room-1", "demo", "room-1")
+        return project_dir, store
+
+    def _seed_verify_pending(self, store, sid, branch):
+        """Drive a fresh subtask to ``verify_pending`` with its branch recorded.
+
+        The branch goes in metadata *before* the first transition (which only
+        ``ensure_subtask``s without metadata), so the watchdog can read the
+        subtask's git HEAD.
+        """
+        store.ensure_subtask(sid, "room-1", metadata={"branch": branch})
+        transition(sid, "room-1", "assigned", caller_role="conductor", store=store)
+        transition(sid, "room-1", "in_progress", caller_role="coder", store=store)
+        transition(sid, "room-1", "verify_pending", caller_role="coder", store=store)
+
+    def _run_verify(self, project_dir, worktree, subtask_id, *, pr=42):
+        return handoff.main([
+            "verify", subtask_id,
+            "--task", "room-1",
+            "--pr", str(pr),
+            "--worktree", str(worktree),
+            "--project-dir", str(project_dir),
+        ])
+
+    # ── the crux: a progressing verify loop, bounded by the cap ──────────────
+
+    async def test_cap_fires_on_progressing_loop_distinct_from_stall(
+        self, tmp_path, monkeypatch,
+    ):
+        """A real commit before every attempt (HEAD advances) — NOT a stall —
+        and the verify cap still escalates to ``blocked`` at the cap, while a
+        deliberately TIGHT-stall watchdog patrolling the same loop never fires.
+        Proves the verify cap and the watchdog stall cap catch disjoint faults.
+        """
+        repo = _init_repo(tmp_path / "repo")
+        _commit_on(repo, "feat-v", "seed")          # create the subtask's branch
+        _git(repo, "checkout", "main")
+        monkeypatch.chdir(repo)                      # watchdog runs git here
+        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)  # PR OPEN
+
+        # Default cap (20). verify_command 'exit 1' rejects every attempt.
+        project_dir, store = self._project(tmp_path, verify_command="exit 1")
+        self._seed_verify_pending(store, "st-v", "feat-v")
+        assert MAX_VERIFY_ATTEMPTS == 20             # the documented default
+
+        rest = _fake_rest()
+        daemon = WatchdogDaemon(
+            config=WatchdogConfig(max_phase_visits=2, git_progress_check=True),
+            rest_client=rest,
+            agent_id="agent-wd",
+            conductor_id="agent-cond",
+            state_store=store,
+        )
+        now = datetime.now(timezone.utc)
+        await daemon._check_subtask_progress(now)    # baseline patrol
+
+        base_log = _log_count(store, "st-v")         # 3 seeding rows
+        for i in range(1, MAX_VERIFY_ATTEMPTS + 1):  # MAX rejecting attempts
+            _commit_on(repo, "feat-v", f"attempt-{i}")   # REAL HEAD movement
+            _git(repo, "checkout", "main")
+            await daemon._check_subtask_progress(now)    # watchdog sees progress
+            assert self._run_verify(project_dir, repo, "st-v") != 0
+            sub = store.get_subtask("st-v")
+            assert sub.verify_attempts == i              # one count per rejection
+            assert sub.state == "verify_pending"         # rejection ≠ transition
+            assert _log_count(store, "st-v") == base_log  # no log row on rejection
+
+        # The progressing loop never tripped the (tight) watchdog stall cap.
+        assert daemon._subtask_state["st-v"].patrol_visits_without_progress == 0
+        assert rest.agent_api_messages.create_agent_chat_message.await_count == 0
+        assert store.get_subtask("st-v").verify_attempts == MAX_VERIFY_ATTEMPTS
+
+        # The next verify call hits the cap: escalate verify_pending → blocked,
+        # writing nothing but the blocked transition (no further increment).
+        assert self._run_verify(project_dir, repo, "st-v") != 0
+        sub = store.get_subtask("st-v")
+        assert sub.state == "blocked"
+        assert sub.verify_attempts == MAX_VERIFY_ATTEMPTS  # not bumped on escalate
+        assert _log_count(store, "st-v") == base_log + 1
+        last = _log_rows(store, "st-v")[-1]
+        assert (last["from_state"], last["to_state"]) == ("verify_pending", "blocked")
+        assert last["caller_role"] == "coder"
+
+    def test_configurable_cap_rejects_at_explicit_max(self, tmp_path, monkeypatch):
+        """The cap is configurable: ``max_verify_attempts=2`` bounds the loop
+        after two rejected attempts; the third call escalates to ``blocked``."""
+        repo = _init_repo(tmp_path / "repo")
+        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        project_dir, store = self._project(
+            tmp_path, verify_command="exit 1", max_verify_attempts=2,
+        )
+        self._seed_verify_pending(store, "st-c", "feat-c")
+        base = _log_count(store, "st-c")
+
+        assert self._run_verify(project_dir, repo, "st-c") != 0   # attempt 1
+        assert self._run_verify(project_dir, repo, "st-c") != 0   # attempt 2
+        sub = store.get_subtask("st-c")
+        assert sub.verify_attempts == 2
+        assert sub.state == "verify_pending"
+        assert _log_count(store, "st-c") == base                  # no log rows
+
+        # Third call: count has reached the (overridden) cap → blocked.
+        assert self._run_verify(project_dir, repo, "st-c") != 0
+        assert store.get_subtask("st-c").state == "blocked"
+        assert store.get_subtask("st-c").verify_attempts == 2     # not re-bumped
+        assert _log_count(store, "st-c") == base + 1
+
+    # ── durability: the count survives a crash/reopen mid-loop ───────────────
+
+    def test_cap_survives_store_reopen(self, tmp_path, monkeypatch):
+        """A crash mid-loop must not reset the cap: the durable count persists
+        across a fresh ``StateStore`` on the same DB file, and the cap still
+        fires after reopen."""
+        repo = _init_repo(tmp_path / "repo")
+        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        project_dir, store = self._project(
+            tmp_path, verify_command="exit 1", max_verify_attempts=3,
+        )
+        self._seed_verify_pending(store, "st-d", "feat-d")
+
+        assert self._run_verify(project_dir, repo, "st-d") != 0   # attempt 1
+        assert self._run_verify(project_dir, repo, "st-d") != 0   # attempt 2
+        assert store.get_subtask("st-d").verify_attempts == 2
+
+        # Simulate a crash/restart: drop the handle, reopen the same file fresh.
+        db_path = store.db_path
+        del store
+        reopened = StateStore(db_path)
+        assert reopened.get_subtask("st-d").verify_attempts == 2  # survived reopen
+        assert reopened.get_subtask("st-d").state == "verify_pending"
+
+        base = _log_count(reopened, "st-d")
+        assert self._run_verify(project_dir, repo, "st-d") != 0   # attempt 3 → cap
+        assert reopened.get_subtask("st-d").verify_attempts == 3
+        assert _log_count(reopened, "st-d") == base               # still no log row
+
+        # Next call after reopen escalates — the cap fired across the "crash".
+        assert self._run_verify(project_dir, repo, "st-d") != 0
+        assert reopened.get_subtask("st-d").state == "blocked"
+        assert _log_count(reopened, "st-d") == base + 1
+
+    # ── isolation: one subtask's cap does not affect another's counter ───────
+
+    def test_per_subtask_verify_counters_are_independent(self, tmp_path, monkeypatch):
+        """N concurrent subtasks each carry their own ``verify_attempts``: one
+        hitting the cap leaves the others' attempts and state untouched."""
+        repo = _init_repo(tmp_path / "repo")
+        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        project_dir, store = self._project(
+            tmp_path, verify_command="exit 1", max_verify_attempts=3,
+        )
+        for sid, branch in [("st-a", "feat-a"), ("st-b", "feat-b"),
+                            ("st-c", "feat-c")]:
+            self._seed_verify_pending(store, sid, branch)
+
+        # st-a → cap (3 rejections, then a 4th call escalates to blocked).
+        for _ in range(3):
+            assert self._run_verify(project_dir, repo, "st-a") != 0
+        assert self._run_verify(project_dir, repo, "st-a") != 0
+        # st-b once, st-c twice — both below the cap.
+        assert self._run_verify(project_dir, repo, "st-b") != 0
+        for _ in range(2):
+            assert self._run_verify(project_dir, repo, "st-c") != 0
+
+        assert store.get_subtask("st-a").state == "blocked"
+        assert store.get_subtask("st-a").verify_attempts == 3
+        assert store.get_subtask("st-b").state == "verify_pending"
+        assert store.get_subtask("st-b").verify_attempts == 1
+        assert store.get_subtask("st-c").state == "verify_pending"
+        assert store.get_subtask("st-c").verify_attempts == 2
+
+        # The capped subtask is blocked, but the others — below their own caps —
+        # keep accepting attempts independently.
+        assert self._run_verify(project_dir, repo, "st-b") != 0
+        assert store.get_subtask("st-b").state == "verify_pending"
+        assert store.get_subtask("st-b").verify_attempts == 2
+
+    # ── interaction: verify cap and review-round cap are independent loops ────
+
+    def test_verify_cap_and_review_cap_are_independent_counters(
+        self, tmp_path, monkeypatch,
+    ):
+        """``verify_attempts`` and ``review_round`` count disjoint loops: verify
+        rejections never touch the review counter, a verify *success* never bumps
+        either, and a failed review never touches the verify counter. A subtask
+        can approach one cap without affecting the other."""
+        repo = _init_repo(tmp_path / "repo")
+        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        # Cap high enough that nothing blocks during this test.
+        project_dir, store = self._project(
+            tmp_path, verify_command="exit 1", max_verify_attempts=20,
+        )
+        self._seed_verify_pending(store, "st-i", "feat-i")
+
+        # Two verify rejections: verify_attempts climbs, review_round stays 0.
+        assert self._run_verify(project_dir, repo, "st-i") != 0
+        assert self._run_verify(project_dir, repo, "st-i") != 0
+        sub = store.get_subtask("st-i")
+        assert sub.verify_attempts == 2
+        assert sub.review_round == 0
+
+        # Now verify *passes* (verify command exits 0) → advances to
+        # review_pending; a success leaves verify_attempts untouched.
+        monkeypatch.setattr(handoff, "_verify_command", lambda project_dir: "exit 0")
+        assert self._run_verify(project_dir, repo, "st-i") == 0
+        sub = store.get_subtask("st-i")
+        assert sub.state == "review_pending"
+        assert sub.verify_attempts == 2          # success never increments
+        assert sub.review_round == 0
+
+        # A failed review increments review_round only — verify_attempts is the
+        # other cap's counter and stays put.
+        transition("st-i", "room-1", "review_failed", caller_role="reviewer",
+                   store=store)
+        sub = store.get_subtask("st-i")
+        assert sub.review_round == 1
+        assert sub.verify_attempts == 2

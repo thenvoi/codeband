@@ -62,7 +62,13 @@ VALID_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     ("planned", "conductor"): frozenset({"assigned"}),
     ("assigned", "coder"): frozenset({"in_progress"}),
     ("in_progress", "coder"): frozenset({"verify_pending", "blocked"}),
-    ("verify_pending", "coder"): frozenset({"review_pending"}),
+    # A coder advances a verified subtask to ``review_pending`` (via the
+    # ``cb-phase verify`` gate) OR, once the per-subtask verify-attempt cap is
+    # hit, escalates it to ``blocked`` — the same escalation outcome the watchdog
+    # and review-round cap produce. The ``cb-phase`` CLI drives the ``blocked``
+    # edge directly (it is a deterministic subprocess, not an LLM that can be
+    # *told* to escalate); the runtime cap guard lives in ``cli/handoff.py``.
+    ("verify_pending", "coder"): frozenset({"review_pending", "blocked"}),
     ("review_pending", "reviewer"): frozenset({"review_passed", "review_failed"}),
     # A coder may rework a failed review (back to ``in_progress``) OR, once the
     # review-round cap is hit, escalate the subtask to ``blocked`` — the same

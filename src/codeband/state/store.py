@@ -79,6 +79,15 @@ class SubtaskRow:
     # so the per-subtask review-round cap survives a crash/reopen mid-loop and
     # cannot be reset by rehydration. Distinct from the watchdog's stall counter.
     review_round: int = 0
+    # Count of *rejected* ``cb-phase verify`` attempts over the subtask's whole
+    # life — incremented by the handoff CLI each time a verify gate (clean tree /
+    # open PR / verify command) fails, never on success. Durable and cumulative
+    # (never reset on rework), so the per-subtask verify-attempt cap survives a
+    # crash/reopen and cannot be gamed by bouncing through review. Bounds the
+    # productive verify-rejection loop the watchdog's stall cap cannot catch —
+    # the coder commits real code each attempt, so git HEAD keeps advancing.
+    # Distinct from both ``review_round`` and the watchdog's stall counter.
+    verify_attempts: int = 0
 
 
 _SCHEMA = """
@@ -99,7 +108,8 @@ CREATE TABLE IF NOT EXISTS subtask_states (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
     metadata        TEXT,
-    review_round    INTEGER NOT NULL DEFAULT 0
+    review_round    INTEGER NOT NULL DEFAULT 0,
+    verify_attempts INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS transition_log (
@@ -180,6 +190,11 @@ class StateStore:
                 "ALTER TABLE subtask_states "
                 "ADD COLUMN review_round INTEGER NOT NULL DEFAULT 0"
             )
+        if "verify_attempts" not in cols:
+            conn.execute(
+                "ALTER TABLE subtask_states "
+                "ADD COLUMN verify_attempts INTEGER NOT NULL DEFAULT 0"
+            )
 
     # ── tasks ──────────────────────────────────────────────────────────────
 
@@ -256,6 +271,31 @@ class StateStore:
             ).fetchone()
         return _subtask_from_row(row) if row is not None else None
 
+    def increment_verify_attempts(self, subtask_id: str) -> int:
+        """Atomically bump ``verify_attempts`` for a subtask; return the new count.
+
+        Called by the ``cb-phase`` handoff CLI on each *rejected* verify attempt
+        (a failed gate), never on success. The bump is a single ``UPDATE`` inside
+        a short transaction, so it is durable the instant it commits and survives
+        a crash/reopen — a coder that crashes mid-loop cannot reset its budget.
+        Treats an absent ``verify_attempts`` value as 0 via ``COALESCE`` for
+        defence against any pre-migration NULL. Returns the post-increment count
+        (``0`` if the subtask row does not exist, i.e. nothing was updated) so the
+        caller can compare against the cap without a second read.
+        """
+        with self._transaction() as conn:
+            conn.execute(
+                "UPDATE subtask_states "
+                "SET verify_attempts = COALESCE(verify_attempts, 0) + 1, "
+                "updated_at = ? WHERE subtask_id = ?",
+                (_now_iso(), subtask_id),
+            )
+            row = conn.execute(
+                "SELECT verify_attempts FROM subtask_states WHERE subtask_id = ?",
+                (subtask_id,),
+            ).fetchone()
+        return row["verify_attempts"] if row is not None else 0
+
     def list_active_subtasks(self, task_id: str | None = None) -> list[SubtaskRow]:
         """Return non-terminal subtasks, newest first.
 
@@ -296,4 +336,5 @@ def _subtask_from_row(row: sqlite3.Row) -> SubtaskRow:
         updated_at=row["updated_at"],
         metadata=json.loads(raw_metadata) if raw_metadata else None,
         review_round=row["review_round"],
+        verify_attempts=row["verify_attempts"],
     )
