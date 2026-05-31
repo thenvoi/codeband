@@ -193,10 +193,106 @@ def _reject(store: StateStore, subtask_id: str, message: str, exit_code: int) ->
     return exit_code
 
 
+def _walk_to_verify_pending(
+    subtask_id: str,
+    task_id: str,
+    store: StateStore,
+) -> int | None:
+    """Auto-walk the subtask to ``verify_pending`` from its current state.
+
+    Returns ``None`` on success (the subtask is now at ``verify_pending`` and
+    gates can proceed). Returns an exit code on failure (the caller should
+    return it immediately).
+
+    Legal entry states:
+
+    * ``verify_pending`` — already there, no transitions needed.
+    * ``in_progress`` — walk ``in_progress → verify_pending``.
+    * ``review_failed`` — walk ``review_failed → in_progress`` (the FSM
+      checks the review-round cap on this edge), then
+      ``in_progress → verify_pending``.
+
+    Any other state prints a clear error and returns exit code 1.
+    """
+    subtask = store.get_subtask(subtask_id)
+    current = subtask.state if subtask is not None else "planned"
+
+    if current == "verify_pending":
+        return None
+
+    if current == "in_progress":
+        try:
+            transition(
+                subtask_id, task_id, "verify_pending",
+                caller_role="coder",
+                reason="cb-phase verify: auto-walk in_progress → verify_pending",
+                store=store,
+            )
+        except InvalidTransitionError as exc:
+            print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
+            return 1
+        return None
+
+    if current == "review_failed":
+        try:
+            transition(
+                subtask_id, task_id, "in_progress",
+                caller_role="coder",
+                reason="cb-phase verify: auto-walk review_failed → in_progress (rework)",
+                store=store,
+            )
+        except InvalidTransitionError as exc:
+            # The review-round cap fires here. Escalate to blocked.
+            try:
+                transition(
+                    subtask_id, task_id, "blocked",
+                    caller_role="coder",
+                    reason="review-round cap reached",
+                    store=store,
+                )
+            except InvalidTransitionError:
+                print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
+                return 1
+            sub = store.get_subtask(subtask_id)
+            rounds = sub.review_round if sub is not None else 0
+            print(
+                f"BLOCKED [review_cap_reached]: {rounds} review rounds. "
+                "Escalated to human; stop and await.",
+                file=sys.stderr,
+            )
+            return EXIT_CAP_REACHED
+        try:
+            transition(
+                subtask_id, task_id, "verify_pending",
+                caller_role="coder",
+                reason="cb-phase verify: auto-walk in_progress → verify_pending",
+                store=store,
+            )
+        except InvalidTransitionError as exc:
+            print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
+            return 1
+        return None
+
+    print(
+        f"cb-phase: subtask {subtask_id!r} is in state {current!r}, "
+        "which is not a valid entry state for cb-phase verify. "
+        "Expected in_progress, verify_pending, or review_failed.",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
     project_dir = Path(args.project_dir).resolve()
     worktree = Path(args.worktree).resolve()
     store = _resolve_store(project_dir)
+
+    # Walk the subtask to verify_pending from its current state. This handles
+    # first-submit (in_progress), rework (review_failed), and retry
+    # (verify_pending) entry paths, walking only legal FSM edges.
+    walk_result = _walk_to_verify_pending(args.subtask_id, args.task, store)
+    if walk_result is not None:
+        return walk_result
 
     # Gate 0 — verify-attempt cap. If this subtask has already burned its budget
     # of rejected attempts, escalate to ``blocked`` and stop *before* running any
