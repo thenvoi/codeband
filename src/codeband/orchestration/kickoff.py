@@ -68,11 +68,27 @@ async def send_task(config: CodebandConfig, project_dir: Path, description: str)
     try:
         from codeband.state import StateStore
 
+        # The initiator is whoever holds BAND_API_KEY (the human_client above).
+        # Resolve their Band participant id the same way repl.py does, so the
+        # watchdog can @mention them when a subtask of this task lands blocked.
+        # Best-effort: a profile-lookup failure leaves owner_id None.
+        owner_id = None
+        try:
+            profile = await human_client.human_api_profile.get_my_profile()
+            owner_id = getattr(profile.data, "id", None)
+        except Exception:  # noqa: BLE001 - owner resolution must never break kickoff
+            logger.debug("Could not resolve task initiator profile", exc_info=True)
+
         workspace_path = Path(config.workspace.path)
         if not workspace_path.is_absolute():
             workspace_path = project_dir / workspace_path
         store = StateStore(workspace_path / "state" / "orchestration.db")
-        store.create_task(task_id=room_id, description=description, room_id=room_id)
+        store.create_task(
+            task_id=room_id,
+            description=description,
+            room_id=room_id,
+            owner_id=owner_id,
+        )
     except Exception:  # noqa: BLE001 - shadow mode must never break kickoff
         logger.warning("StateStore task write skipped (shadow mode)", exc_info=True)
 

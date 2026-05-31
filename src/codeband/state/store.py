@@ -60,6 +60,11 @@ class TaskRow:
     room_id: str
     created_at: str
     status: str = "active"
+    # Band participant id of the task initiator (whoever held BAND_API_KEY at
+    # kickoff). Nullable — predates the column on older DBs and may be unresolved
+    # if the profile lookup failed. The watchdog reads it to @mention the
+    # initiator when one of the subtask's caps trips it into ``blocked``.
+    owner_id: str | None = None
 
 
 @dataclass
@@ -96,7 +101,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     description TEXT NOT NULL,
     room_id     TEXT NOT NULL,
     created_at  TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'active'
+    status      TEXT NOT NULL DEFAULT 'active',
+    owner_id    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS subtask_states (
@@ -195,6 +201,11 @@ class StateStore:
                 "ALTER TABLE subtask_states "
                 "ADD COLUMN verify_attempts INTEGER NOT NULL DEFAULT 0"
             )
+        task_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        if "owner_id" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN owner_id TEXT")
 
     # ── tasks ──────────────────────────────────────────────────────────────
 
@@ -206,6 +217,7 @@ class StateStore:
         *,
         created_at: str | None = None,
         status: str = "active",
+        owner_id: str | None = None,
     ) -> None:
         """Insert a task row (idempotent on ``task_id``).
 
@@ -215,9 +227,16 @@ class StateStore:
         with self._transaction() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO tasks "
-                "(task_id, description, room_id, created_at, status) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (task_id, description, room_id, created_at or _now_iso(), status),
+                "(task_id, description, room_id, created_at, status, owner_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    description,
+                    room_id,
+                    created_at or _now_iso(),
+                    status,
+                    owner_id,
+                ),
             )
 
     def get_task(self, task_id: str) -> TaskRow | None:
@@ -315,12 +334,16 @@ class StateStore:
 
 
 def _task_from_row(row: sqlite3.Row) -> TaskRow:
+    # ``owner_id`` may be absent on rows fetched before the migration ran (or in
+    # a hand-built row in tests); tolerate its absence rather than KeyError.
+    owner_id = row["owner_id"] if "owner_id" in row.keys() else None
     return TaskRow(
         task_id=row["task_id"],
         description=row["description"],
         room_id=row["room_id"],
         created_at=row["created_at"],
         status=row["status"],
+        owner_id=owner_id,
     )
 
 

@@ -56,6 +56,62 @@ def test_create_task_then_get(store: StateStore) -> None:
     assert task.created_at  # ISO-8601 UTC timestamp populated
 
 
+def test_create_task_with_owner_id_round_trips(store: StateStore) -> None:
+    store.create_task(
+        task_id="room-1",
+        description="do the thing",
+        room_id="room-1",
+        owner_id="initiator-7",
+    )
+
+    task = store.get_task("room-1")
+    assert task is not None
+    assert task.owner_id == "initiator-7"
+
+
+def test_create_task_owner_id_defaults_to_none(store: StateStore) -> None:
+    store.create_task(task_id="room-1", description="t", room_id="room-1")
+
+    task = store.get_task("room-1")
+    assert task is not None
+    assert task.owner_id is None
+
+
+def test_owner_id_migrated_onto_legacy_tasks_table(tmp_path: Path) -> None:
+    """A pre-existing tasks table without ``owner_id`` is migrated in place.
+
+    ``CREATE TABLE IF NOT EXISTS`` is a no-op against the old table, so the
+    guarded ALTER must add the column; legacy rows then read back with
+    ``owner_id`` None and new writes can persist it.
+    """
+    db_path = tmp_path / "state" / "orchestration.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE tasks ("
+        "task_id TEXT PRIMARY KEY, description TEXT NOT NULL, "
+        "room_id TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'active')"
+    )
+    conn.execute(
+        "INSERT INTO tasks (task_id, description, room_id, created_at, status) "
+        "VALUES ('old-1', 'legacy', 'old-1', '2020-01-01T00:00:00+00:00', 'active')"
+    )
+    conn.commit()
+    conn.close()
+
+    store = StateStore(db_path)  # runs the guarded migration
+
+    legacy = store.get_task("old-1")
+    assert legacy is not None
+    assert legacy.owner_id is None  # backfilled, no KeyError on a pre-column row
+
+    store.create_task(
+        task_id="new-1", description="t", room_id="new-1", owner_id="owner-9",
+    )
+    assert store.get_task("new-1").owner_id == "owner-9"
+
+
 def test_get_missing_task_returns_none(store: StateStore) -> None:
     assert store.get_task("nope") is None
 

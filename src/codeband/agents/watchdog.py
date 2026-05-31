@@ -757,13 +757,17 @@ class WatchdogDaemon:
         cap all land here. Each blocked subtask is announced to the owner exactly
         once (escalate-once via ``_owner_escalated``).
 
-        Fully no-ops when no store is wired or no ``owner_id`` was supplied — the
-        latter is the dormant default pre-activation. Guarded so a store read or
-        a notify failure never breaks the patrol loop.
+        The owner is resolved per blocked subtask from its task row
+        (``task.owner_id``, persisted at kickoff), falling back to the optional
+        ``self._owner_id`` constructor override. Fully no-ops when no store is
+        wired. When no owner can be resolved for a subtask it is skipped WITHOUT
+        burning its escalate-once marker, so it can still escalate later if an
+        owner appears. Guarded so a store read or a notify failure never breaks
+        the patrol loop.
         """
         import asyncio
 
-        if self._store is None or self._owner_id is None:
+        if self._store is None:
             return
 
         try:
@@ -778,24 +782,53 @@ class WatchdogDaemon:
         for sub in subtasks:
             if sub.state != "blocked" or sub.subtask_id in self._owner_escalated:
                 continue
+            # Resolve the owner from the subtask's task row (set at kickoff),
+            # falling back to the constructor override. Do this BEFORE flipping
+            # escalate-once: with no resolvable owner there is nobody to mention,
+            # so skip without consuming the marker — it can escalate later once
+            # an owner is recorded.
+            owner_id = await self._resolve_owner_id(sub.task_id)
+            if owner_id is None:
+                continue
             # Flip escalate-once BEFORE the send so a server rejection (e.g.
             # mention validation) doesn't re-fire the owner every patrol.
             self._owner_escalated.add(sub.subtask_id)
             try:
-                await self._send_owner_blocked_escalation(sub)
+                await self._send_owner_blocked_escalation(sub, owner_id)
             except Exception:
                 logger.exception(
                     "Failed owner escalation for blocked subtask %s",
                     sub.subtask_id,
                 )
 
-    async def _send_owner_blocked_escalation(self, sub: Any) -> None:
+    async def _resolve_owner_id(self, task_id: str) -> str | None:
+        """Return the initiator id for *task_id*, or the constructor override.
+
+        Reads ``owner_id`` off the task row (persisted at kickoff). Falls back to
+        ``self._owner_id`` when the row carries no owner. Returns ``None`` when
+        neither is available. Guarded so a store read failure degrades to the
+        override rather than breaking the patrol.
+        """
+        import asyncio
+
+        owner_id: str | None = None
+        try:
+            task = await asyncio.to_thread(self._store.get_task, task_id)
+            owner_id = getattr(task, "owner_id", None) if task else None
+        except Exception:
+            logger.debug(
+                "Could not resolve owner id for task %s", task_id, exc_info=True,
+            )
+        return owner_id or self._owner_id
+
+    async def _send_owner_blocked_escalation(self, sub: Any, owner_id: str) -> None:
         """@mention the owner about a blocked subtask, with its blocked reason.
 
-        The owner is a distinct room participant (not the Conductor whose
-        credentials the watchdog borrows), so the mention is valid. The message
-        carries the subtask id and the durable reason recorded on the blocked
-        transition so the owner has actionable context.
+        *owner_id* is the resolved task initiator (from the task row, or the
+        constructor override). The owner is a distinct room participant (not the
+        Conductor whose credentials the watchdog borrows), so the mention is
+        valid. The message carries the subtask id and the durable reason recorded
+        on the blocked transition so the owner has actionable context.
         """
         import asyncio
 
@@ -820,7 +853,7 @@ class WatchdogDaemon:
             ChatMessageRequestMentionsItem,
         )
 
-        handle = self._owner_handle or self._owner_id
+        handle = self._owner_handle or owner_id
         if self._activity:
             self._activity.log(
                 "SUBTASK_BLOCKED_OWNER_ESCALATION", "watchdog",
@@ -834,7 +867,7 @@ class WatchdogDaemon:
                     f"({reason}). It needs a human decision — reassign, "
                     f"intervene, or abandon."
                 ),
-                mentions=[ChatMessageRequestMentionsItem(id=self._owner_id)],
+                mentions=[ChatMessageRequestMentionsItem(id=owner_id)],
             ),
         )
 

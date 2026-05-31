@@ -325,18 +325,19 @@ async def test_patrol_still_nudges_stale_agent_with_store(tmp_path, monkeypatch)
 
 # ── owner escalation on blocked (RFC P5 stage-1b wiring; dormant by default) ──
 
-def _seed_blocked(tmp_path, *, reason="verify-attempt cap 20 reached"):
+def _seed_blocked(tmp_path, *, reason="verify-attempt cap 20 reached", owner_id=None):
     """A real store with one subtask driven to ``blocked`` via the FSM.
 
     Driving it through ``fsm.transition`` (not a bare ``ensure_subtask``) writes
     a real ``→ blocked`` transition_log row carrying ``reason`` so the owner
-    escalation can surface it.
+    escalation can surface it. ``owner_id`` is persisted on the task row so the
+    watchdog can resolve the initiator without a constructor override.
     """
     from codeband.state import StateStore
     from codeband.state.fsm import transition
 
     store = StateStore(tmp_path / "state" / "orchestration.db")
-    store.create_task(TASK_ID, "demo task", ROOM_ID)
+    store.create_task(TASK_ID, "demo task", ROOM_ID, owner_id=owner_id)
     transition(SUBTASK_ID, TASK_ID, "assigned", caller_role="conductor", store=store)
     transition(SUBTASK_ID, TASK_ID, "in_progress", caller_role="coder", store=store)
     transition(SUBTASK_ID, TASK_ID, "blocked", caller_role="coder",
@@ -435,3 +436,37 @@ async def test_non_blocked_subtasks_are_not_escalated(tmp_path):
     await daemon._check_blocked_subtasks(datetime.now(UTC))
 
     rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_owner_resolved_from_task_row_without_override(tmp_path):
+    """The initiator persisted on the task row drives the escalation even when
+    the watchdog carries no constructor owner override (the runner's default)."""
+    store = _seed_blocked(tmp_path, owner_id="initiator-7")
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest, owner_id=None, owner_handle=None)
+
+    await daemon._check_blocked_subtasks(datetime.now(UTC))
+
+    rest.agent_api_messages.create_agent_chat_message.assert_awaited_once()
+    msg = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
+    assert SUBTASK_ID in msg.content
+    assert "@initiator-7" in msg.content
+    assert [m.id for m in msg.mentions] == ["initiator-7"]
+
+
+@pytest.mark.asyncio
+async def test_no_resolvable_owner_does_not_burn_escalate_once(tmp_path):
+    """A blocked subtask with no row owner and no override is skipped without
+    consuming its escalate-once marker, so it can escalate once an owner appears.
+    """
+    store = _seed_blocked(tmp_path, owner_id=None)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest, owner_id=None, owner_handle=None)
+
+    await daemon._check_blocked_subtasks(datetime.now(UTC))
+
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+    # The marker must NOT be set — a later patrol can still escalate once an
+    # owner is recorded on the task row.
+    assert SUBTASK_ID not in daemon._owner_escalated
