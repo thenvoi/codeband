@@ -40,7 +40,7 @@ class TestReviewersPoolConfig:
             agents=AgentsConfig(
                 reviewers=ReviewersConfig(
                     claude_sdk=PoolEntry(count=0),
-                    codex=PoolEntry(count=2, model="gpt-5.4"),
+                    codex=PoolEntry(count=2, model="gpt-5.5"),
                     review_guidelines="Must have tests",
                 ),
             ),
@@ -50,7 +50,7 @@ class TestReviewersPoolConfig:
         loaded = CodebandConfig.from_yaml(yaml_path)
         assert loaded.agents.reviewers.claude_sdk.count == 0
         assert loaded.agents.reviewers.codex.count == 2
-        assert loaded.agents.reviewers.codex.model == "gpt-5.4"
+        assert loaded.agents.reviewers.codex.model == "gpt-5.5"
         assert loaded.agents.reviewers.review_guidelines == "Must have tests"
 
 

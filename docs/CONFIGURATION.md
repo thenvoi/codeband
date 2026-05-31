@@ -22,14 +22,14 @@ agents:
     codex:      { count: 0 }
   plan_reviewers:
     claude_sdk: { count: 0 }
-    codex:      { count: 1, model: gpt-5.4 }
+    codex:      { count: 1, model: gpt-5.5 }
     # review_guidelines: "Optional project-wide plan-review policy"
   coders:
-    claude_sdk: { count: 1, model: claude-opus-4-7 }
-    codex:      { count: 1, model: gpt-5.4 }
+    claude_sdk: { count: 1, model: claude-opus-4-8 }
+    codex:      { count: 1, model: gpt-5.5 }
   reviewers:
     claude_sdk: { count: 1, model: claude-sonnet-4-6 }
-    codex:      { count: 1, model: gpt-5.4 }
+    codex:      { count: 1, model: gpt-5.5 }
     # review_guidelines: "All public functions need docstrings. No raw SQL."
 
   watchdog:

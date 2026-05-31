@@ -40,15 +40,15 @@ def sample_config(tmp_path: Path) -> CodebandConfig:
                 claude_sdk=PoolEntry(count=1, model="claude-sonnet-4-6"),
             ),
             plan_reviewers=PlanReviewersConfig(
-                codex=PoolEntry(count=1, model="gpt-5.4"),
+                codex=PoolEntry(count=1, model="gpt-5.5"),
             ),
             coders=FrameworkPool(
                 claude_sdk=PoolEntry(count=1, model="claude-sonnet-4-6"),
-                codex=PoolEntry(count=1, model="gpt-5.4"),
+                codex=PoolEntry(count=1, model="gpt-5.5"),
             ),
             reviewers=ReviewersConfig(
                 claude_sdk=PoolEntry(count=1, model="claude-sonnet-4-6"),
-                codex=PoolEntry(count=1, model="gpt-5.4"),
+                codex=PoolEntry(count=1, model="gpt-5.5"),
             ),
             watchdog=WatchdogConfig(),
         ),

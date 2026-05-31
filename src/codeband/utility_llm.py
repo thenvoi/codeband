@@ -10,12 +10,14 @@ from __future__ import annotations
 import json
 import re
 
+from codeband.models import CLAUDE_SONNET
+
 # Strips a leading/trailing ```json ... ``` fence in case the model adds it
 # despite the prompt. Tolerant of extra whitespace.
 _FENCE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 
 
-async def one_shot_text(prompt: str, *, model: str = "claude-sonnet-4-6") -> str:
+async def one_shot_text(prompt: str, *, model: str = CLAUDE_SONNET) -> str:
     """Run a single-turn prompt through Claude Code SDK and return assistant text.
 
     Disables tool use so the call is a plain prompt → text round trip.

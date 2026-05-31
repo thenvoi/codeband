@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from codeband.models import CLAUDE_SONNET, CODEX_GPT
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_PROMPT = Path(__file__).parent.parent / "prompts" / "planner.md"
@@ -32,7 +34,7 @@ class ClaudePlannerRunner:
     def __init__(
         self,
         *,
-        model: str = "claude-sonnet-4-6",
+        model: str = CLAUDE_SONNET,
         custom_prompt: str | None = None,
         workspace: str | None = None,
         worker_roster: str | None = None,
@@ -75,7 +77,7 @@ class CodexPlannerRunner:
     def __init__(
         self,
         *,
-        model: str = "gpt-5.4",
+        model: str = CODEX_GPT,
         custom_prompt: str | None = None,
         workspace: str | None = None,
         worker_roster: str | None = None,

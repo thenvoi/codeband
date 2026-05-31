@@ -238,7 +238,7 @@ def _write_project_yaml(tmp_path: Path, worktree: Path) -> Path:
         "  plan_reviewers:\n"
         "    codex:\n"
         "      count: 1\n"
-        "      model: gpt-5.4\n"
+        "      model: gpt-5.5\n"
         "  coders:\n"
         "    claude_sdk:\n"
         "      count: 1\n"

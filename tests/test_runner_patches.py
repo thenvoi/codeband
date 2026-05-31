@@ -195,7 +195,7 @@ class TestCoderModelWiring:
             repo=RepoConfig(url="https://github.com/a/b.git"),
             agents=AgentsConfig(
                 coders=FrameworkPool(
-                    claude_sdk=PoolEntry(count=1, model="claude-opus-4-7"),
+                    claude_sdk=PoolEntry(count=1, model="claude-opus-4-8"),
                 ),
             ),
             workspace=WorkspaceConfig(path=str(tmp_path / "workspace")),
@@ -204,7 +204,7 @@ class TestCoderModelWiring:
             Framework.CLAUDE_SDK, config, str(tmp_path),
         )
         # ClaudeSDKAdapter exposes the model via the `model` attribute.
-        assert adapter.model == "claude-opus-4-7"
+        assert adapter.model == "claude-opus-4-8"
 
     def test_codex_coder_uses_configured_model(self, tmp_path: Path):
         config = CodebandConfig(
@@ -239,7 +239,7 @@ class TestCoderModelWiring:
             Framework.CLAUDE_SDK, config, str(tmp_path),
         )
         # ClaudePlayerRunner default — coders use the heavier model.
-        assert adapter.model == "claude-opus-4-7"
+        assert adapter.model == "claude-opus-4-8"
 
 
 class TestRunAgentForever:

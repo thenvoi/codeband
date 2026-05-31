@@ -40,7 +40,7 @@ Then port your v0 customizations into the v1 yaml. Common translations:
 
 - **2 Claude players + 1 Codex player** → `coders: {claude_sdk: {count: 2}, codex: {count: 1}}`
 - **Claude code reviewer with review guidelines** → `reviewers: {claude_sdk: {count: 1}, review_guidelines: "..."}`
-- **`planner.model = "claude-opus-4-7"`** → `planners: {claude_sdk: {count: 1, model: "claude-opus-4-7"}}`
+- **`planner.model = "claude-opus-4-8"`** → `planners: {claude_sdk: {count: 1, model: "claude-opus-4-8"}}`
 - **Player descriptions** → per-framework description on the `coders.{framework}` entry (shared by all coders of that framework)
 - **`max_restarts` / `restart_delay_seconds`** → per-framework entry on `coders.{framework}` (applies to all coders of that framework)
 

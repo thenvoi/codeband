@@ -69,7 +69,7 @@ class TestPlannerComposeProfiles:
             tmp_path,
             FrameworkPool(
                 claude_sdk=PoolEntry(count=0),
-                codex=PoolEntry(count=1, model="gpt-5.4"),
+                codex=PoolEntry(count=1, model="gpt-5.5"),
             ),
         )
         assert _pool_compose_profiles(tmp_path, "planners", "planner") == ["codex-planner"]
@@ -110,7 +110,7 @@ class TestApplyPlannerProfile:
             tmp_path,
             FrameworkPool(
                 claude_sdk=PoolEntry(count=0),
-                codex=PoolEntry(count=1, model="gpt-5.4"),
+                codex=PoolEntry(count=1, model="gpt-5.5"),
             ),
         )
 
@@ -203,7 +203,7 @@ class TestApplyPlanReviewerProfile:
             tmp_path,
             planners=FrameworkPool(
                 claude_sdk=PoolEntry(count=0),
-                codex=PoolEntry(count=1, model="gpt-5.4"),
+                codex=PoolEntry(count=1, model="gpt-5.5"),
             ),
             plan_reviewers=PlanReviewersConfig(
                 claude_sdk=PoolEntry(count=1),

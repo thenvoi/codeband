@@ -16,6 +16,7 @@ from codeband.config import (
     PoolEntry,
     load_agent_config,
 )
+from codeband.models import CLAUDE_SONNET
 from codeband.workers import WorkerId, WorkerRole
 from codeband.workspace.init import initialize_agent_workspace, initialize_workspace
 
@@ -1099,7 +1100,7 @@ def _create_code_reviewer(
     entry = reviewers.entry_for(framework)
 
     kwargs = dict(
-        model=entry.model or "claude-sonnet-4-6",
+        model=entry.model or CLAUDE_SONNET,
         review_guidelines=reviewers.review_guidelines,
         workspace=workspace,
     )
@@ -1123,7 +1124,7 @@ def _create_plan_reviewer(
     entry = plan_reviewers.entry_for(framework)
 
     kwargs = dict(
-        model=entry.model or "claude-sonnet-4-6",
+        model=entry.model or CLAUDE_SONNET,
         review_guidelines=plan_reviewers.review_guidelines,
         workspace=workspace,
     )
@@ -1148,7 +1149,7 @@ def _create_coder(
 
     Reads `agents.coders.<framework>.model` from the config so user
     customizations in `codeband.yaml` (e.g., `coders.claude_sdk.model:
-    claude-opus-4-7`) are respected at runtime. When `model` is unset on
+    claude-opus-4-8`) are respected at runtime. When `model` is unset on
     the pool entry, we pass None to the runner and let its default apply.
 
     `worker_roster` is the same Worker Pool Roster injected into the
