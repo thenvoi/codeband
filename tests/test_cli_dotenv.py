@@ -112,7 +112,7 @@ def test_clirunner_subcommand_dir_loads_env(tmp_path: Path, monkeypatch):
 
     # `cb log` is cheap (read-only) and project-aware. It will load
     # `--dir`'s .env via @_project_aware before any other side effect.
-    runner = CliRunner(mix_stderr=False)
+    runner = CliRunner()
     runner.invoke(cli, ["log", "--dir", str(project)])
 
     assert os.environ.get("CODEBAND_E2E_KEY") == "from_clirunner_test"

@@ -35,7 +35,7 @@ classifiers = [
 
 dependencies = [
     "band-sdk[codex,claude-sdk]>=0.2.8",
-    "click>=8.1",
+    "click>=8.2,<9",
     "pyyaml>=6.0",
     "pydantic>=2.0",
     "python-dotenv>=1.0",

@@ -164,7 +164,7 @@ def test_cli_diff_missing_arg_lists_workers(diff_setup, tmp_path: Path, monkeypa
     project = _write_project_yaml(tmp_path, diff_setup["worktree"])
     monkeypatch.chdir(project)
 
-    runner = CliRunner(mix_stderr=False)
+    runner = CliRunner()
     result = runner.invoke(cli, ["diff"])
     assert result.exit_code == 1
     assert "Available workers" in result.stderr
@@ -179,7 +179,7 @@ def test_cli_diff_resolves_and_renders(diff_setup, tmp_path: Path, monkeypatch):
     project = _write_project_yaml(tmp_path, wt)
     monkeypatch.chdir(project)
 
-    runner = CliRunner(mix_stderr=False)
+    runner = CliRunner()
     result = runner.invoke(cli, ["diff", "claude"])  # substring match
     assert result.exit_code == 0, result.output + result.stderr
     assert "coder-claude_sdk-0" in result.output
