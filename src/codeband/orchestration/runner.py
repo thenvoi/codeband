@@ -335,6 +335,22 @@ def _build_watchdog_memory_store(memory_mode: str, workspace_path: Path) -> Any:
     return LocalMemoryStore(workspace_path / "state" / "memories.jsonl")
 
 
+def _build_watchdog_state_store(workspace_path: Path) -> Any:
+    """Construct the durable ``StateStore`` for the watchdog (RFC WS4).
+
+    Points at the same SQLite file the shadow-mode store uses. Best-effort —
+    returns ``None`` on any failure so the watchdog degrades to chat-recency
+    behavior rather than blocking startup.
+    """
+    try:
+        from codeband.state import StateStore
+
+        return StateStore(workspace_path / "state" / "orchestration.db")
+    except Exception:  # noqa: BLE001 - mechanical-progress path is optional
+        logger.warning("Watchdog StateStore unavailable", exc_info=True)
+        return None
+
+
 async def _install_memory_backend(
     config: CodebandConfig, workspace_path: Path, rest_client,
 ):
@@ -666,6 +682,9 @@ async def run_local(
         local_memory_store=_build_watchdog_memory_store(
             memory_mode, Path(resolved_config.workspace.path),
         ),
+        state_store=_build_watchdog_state_store(
+            Path(resolved_config.workspace.path),
+        ),
     )
     logger.info("Created Watchdog daemon")
 
@@ -929,6 +948,9 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
             human_rest_client=wd_human_rest,
             local_memory_store=_build_watchdog_memory_store(
                 memory_mode, Path(resolved_config.workspace.path),
+            ),
+            state_store=_build_watchdog_state_store(
+                Path(resolved_config.workspace.path),
             ),
         )
         try:

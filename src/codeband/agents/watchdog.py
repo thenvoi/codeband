@@ -3,14 +3,34 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import re
+import sqlite3
+import subprocess
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from codeband.config import WatchdogConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    """Coerce an ISO-8601 string or datetime into a tz-aware UTC datetime.
+
+    Returns ``None`` for missing or unparseable values. Naive datetimes are
+    assumed to be UTC.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return None
 
 
 def _mentioned_participant_ids(
@@ -82,6 +102,16 @@ class AgentHealthState:
     # i.e. the nudge confirmed it's alive. Gates `nudge_suppression_seconds`
     # so legitimately-idle agents don't get re-nudged every staleness cycle.
     confirmed_alive_at: datetime | None = None
+    # ── Mechanical progress tracking (RFC WS4) ──────────────────────────────
+    # Used for the per-subtask progress signals, not the chat-recency path.
+    # Consecutive patrols with no observed mechanical progress (no git-HEAD
+    # change on the subtask's branch and no newer transition-log/PR timestamp).
+    patrol_visits_without_progress: int = 0
+    # Last observed git HEAD for the subtask's branch ("" until first seen).
+    last_git_head: str = ""
+    # Most recent progress timestamp observed from the transition log or the
+    # PR's updatedAt — whichever is newer.
+    last_transition_timestamp: datetime | None = None
 
 
 class WatchdogDaemon:
@@ -109,6 +139,7 @@ class WatchdogDaemon:
         agent_id_to_role: dict[str, str] | None = None,
         human_rest_client: Any | None = None,
         local_memory_store: Any | None = None,
+        state_store: Any | None = None,
     ):
         self._config = config
         self._rest = rest_client
@@ -116,6 +147,13 @@ class WatchdogDaemon:
         self._agent_id = agent_id
         self._conductor_id = conductor_id
         self._state: dict[str, AgentHealthState] = {}
+        # Durable state store (RFC WS1). May be None — when absent the watchdog
+        # degrades to chat-recency-only behavior and the mechanical-progress
+        # path is skipped entirely.
+        self._store = state_store
+        # Per-subtask mechanical-progress health, keyed by subtask_id. Separate
+        # from `_state` (which is keyed by agent_id for the chat-recency path).
+        self._subtask_state: dict[str, AgentHealthState] = {}
         self._activity = activity
         self._role_map = agent_id_to_role or {}
         # Rooms we've already warned about for stale state — log once per
@@ -450,6 +488,252 @@ class WatchdogDaemon:
                     logger.exception(
                         "Failed to nudge/escalate %s in room %s", agent_id, room_id,
                     )
+
+        # Third escalation rung (RFC WS4): mechanical per-subtask progress.
+        # Independent of the chat-recency path above; guarded so a store/git
+        # failure never breaks the patrol loop.
+        await self._check_subtask_progress(now)
+
+    async def _check_subtask_progress(self, now: datetime) -> None:
+        """Detect stalled subtasks via mechanical signals and escalate (RFC WS4).
+
+        For each in-flight subtask in ``in_progress``/``verify_pending`` we read
+        three deterministic signals — the git HEAD of its branch, its PR's
+        ``updatedAt`` and the most recent ``transition_log`` timestamp. A change
+        in any of them since the last patrol counts as progress and resets the
+        per-subtask stall counter; otherwise the counter increments. When it
+        reaches ``max_phase_visits`` the subtask is marked blocked (via the FSM
+        when available) and the Conductor + human are notified.
+
+        Fully no-ops when the store is absent or ``git_progress_check`` is off,
+        preserving the prior chat-recency-only behavior.
+        """
+        import asyncio
+
+        if self._store is None or not self._config.git_progress_check:
+            return
+
+        try:
+            subtasks = await asyncio.to_thread(self._store.list_active_subtasks)
+        except Exception:
+            logger.debug("Watchdog could not list subtasks from store", exc_info=True)
+            return
+
+        for sub in subtasks:
+            if sub.state not in {"in_progress", "verify_pending"}:
+                continue
+            try:
+                await self._check_one_subtask(sub, now)
+            except Exception:
+                logger.exception(
+                    "Watchdog subtask-progress check failed for %s", sub.subtask_id,
+                )
+
+    async def _check_one_subtask(self, sub: Any, now: datetime) -> None:
+        """Evaluate mechanical progress for a single in-flight subtask."""
+        import asyncio
+
+        branch = (sub.metadata or {}).get("branch") if sub.metadata else None
+        git_head = (
+            await asyncio.to_thread(self._git_head, branch) if branch else None
+        )
+        pr_ts = (
+            await asyncio.to_thread(self._pr_updated_at, sub.pr_number)
+            if sub.pr_number is not None
+            else None
+        )
+        transition_ts = await asyncio.to_thread(
+            self._latest_transition, sub.subtask_id,
+        )
+        # Newest of the two timestamped signals (PR update vs. transition log).
+        latest_ts = max(
+            (t for t in (pr_ts, transition_ts) if t is not None),
+            default=None,
+        )
+
+        health = self._subtask_state.get(sub.subtask_id)
+        if health is None:
+            health = AgentHealthState(last_seen=now)
+            self._subtask_state[sub.subtask_id] = health
+
+        progressed = False
+        if git_head is not None and git_head != health.last_git_head:
+            progressed = True
+        if latest_ts is not None and (
+            health.last_transition_timestamp is None
+            or latest_ts > health.last_transition_timestamp
+        ):
+            progressed = True
+
+        # Record the new baselines before deciding, so the next patrol compares
+        # against the latest observation.
+        if git_head is not None:
+            health.last_git_head = git_head
+        if latest_ts is not None:
+            health.last_transition_timestamp = latest_ts
+
+        if progressed:
+            health.patrol_visits_without_progress = 0
+            # Recovery — allow a future stall to escalate again.
+            health.escalated = False
+            return
+
+        health.patrol_visits_without_progress += 1
+        if (
+            health.patrol_visits_without_progress >= self._config.max_phase_visits
+            and not health.escalated
+        ):
+            health.escalated = True
+            await self._send_blocked_escalation(sub)
+
+    def _git_head(self, branch: str) -> str | None:
+        """Return the commit SHA at ``branch``, or ``None`` if it can't be read."""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", branch],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            logger.debug("git rev-parse %s failed", branch, exc_info=True)
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+
+    def _pr_updated_at(self, pr_number: int) -> datetime | None:
+        """Return the PR's ``updatedAt`` timestamp via ``gh``, or ``None``.
+
+        A change in ``updatedAt`` captures any PR activity — including state
+        transitions — so it doubles as the PR-state progress signal.
+        """
+        try:
+            result = subprocess.run(
+                ["gh", "pr", "view", str(pr_number), "--json", "state,updatedAt"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            logger.debug("gh pr view %s failed", pr_number, exc_info=True)
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            data = json.loads(result.stdout)
+        except (ValueError, TypeError):
+            return None
+        return _parse_ts(data.get("updatedAt"))
+
+    def _latest_transition(self, subtask_id: str) -> datetime | None:
+        """Return ``MAX(timestamp)`` from the transition log for a subtask.
+
+        Reads the store's SQLite file directly (read-only) since the
+        Workstream-1 store surface does not expose a transition-log query. The
+        table may be empty (e.g. before the FSM from Workstream 2 is wired up),
+        in which case this returns ``None``.
+        """
+        db_path = getattr(self._store, "db_path", None)
+        if db_path is None:
+            return None
+        try:
+            conn = sqlite3.connect(db_path, timeout=5.0)
+            try:
+                row = conn.execute(
+                    "SELECT MAX(timestamp) FROM transition_log WHERE subtask_id = ?",
+                    (subtask_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            logger.debug("Could not read transition_log", exc_info=True)
+            return None
+        if not row or row[0] is None:
+            return None
+        return _parse_ts(row[0])
+
+    async def _send_blocked_escalation(self, sub: Any) -> None:
+        """Mark a stalled subtask blocked and notify the Conductor + human.
+
+        The FSM (Workstream 2) owns the canonical ``blocked`` transition; when
+        it is importable we call it, otherwise we log + notify only and leave
+        the transition to the FSM once that phase lands. Either way the human
+        and Conductor are alerted via a chat message in the task's room.
+        """
+        import asyncio
+
+        visits = self._config.max_phase_visits
+        logger.warning(
+            "Subtask %s stalled: no git-HEAD change and no new transition across "
+            "%d patrols — marking blocked",
+            sub.subtask_id, visits,
+        )
+        if self._activity:
+            self._activity.log(
+                "SUBTASK_BLOCKED", "watchdog",
+                f"Subtask {sub.subtask_id} blocked after {visits} patrols "
+                f"with no mechanical progress",
+            )
+
+        fsm_applied = await asyncio.to_thread(self._mark_blocked_via_fsm, sub)
+
+        # Resolve the task's room so the Conductor + human (both participants)
+        # see the alert. Best-effort — a notify failure must not break patrol.
+        room_id: str | None = None
+        try:
+            task = await asyncio.to_thread(self._store.get_task, sub.task_id)
+            room_id = getattr(task, "room_id", None) if task else None
+        except Exception:
+            logger.debug("Could not resolve room for blocked subtask", exc_info=True)
+
+        if room_id is None:
+            return
+
+        from thenvoi_rest.types import ChatMessageRequest
+
+        suffix = "" if fsm_applied else " (FSM unavailable — transition deferred)"
+        try:
+            await self._rest.agent_api_messages.create_agent_chat_message(
+                chat_id=room_id,
+                message=ChatMessageRequest(
+                    content=(
+                        f"[Watchdog] Subtask {sub.subtask_id} appears stalled — no "
+                        f"git-HEAD change and no new transition across {visits} "
+                        f"patrols. Marking it blocked; Conductor please reassign or "
+                        f"investigate.{suffix}"
+                    ),
+                    mentions=[],
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to post blocked-subtask alert for %s", sub.subtask_id,
+            )
+
+    def _mark_blocked_via_fsm(self, sub: Any) -> bool:
+        """Transition the subtask to ``blocked`` via the FSM when available.
+
+        Returns ``True`` if the FSM applied the transition, ``False`` when the
+        FSM (Workstream 2) is not importable yet — the watchdog must work with
+        or without it. TODO(WS2): once the FSM lands, this is the canonical
+        blocked-transition path; do not add an FSM here (that is WS2's lane).
+        """
+        try:
+            from codeband.state import fsm  # noqa: PLC0415 — guarded optional dep
+        except ImportError:
+            logger.info(
+                "FSM not available (Phase 2 not merged) — TODO: mark %s blocked "
+                "via fsm.transition once it lands; notified only for now",
+                sub.subtask_id,
+            )
+            return False
+        try:
+            fsm.transition(
+                sub.subtask_id, sub.task_id, "blocked", caller_role="watchdog",
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "FSM blocked-transition failed for %s", sub.subtask_id,
+            )
+            return False
 
     async def _send_nudge(
         self, room_id: str, agent_id: str, names: dict[str, str],

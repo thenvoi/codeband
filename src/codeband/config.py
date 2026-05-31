@@ -95,6 +95,15 @@ class WatchdogConfig(_StrictModel):
     # behavior if no envelope is present (e.g. Conductor crashed before writing
     # one).
     swarm_idle_grace_seconds: int = 1800
+    # Cycle/stall cap (RFC WS4). When a subtask makes no mechanical progress —
+    # no git-HEAD change on its branch and no new transition-log entry — for
+    # this many consecutive patrols, the watchdog marks it blocked and escalates
+    # to the Conductor + human. Catches stalls that chat-recency alone misses
+    # (e.g. a timed-out turn that produces no commit and no transition).
+    max_phase_visits: int = 10
+    # Toggle for the mechanical (git-HEAD / PR-state / transition-log) progress
+    # signals. When False the watchdog falls back to chat-recency-only behavior.
+    git_progress_check: bool = True
 
 
 # ─── Worker-pool config primitives ──────────────────────────────────────────
