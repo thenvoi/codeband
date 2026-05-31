@@ -962,6 +962,43 @@ def _framework_from_key(key: str) -> Framework:
 
 # ─── prompt roster ──────────────────────────────────────────────────────────
 
+def framework_label(fw: Framework) -> str:
+    """Human-readable attribution label for a framework.
+
+    Distinct from the short ``Claude``/``Codex`` form used in display names
+    (see ``_build_worker_roster``) — artifacts are tagged with the fuller
+    "Claude Code" so humans reading a plan or PR comment can tell at a glance
+    which model produced it.
+    """
+    return "Claude Code" if fw == Framework.CLAUDE_SDK else "Codex"
+
+
+def _build_identity_section(fw: Framework) -> str:
+    """Build the "Your Identity & Attribution" prompt section for an agent.
+
+    Injected into every agent's system prompt so the agent knows its own
+    framework and stamps the artifacts it submits with a ``[From <label>]``
+    tag — in chat and in GitHub PR comments, where the Band.ai display name
+    is otherwise invisible. Routine coordination chatter stays untagged.
+    """
+    label = framework_label(fw)
+    return (
+        "## Your Identity & Attribution\n\n"
+        f"You are running on the **{label}** framework.\n\n"
+        "When you submit a work artifact, attribute it to your framework so "
+        "humans and other agents can tell which model produced it. Begin the "
+        f"artifact with **`[From {label}]`** on its own first line. This applies to:\n\n"
+        "- a plan you post,\n"
+        "- a PR you open (tag the top of the PR description) and your PR-ready "
+        "handoff message,\n"
+        "- a code-review or plan-review verdict — in chat AND in the GitHub PR "
+        "comment you post,\n"
+        "- a merge decision.\n\n"
+        "Do NOT tag routine coordination chatter (acknowledgements, @mention "
+        "handoffs, status pings) — only the artifacts above."
+    )
+
+
 def _build_worker_roster(config: CodebandConfig) -> str:
     """Build a worker-pool roster for the Planner/Conductor/Coder prompts.
 
@@ -1017,6 +1054,7 @@ def _create_planner(
     kwargs = dict(
         workspace=workspace,
         worker_roster=worker_roster,
+        identity_section=_build_identity_section(framework),
     )
     if entry.model:
         kwargs["model"] = entry.model
@@ -1079,6 +1117,7 @@ def _create_conductor(
         worker_roster=worker_roster,
         auto_merge=config.agents.mergemaster.auto_merge.value,
         repo_pin=_build_repo_pin(config),
+        identity_section=_build_identity_section(config.agents.conductor.framework),
     )
 
     if config.agents.conductor.framework == Framework.CODEX:
@@ -1103,6 +1142,7 @@ def _create_code_reviewer(
         model=entry.model or CLAUDE_SONNET,
         review_guidelines=reviewers.review_guidelines,
         workspace=workspace,
+        identity_section=_build_identity_section(framework),
     )
 
     if framework == Framework.CODEX:
@@ -1127,6 +1167,7 @@ def _create_plan_reviewer(
         model=entry.model or CLAUDE_SONNET,
         review_guidelines=plan_reviewers.review_guidelines,
         workspace=workspace,
+        identity_section=_build_identity_section(framework),
     )
 
     if framework == Framework.CODEX:
@@ -1167,6 +1208,7 @@ def _create_coder(
             workspace=workspace,
             recovery_context=recovery_context,
             worker_roster=worker_roster,
+            identity_section=_build_identity_section(framework),
         )
         if entry.model:
             kwargs["model"] = entry.model
@@ -1180,6 +1222,7 @@ def _create_coder(
             workspace=workspace,
             recovery_context=recovery_context,
             worker_roster=worker_roster,
+            identity_section=_build_identity_section(framework),
         )
         if entry.model:
             kwargs["model"] = entry.model
@@ -1199,6 +1242,7 @@ def _create_mergemaster(
         workspace=workspace,
         test_command=config.agents.mergemaster.test_command,
         review_guidelines=config.agents.mergemaster.review_guidelines,
+        identity_section=_build_identity_section(config.agents.mergemaster.framework),
     )
 
     if config.agents.mergemaster.framework == Framework.CODEX:

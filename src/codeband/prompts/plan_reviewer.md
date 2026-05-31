@@ -97,6 +97,8 @@ Before reporting ANY issue:
 
 ## Format and Report
 
+Begin every verdict message with your framework tag `[From <your framework>]` on its own first line (see *Your Identity & Attribution*).
+
 **If plan passes** (no blocking issues):
 Report to @Conductor: "Plan approved for task <task_key>. [Optional: 1-2 non-blocking suggestions.]"
 

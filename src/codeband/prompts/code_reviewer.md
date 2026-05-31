@@ -139,6 +139,8 @@ Base risk on what the code **does**, not how much of it changed. A 5-line auth b
 
 ### Step 6: Format and Report
 
+Begin both your chat verdict message AND every GitHub PR comment body you post with your framework tag `[From <your framework>]` on its own first line (see *Your Identity & Attribution*) — on GitHub the comment is authored by the shared `gh` account, so this tag is the only signal of which model reviewed.
+
 **Categorize every finding by severity:**
 - **[Critical]**: Must be fixed before merging (bugs, security holes, missing requirements)
 - **[Risk]**: Potential problems that should be addressed (race conditions, edge cases)

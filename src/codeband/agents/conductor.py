@@ -29,6 +29,7 @@ def _compose_prompt(
     worker_roster: str | None,
     auto_merge: str | None,
     repo_pin: str | None,
+    identity_section: str | None = None,
 ) -> str:
     from codeband.agents.prompts import load_prompt
 
@@ -41,6 +42,8 @@ def _compose_prompt(
         prompt += f"\n{repo_pin}\n"
     if worker_roster:
         prompt += f"\n{worker_roster}\n"
+    if identity_section:
+        prompt += f"\n{identity_section}\n"
     return prompt
 
 
@@ -55,10 +58,13 @@ class ClaudeConductorRunner:
         worker_roster: str | None = None,
         auto_merge: str | None = None,
         repo_pin: str | None = None,
+        identity_section: str | None = None,
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
 
-        prompt = _compose_prompt(custom_prompt, worker_roster, auto_merge, repo_pin)
+        prompt = _compose_prompt(
+            custom_prompt, worker_roster, auto_merge, repo_pin, identity_section,
+        )
 
         # See planner.py for why `dontAsk` + `approval_mode=None`. The
         # Conductor has no workspace, so there's no .claude/settings.json to
@@ -96,6 +102,7 @@ class CodexConductorRunner:
         worker_roster: str | None = None,
         auto_merge: str | None = None,
         repo_pin: str | None = None,
+        identity_section: str | None = None,
     ):
         try:
             from thenvoi.adapters import CodexAdapter
@@ -108,7 +115,9 @@ class CodexConductorRunner:
                 "Codex support."
             ) from e
 
-        prompt = _compose_prompt(custom_prompt, worker_roster, auto_merge, repo_pin)
+        prompt = _compose_prompt(
+            custom_prompt, worker_roster, auto_merge, repo_pin, identity_section,
+        )
         self._scratch_dir = tempfile.TemporaryDirectory(
             prefix="codeband-conductor-",
         )

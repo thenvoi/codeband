@@ -29,12 +29,15 @@ class ClaudePlanReviewerRunner:
         custom_prompt: str | None = None,
         review_guidelines: str | None = None,
         workspace: str | None = None,
+        identity_section: str | None = None,
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
 
         from codeband.agents.prompts import build_review_prompt
 
         prompt = build_review_prompt(custom_prompt, review_guidelines, _DEFAULT_PROMPT)
+        if identity_section:
+            prompt += f"\n\n{identity_section}"
         # See planner.py for why `dontAsk` + `approval_mode=None` — this lets
         # .claude/settings.json own the allow list instead of an adapter-level
         # can_use_tool hook that would override it.
@@ -64,6 +67,7 @@ class CodexPlanReviewerRunner:
         custom_prompt: str | None = None,
         review_guidelines: str | None = None,
         workspace: str | None = None,
+        identity_section: str | None = None,
     ):
         try:
             from thenvoi.adapters import CodexAdapter
@@ -78,6 +82,8 @@ class CodexPlanReviewerRunner:
         from codeband.agents.prompts import build_review_prompt
 
         prompt = build_review_prompt(custom_prompt, review_guidelines, _DEFAULT_PROMPT)
+        if identity_section:
+            prompt += f"\n\n{identity_section}"
         config = CodexAdapterConfig(
             model=model,
             system_prompt=prompt,

@@ -40,7 +40,7 @@ The task room starts with only the Conductor and the human; other agents are add
 
 ### Sharing plans
 
-Send the full plan as a **single chat message** @mentioning both the **Conductor** and a concrete **Plan Reviewer** from the Worker Pool Roster, such as `@Plan-Reviewer-Codex-0`. This avoids the Conductor having to forward the plan — the Plan Reviewer reads it directly.
+Send the full plan as a **single chat message** @mentioning both the **Conductor** and a concrete **Plan Reviewer** from the Worker Pool Roster, such as `@Plan-Reviewer-Codex-0`. This avoids the Conductor having to forward the plan — the Plan Reviewer reads it directly. Begin the plan with your framework tag `[From <your framework>]` on its own first line (see *Your Identity & Attribution*).
 
 Also store a **protocol state envelope** in memory so the system can track that a plan exists:
 - `content`: `protocol plan cid plan_<task_key>_r<round> task <task_key> round <round> state ready from <your-worker-id> to <plan-reviewer-worker-id>` followed by a 1-2 sentence summary

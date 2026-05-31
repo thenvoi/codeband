@@ -16,6 +16,7 @@ def _compose_prompt(
     custom_prompt: str | None,
     test_command: str | None,
     review_guidelines: str | None,
+    identity_section: str | None = None,
 ) -> str:
     from codeband.agents.prompts import load_prompt
 
@@ -24,7 +25,10 @@ def _compose_prompt(
     config_section = f"\n\n## Configuration\n- Test command: {test_cmd_display}\n"
     if review_guidelines:
         config_section += f"- Review guidelines: {review_guidelines}\n"
-    return prompt + config_section
+    prompt += config_section
+    if identity_section:
+        prompt += f"\n\n{identity_section}"
+    return prompt
 
 
 class ClaudeMergemasterRunner:
@@ -42,10 +46,13 @@ class ClaudeMergemasterRunner:
         workspace: str | None = None,
         test_command: str | None = None,
         review_guidelines: str | None = None,
+        identity_section: str | None = None,
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
 
-        prompt = _compose_prompt(custom_prompt, test_command, review_guidelines)
+        prompt = _compose_prompt(
+            custom_prompt, test_command, review_guidelines, identity_section,
+        )
 
         self._adapter = ClaudeSDKAdapter(
             model=model,
@@ -79,6 +86,7 @@ class CodexMergemasterRunner:
         workspace: str | None = None,
         test_command: str | None = None,
         review_guidelines: str | None = None,
+        identity_section: str | None = None,
     ):
         try:
             from thenvoi.adapters import CodexAdapter
@@ -91,7 +99,9 @@ class CodexMergemasterRunner:
                 "Codex support."
             ) from e
 
-        prompt = _compose_prompt(custom_prompt, test_command, review_guidelines)
+        prompt = _compose_prompt(
+            custom_prompt, test_command, review_guidelines, identity_section,
+        )
 
         config = CodexAdapterConfig(
             model=model,

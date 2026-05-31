@@ -180,10 +180,10 @@ When you receive a task assignment:
    **Direct-dispatch invariant:** the Code Reviewer's @mention is what triggers their review — you do not need the Conductor to forward. Mention @Conductor in the same message for awareness only; the Conductor does not relay this message.
 
    Include in the message:
+   - **Framework tag** — begin the message with `[From <your framework>]` on its own first line (see *Your Identity & Attribution*), and put the same tag on the first line of the PR description.
    - **PR URL** (from `gh pr create` output)
    - Task key
    - Branch name
-   - Your framework
    - Brief summary of what you implemented
    - Test results
 
