@@ -53,10 +53,13 @@ class ClaudeConductorRunner:
         worker_roster: str | None = None,
         auto_merge: str | None = None,
         repo_pin: str | None = None,
+        recovery_context: str | None = None,
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
 
         prompt = _compose_prompt(custom_prompt, worker_roster, auto_merge, repo_pin)
+        if recovery_context:
+            prompt = f"{recovery_context}\n\n---\n\n{prompt}"
 
         # See planner.py for why `dontAsk` + `approval_mode=None`. The
         # Conductor has no workspace, so there's no .claude/settings.json to
@@ -94,6 +97,7 @@ class CodexConductorRunner:
         worker_roster: str | None = None,
         auto_merge: str | None = None,
         repo_pin: str | None = None,
+        recovery_context: str | None = None,
     ):
         try:
             from thenvoi.adapters import CodexAdapter
@@ -107,6 +111,8 @@ class CodexConductorRunner:
             ) from e
 
         prompt = _compose_prompt(custom_prompt, worker_roster, auto_merge, repo_pin)
+        if recovery_context:
+            prompt = f"{recovery_context}\n\n---\n\n{prompt}"
         self._scratch_dir = tempfile.TemporaryDirectory(
             prefix="codeband-conductor-",
         )

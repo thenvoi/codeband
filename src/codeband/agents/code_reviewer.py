@@ -25,6 +25,7 @@ class CodexCodeReviewerRunner:
         custom_prompt: str | None = None,
         review_guidelines: str | None = None,
         workspace: str | None = None,
+        recovery_context: str | None = None,
     ):
         try:
             from thenvoi.adapters import CodexAdapter
@@ -39,6 +40,8 @@ class CodexCodeReviewerRunner:
         from codeband.agents.prompts import build_review_prompt
 
         prompt = build_review_prompt(custom_prompt, review_guidelines, _DEFAULT_PROMPT)
+        if recovery_context:
+            prompt = f"{recovery_context}\n\n---\n\n{prompt}"
         config = CodexAdapterConfig(
             model=model,
             system_prompt=prompt,
@@ -70,12 +73,15 @@ class ClaudeCodeReviewerRunner:
         custom_prompt: str | None = None,
         review_guidelines: str | None = None,
         workspace: str | None = None,
+        recovery_context: str | None = None,
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
 
         from codeband.agents.prompts import build_review_prompt
 
         prompt = build_review_prompt(custom_prompt, review_guidelines, _DEFAULT_PROMPT)
+        if recovery_context:
+            prompt = f"{recovery_context}\n\n---\n\n{prompt}"
         self._adapter = ClaudeSDKAdapter(
             model=model,
             custom_section=prompt,

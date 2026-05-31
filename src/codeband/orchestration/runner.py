@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -173,20 +174,43 @@ def _patch_band_local_runtime() -> None:
 
 
 async def _run_agent_forever(
-    make_agent: Callable[[], object], name: str, activity: object,
+    make_agent: Callable[..., object],
+    name: str,
+    activity: object,
+    *,
+    agent_key: str | None = None,
+    workspace_path: Path | str | None = None,
 ) -> None:
     """Run an unsupervised agent under an infinite reconnect loop.
 
-    Each cycle builds a fresh Agent via ``make_agent()`` and tears it down
-    in ``finally`` so the underlying PHXChannelsClient's reconnect/heartbeat
-    tasks cannot leak into the next cycle. Both crashes and clean exits
-    trigger another cycle after exponential backoff. The loop ends only
-    when the enclosing task is cancelled by the shutdown path.
+    Each cycle builds a fresh Agent via ``make_agent(recovery_context)`` and
+    tears it down in ``finally`` so the underlying PHXChannelsClient's
+    reconnect/heartbeat tasks cannot leak into the next cycle. Both crashes and
+    clean exits trigger another cycle after exponential backoff. The loop ends
+    only when the enclosing task is cancelled by the shutdown path.
+
+    On every (re)connect, when ``agent_key`` and ``workspace_path`` are set, we
+    rebuild per-role recovery context from the durable StateStore (RFC WS5) and
+    pass it into the factory so it can be prepended to the system prompt.
+    Rehydration is fully guarded — any failure falls back to ``None`` and never
+    breaks the reconnect loop.
     """
     attempt = 0
     while True:
         attempt += 1
-        agent = make_agent()
+        recovery_context = None
+        if agent_key is not None and workspace_path is not None:
+            try:
+                from codeband.state.rehydration import recover_for_reconnect
+
+                recovery_context = await recover_for_reconnect(agent_key, workspace_path)
+            except Exception:
+                logger.warning(
+                    "Rehydration wiring failed for %s — continuing without it",
+                    name, exc_info=True,
+                )
+                recovery_context = None
+        agent = make_agent(recovery_context)
         try:
             try:
                 await agent.run()
@@ -596,30 +620,44 @@ async def run_local(
     # brand-new Agent (and a brand-new PHXChannelsClient) on every reconnect
     # cycle. Reusing an instance leaks the SDK's internal reconnect task into
     # the next cycle and produces "Topic ... already subscribed" cascades.
-    def _band_agent_factory(adapter, creds):
+    #
+    # ``make_adapter`` is a partial over a ``_create_*`` factory with everything
+    # bound except ``recovery_context``; ``_run_agent_forever`` supplies fresh
+    # per-role recovery context (RFC WS5) on every reconnect, so the adapter —
+    # and the system prompt it carries — is rebuilt each cycle.
+    def _band_agent_factory(make_adapter, creds):
         config = resolved_config
-        return lambda: _create_band_agent(adapter, creds, config)
 
-    unsupervised: list[tuple[Callable[[], object], str]] = []
+        def factory(recovery_context: str | None = None):
+            adapter = make_adapter(recovery_context=recovery_context)
+            return _create_band_agent(adapter, creds, config)
+
+        return factory
+
+    unsupervised: list[tuple[Callable[..., object], str]] = []
 
     # --- Conductor (singleton) ---
-    cond_adapter = _create_conductor(
-        resolved_config, worker_roster=worker_roster,
-    )
-    unsupervised.append(
-        (_band_agent_factory(cond_adapter, conductor_creds), "conductor"),
-    )
+    unsupervised.append((
+        _band_agent_factory(
+            partial(_create_conductor, resolved_config, worker_roster=worker_roster),
+            conductor_creds,
+        ),
+        "conductor",
+    ))
     logger.info("Created Conductor agent")
 
     # --- Mergemaster (singleton) ---
     mm_creds = agent_config.get("mergemaster")
-    mm_adapter = _create_mergemaster(
-        resolved_config,
-        str(layout.mergemaster_worktree) if layout.mergemaster_worktree else None,
+    mm_workspace = (
+        str(layout.mergemaster_worktree) if layout.mergemaster_worktree else None
     )
-    unsupervised.append(
-        (_band_agent_factory(mm_adapter, mm_creds), "mergemaster"),
-    )
+    unsupervised.append((
+        _band_agent_factory(
+            partial(_create_mergemaster, resolved_config, mm_workspace),
+            mm_creds,
+        ),
+        "mergemaster",
+    ))
     logger.info("Created Mergemaster agent")
 
     # --- Planner pool ---
@@ -627,13 +665,14 @@ async def run_local(
         key = str(wid)
         creds = agent_config.get(key)
         wt_path = layout.planner_worktrees.get(key)
-        adapter = _create_planner(
+        make_adapter = partial(
+            _create_planner,
             resolved_config,
             workspace=str(wt_path) if wt_path else None,
             framework=wid.framework,
             worker_roster=worker_roster,
         )
-        unsupervised.append((_band_agent_factory(adapter, creds), key))
+        unsupervised.append((_band_agent_factory(make_adapter, creds), key))
         logger.info("Created %s", key)
 
     # --- Plan Reviewer pool ---
@@ -643,12 +682,13 @@ async def run_local(
         key = str(wid)
         creds = agent_config.get(key)
         wt_path = layout.plan_reviewer_worktrees.get(key)
-        adapter = _create_plan_reviewer(
+        make_adapter = partial(
+            _create_plan_reviewer,
             resolved_config,
             workspace=str(wt_path) if wt_path else None,
             framework=wid.framework,
         )
-        unsupervised.append((_band_agent_factory(adapter, creds), key))
+        unsupervised.append((_band_agent_factory(make_adapter, creds), key))
         logger.info("Created %s", key)
 
     # --- Reviewer pool (code reviewers) ---
@@ -656,12 +696,13 @@ async def run_local(
         key = str(wid)
         creds = agent_config.get(key)
         scratch_path = layout.reviewer_scratch.get(key)
-        adapter = _create_code_reviewer(
+        make_adapter = partial(
+            _create_code_reviewer,
             resolved_config,
             workspace=str(scratch_path) if scratch_path else None,
             framework=wid.framework,
         )
-        unsupervised.append((_band_agent_factory(adapter, creds), key))
+        unsupervised.append((_band_agent_factory(make_adapter, creds), key))
         logger.info("Created %s", key)
 
     # --- Watchdog (deterministic daemon, not a Band.ai Agent) ---
@@ -725,11 +766,17 @@ async def run_local(
     # task → human-readable name for shutdown-time diagnostics.
     task_names: dict[asyncio.Task, str] = {}
 
+    workspace_path = Path(resolved_config.workspace.path)
     unsupervised_tasks = []
     for i, (make_agent, name) in enumerate(unsupervised):
         if i > 0:
             await asyncio.sleep(_STARTUP_DELAY)
-        task = asyncio.create_task(_run_agent_forever(make_agent, name, activity))
+        task = asyncio.create_task(
+            _run_agent_forever(
+                make_agent, name, activity,
+                agent_key=name, workspace_path=workspace_path,
+            )
+        )
         agent_task_filter.register(task, name)
         task_names[task] = name
         unsupervised_tasks.append(task)
@@ -873,14 +920,30 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
             if hasattr(agent, "close"):
                 await agent.close()
 
+    # Distributed-mode rehydration (RFC WS5): rebuild per-role recovery context
+    # from the durable StateStore before building the adapter. Guarded — any
+    # failure falls back to None, identical to today's blank reconnect. The
+    # coder path (handled below) rehydrates from git via WorkerSupervisor.
+    recovery_context: str | None = None
+    if role in ("conductor", "mergemaster", "planner", "plan_reviewer", "reviewer"):
+        from codeband.state.rehydration import recover_for_reconnect
+
+        recovery_context = await recover_for_reconnect(
+            agent_key, Path(resolved_config.workspace.path),
+        )
+
     if role == "conductor":
         roster = _build_worker_roster(resolved_config)
-        adapter = _create_conductor(resolved_config, worker_roster=roster)
+        adapter = _create_conductor(
+            resolved_config, worker_roster=roster, recovery_context=recovery_context,
+        )
         await _run_band_agent(adapter)
 
     elif role == "mergemaster":
         workspace = str(layout.worktree) if layout.worktree else None
-        adapter = _create_mergemaster(resolved_config, workspace)
+        adapter = _create_mergemaster(
+            resolved_config, workspace, recovery_context=recovery_context,
+        )
         await _run_band_agent(adapter)
 
     elif role == "planner":
@@ -890,6 +953,7 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
         adapter = _create_planner(
             resolved_config, workspace=workspace,
             framework=framework, worker_roster=roster,
+            recovery_context=recovery_context,
         )
         await _run_band_agent(adapter)
 
@@ -898,6 +962,7 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
         workspace = str(layout.worktree) if layout.worktree else None
         adapter = _create_plan_reviewer(
             resolved_config, workspace=workspace, framework=framework,
+            recovery_context=recovery_context,
         )
         await _run_band_agent(adapter)
 
@@ -906,6 +971,7 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
         workspace = str(layout.reviewer_workspace) if layout.reviewer_workspace else None
         adapter = _create_code_reviewer(
             resolved_config, workspace=workspace, framework=framework,
+            recovery_context=recovery_context,
         )
         await _run_band_agent(adapter)
 
@@ -1043,6 +1109,7 @@ def _create_planner(
     *,
     framework: Framework = Framework.CLAUDE_SDK,
     worker_roster: str | None = None,
+    recovery_context: str | None = None,
 ) -> "FrameworkAdapter":
     """Create a Planner adapter for the given framework."""
     entry = config.agents.planners.entry_for(framework)
@@ -1050,6 +1117,7 @@ def _create_planner(
     kwargs = dict(
         workspace=workspace,
         worker_roster=worker_roster,
+        recovery_context=recovery_context,
     )
     if entry.model:
         kwargs["model"] = entry.model
@@ -1100,6 +1168,7 @@ def _create_conductor(
     config: CodebandConfig,
     *,
     worker_roster: str | None = None,
+    recovery_context: str | None = None,
 ) -> "FrameworkAdapter":
     """Create the conductor adapter — singleton coordinator, framework-selectable.
 
@@ -1112,6 +1181,7 @@ def _create_conductor(
         worker_roster=worker_roster,
         auto_merge=config.agents.mergemaster.auto_merge.value,
         repo_pin=_build_repo_pin(config),
+        recovery_context=recovery_context,
     )
 
     if config.agents.conductor.framework == Framework.CODEX:
@@ -1127,6 +1197,7 @@ def _create_code_reviewer(
     workspace: str | None = None,
     *,
     framework: Framework = Framework.CLAUDE_SDK,
+    recovery_context: str | None = None,
 ) -> "FrameworkAdapter":
     """Create a code-reviewer adapter for the given framework."""
     reviewers = config.agents.reviewers
@@ -1136,6 +1207,7 @@ def _create_code_reviewer(
         model=entry.model or "claude-sonnet-4-6",
         review_guidelines=reviewers.review_guidelines,
         workspace=workspace,
+        recovery_context=recovery_context,
     )
 
     if framework == Framework.CODEX:
@@ -1151,6 +1223,7 @@ def _create_plan_reviewer(
     workspace: str | None = None,
     *,
     framework: Framework = Framework.CLAUDE_SDK,
+    recovery_context: str | None = None,
 ) -> "FrameworkAdapter":
     """Create a plan-reviewer adapter for the given framework."""
     plan_reviewers = config.agents.plan_reviewers
@@ -1160,6 +1233,7 @@ def _create_plan_reviewer(
         model=entry.model or "claude-sonnet-4-6",
         review_guidelines=plan_reviewers.review_guidelines,
         workspace=workspace,
+        recovery_context=recovery_context,
     )
 
     if framework == Framework.CODEX:
@@ -1225,6 +1299,8 @@ def _create_coder(
 def _create_mergemaster(
     config: CodebandConfig,
     workspace: str | None,
+    *,
+    recovery_context: str | None = None,
 ) -> "FrameworkAdapter":
     """Create the mergemaster adapter — singleton coordinator, framework-selectable."""
     kwargs = dict(
@@ -1232,6 +1308,7 @@ def _create_mergemaster(
         workspace=workspace,
         test_command=config.agents.mergemaster.test_command,
         review_guidelines=config.agents.mergemaster.review_guidelines,
+        recovery_context=recovery_context,
     )
 
     if config.agents.mergemaster.framework == Framework.CODEX:

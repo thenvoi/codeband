@@ -36,10 +36,13 @@ class ClaudePlannerRunner:
         custom_prompt: str | None = None,
         workspace: str | None = None,
         worker_roster: str | None = None,
+        recovery_context: str | None = None,
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
 
         prompt = _build_prompt(custom_prompt, worker_roster)
+        if recovery_context:
+            prompt = f"{recovery_context}\n\n---\n\n{prompt}"
 
         # `dontAsk` is a bundled Claude CLI mode not yet in the SDK's
         # PermissionMode Literal, but forwarded verbatim via --permission-mode.
@@ -79,6 +82,7 @@ class CodexPlannerRunner:
         custom_prompt: str | None = None,
         workspace: str | None = None,
         worker_roster: str | None = None,
+        recovery_context: str | None = None,
     ):
         try:
             from thenvoi.adapters import CodexAdapter
@@ -91,6 +95,8 @@ class CodexPlannerRunner:
             ) from e
 
         prompt = _build_prompt(custom_prompt, worker_roster)
+        if recovery_context:
+            prompt = f"{recovery_context}\n\n---\n\n{prompt}"
         config = CodexAdapterConfig(
             model=model,
             system_prompt=prompt,

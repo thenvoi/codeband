@@ -41,6 +41,11 @@ def main() -> None:
     from codeband.config import CodebandConfig
     config = CodebandConfig.from_yaml(config_path)
 
+    # Distributed-mode rehydration (RFC WS5) is wired inside ``run_agent``: it
+    # resolves the workspace path, opens the durable StateStore, and prepends
+    # per-role recovery context to the agent's system prompt before
+    # ``agent.run()``. Kept there (not here) because ``main()`` only has the raw
+    # config + project_dir, while ``run_agent`` already resolves the workspace.
     from codeband.orchestration.runner import run_agent
     asyncio.run(run_agent(config, project_dir, agent_key))
 

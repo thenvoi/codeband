@@ -285,7 +285,7 @@ class TestRunAgentForever:
                 target_reached.set()
                 await asyncio.sleep(60)  # block until cancelled
 
-        def make_agent() -> MagicMock:
+        def make_agent(recovery_context: str | None = None) -> MagicMock:
             agent, _ = self._make_agent_with_run(clean_exit_run)
             produced_agents.append(agent)
             return agent
@@ -352,7 +352,7 @@ class TestRunAgentForever:
                 await asyncio.sleep(60)
             raise RuntimeError("simulated agent crash")
 
-        def make_agent() -> MagicMock:
+        def make_agent(recovery_context: str | None = None) -> MagicMock:
             agent, _ = self._make_agent_with_run(crashing_run)
             produced_agents.append(agent)
             return agent

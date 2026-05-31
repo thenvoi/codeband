@@ -40,10 +40,13 @@ class ClaudeMergemasterRunner:
         workspace: str | None = None,
         test_command: str | None = None,
         review_guidelines: str | None = None,
+        recovery_context: str | None = None,
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
 
         prompt = _compose_prompt(custom_prompt, test_command, review_guidelines)
+        if recovery_context:
+            prompt = f"{recovery_context}\n\n---\n\n{prompt}"
 
         self._adapter = ClaudeSDKAdapter(
             model=model,
@@ -77,6 +80,7 @@ class CodexMergemasterRunner:
         workspace: str | None = None,
         test_command: str | None = None,
         review_guidelines: str | None = None,
+        recovery_context: str | None = None,
     ):
         try:
             from thenvoi.adapters import CodexAdapter
@@ -90,6 +94,8 @@ class CodexMergemasterRunner:
             ) from e
 
         prompt = _compose_prompt(custom_prompt, test_command, review_guidelines)
+        if recovery_context:
+            prompt = f"{recovery_context}\n\n---\n\n{prompt}"
 
         config = CodexAdapterConfig(
             model=model,
