@@ -366,6 +366,135 @@ class TestCbPhaseGate:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 2c. Reviewer-verdict command — review_pending → review_passed/failed via FSM
+#     Real sqlite, driven through the cb-phase CLI (not an LLM).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestCbPhaseReviewVerdict:
+    """``cb-phase review --approve|--reject`` routes the verdict through the FSM.
+
+    This is the structural bind that makes the verify gate non-bypassable:
+    ``review_passed`` is reachable ONLY from ``review_pending``, which is
+    reachable ONLY via the verify gate (``verify_pending → review_pending``).
+    The verdict edge is legal ONLY from ``review_pending`` — from any other state
+    the FSM raises and writes nothing, so there is no path to an approved subtask
+    that skips verification. Driven at the script level on a real SQLite DB.
+    """
+
+    def _project(self, tmp_path):
+        """Project dir with codeband.yaml + a real store (no subtasks yet).
+
+        ``handoff._resolve_store`` resolves the same DB path from the config, so
+        the CLI and the test share one store. Returns ``(project_dir, store)``.
+        """
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        workspace = tmp_path / "workspace"
+        cfg = CodebandConfig(
+            repo=RepoConfig(url="https://github.com/example/repo.git", branch="main"),
+            agents=AgentsConfig(),
+            workspace=WorkspaceConfig(path=str(workspace)),
+        )
+        cfg.to_yaml(project_dir / "codeband.yaml")
+        store = StateStore(workspace / "state" / "orchestration.db")
+        store.create_task("room-1", "demo", "room-1")
+        return project_dir, store
+
+    def _seed(self, store, sid, chain):
+        for new_state, role in chain:
+            transition(sid, "room-1", new_state, caller_role=role, store=store)
+
+    def _run(self, project_dir, sid, verdict):
+        return handoff.main([
+            "review", sid, "--task", "room-1", verdict,
+            "--project-dir", str(project_dir),
+        ])
+
+    _TO_REVIEW_PENDING = [
+        ("assigned", "conductor"),
+        ("in_progress", "coder"),
+        ("verify_pending", "coder"),
+        ("review_pending", "coder"),
+    ]
+
+    def test_approve_from_review_pending_passes(self, tmp_path):
+        project_dir, store = self._project(tmp_path)
+        self._seed(store, "st-1", self._TO_REVIEW_PENDING)
+        before = _log_count(store, "st-1")
+
+        assert self._run(project_dir, "st-1", "--approve") == 0
+        assert store.get_subtask("st-1").state == "review_passed"
+        assert _log_count(store, "st-1") == before + 1
+        last = _log_rows(store, "st-1")[-1]
+        assert (last["from_state"], last["to_state"]) == (
+            "review_pending", "review_passed",
+        )
+        assert last["caller_role"] == "reviewer"
+
+    def test_reject_from_review_pending_fails_review(self, tmp_path):
+        project_dir, store = self._project(tmp_path)
+        self._seed(store, "st-1", self._TO_REVIEW_PENDING)
+
+        assert self._run(project_dir, "st-1", "--reject") == 0
+        sub = store.get_subtask("st-1")
+        assert sub.state == "review_failed"
+        assert sub.review_round == 1  # a reject counts as one failed review round
+        last = _log_rows(store, "st-1")[-1]
+        assert (last["from_state"], last["to_state"]) == (
+            "review_pending", "review_failed",
+        )
+        assert last["caller_role"] == "reviewer"
+
+    @pytest.mark.parametrize(
+        "label, chain",
+        [
+            ("in_progress", [("assigned", "conductor"), ("in_progress", "coder")]),
+            ("verify_pending", [
+                ("assigned", "conductor"),
+                ("in_progress", "coder"),
+                ("verify_pending", "coder"),
+            ]),
+            ("blocked", [
+                ("assigned", "conductor"),
+                ("in_progress", "coder"),
+                ("blocked", "coder"),
+            ]),
+            ("merged", [
+                ("assigned", "conductor"),
+                ("in_progress", "coder"),
+                ("verify_pending", "coder"),
+                ("review_pending", "coder"),
+                ("review_passed", "reviewer"),
+                ("merge_pending", "mergemaster"),
+                ("merged", "mergemaster"),
+            ]),
+        ],
+    )
+    def test_verdict_illegal_outside_review_pending_writes_nothing(
+        self, tmp_path, label, chain,
+    ):
+        project_dir, store = self._project(tmp_path)
+        self._seed(store, "st-1", chain)
+        state_before = store.get_subtask("st-1").state
+        before = _log_count(store, "st-1")
+
+        # The CLI surfaces the FSM rejection as a non-zero exit…
+        assert self._run(project_dir, "st-1", "--approve") != 0
+        assert self._run(project_dir, "st-1", "--reject") != 0
+        # …and nothing was written for either attempt.
+        assert store.get_subtask("st-1").state == state_before
+        assert _log_count(store, "st-1") == before
+
+        # The FSM is the actual guard: a direct transition raises, writing nothing.
+        for verdict in ("review_passed", "review_failed"):
+            with pytest.raises(InvalidTransitionError):
+                transition("st-1", "room-1", verdict, caller_role="reviewer",
+                           store=store)
+        assert _log_count(store, "st-1") == before
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 3. Kill-and-rehydrate — per-role recovery context from durable state
 # ─────────────────────────────────────────────────────────────────────────────
 

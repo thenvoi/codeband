@@ -278,6 +278,44 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_review(args: argparse.Namespace) -> int:
+    """Record a reviewer's verdict on a ``review_pending`` subtask via the FSM.
+
+    ``--approve`` drives ``review_pending → review_passed``; ``--reject`` drives
+    ``review_pending → review_failed`` (which the FSM counts as one review
+    round). The verdict is *only* legal from ``review_pending`` — from any other
+    state the FSM raises :class:`InvalidTransitionError` and writes nothing.
+
+    This is the structural bind behind the non-bypassable verify gate:
+    ``review_passed`` is reachable only from ``review_pending``, which in turn is
+    reachable only via the ``cb-phase verify`` gate (``verify_pending →
+    review_pending``). So there is no path to an *approved* subtask that skips
+    verification — the route is enforced in code, not by an LLM following a
+    prompt.
+    """
+    project_dir = Path(args.project_dir).resolve()
+    store = _resolve_store(project_dir)
+    new_state = "review_passed" if args.approve else "review_failed"
+
+    try:
+        transition(
+            args.subtask_id,
+            args.task,
+            new_state,
+            caller_role="reviewer",
+            reason="cb-phase review --approve" if args.approve else "cb-phase review --reject",
+            store=store,
+        )
+    except InvalidTransitionError as exc:
+        print(f"cb-phase: review verdict rejected — {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"cb-phase: subtask {args.subtask_id} → {new_state} (task {args.task})."
+    )
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cb-phase",
@@ -303,6 +341,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Project directory containing codeband.yaml (default: cwd).",
     )
     verify.set_defaults(func=_cmd_verify)
+
+    review = sub.add_parser(
+        "review",
+        help="Record a reviewer verdict (review_pending → review_passed/failed).",
+    )
+    review.add_argument("subtask_id", help="Subtask identifier.")
+    review.add_argument("--task", required=True, help="Task identifier (room_id).")
+    verdict = review.add_mutually_exclusive_group(required=True)
+    verdict.add_argument(
+        "--approve", action="store_true", help="Pass review → review_passed.",
+    )
+    verdict.add_argument(
+        "--reject", action="store_true", help="Fail review → review_failed.",
+    )
+    review.add_argument(
+        "--project-dir",
+        default=".",
+        help="Project directory containing codeband.yaml (default: cwd).",
+    )
+    review.set_defaults(func=_cmd_review)
     return parser
 
 

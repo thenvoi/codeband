@@ -184,3 +184,39 @@ def test_pr_is_open_parses_state(monkeypatch):
 
     monkeypatch.setattr(handoff.subprocess, "run", lambda cmd, **kw: _Result())
     assert handoff._pr_is_open(7) is True
+
+
+# ── cb-phase review — reviewer verdict routed through the FSM ────────────────
+
+def _review(verdict: str):
+    return handoff.main(["review", "st-1", "--task", "room-1", verdict])
+
+
+def test_review_approve_advances_to_review_passed(store, monkeypatch):
+    transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
+    monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
+    assert _review("--approve") == 0
+    assert store.get_subtask("st-1").state == "review_passed"
+
+
+def test_review_reject_advances_to_review_failed(store, monkeypatch):
+    transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
+    monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
+    assert _review("--reject") == 0
+    sub = store.get_subtask("st-1")
+    assert sub.state == "review_failed"
+    assert sub.review_round == 1  # a reject is one failed review round
+
+
+def test_review_illegal_from_verify_pending_writes_nothing(store, monkeypatch, capsys):
+    # The `store` fixture leaves st-1 at verify_pending (no review yet).
+    monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
+    assert _review("--approve") == 1
+    assert store.get_subtask("st-1").state == "verify_pending"
+    assert "review verdict rejected" in capsys.readouterr().err
+
+
+def test_review_requires_an_explicit_verdict():
+    # Mutually-exclusive --approve/--reject is required → argparse exits.
+    with pytest.raises(SystemExit):
+        handoff.main(["review", "st-1", "--task", "room-1"])
