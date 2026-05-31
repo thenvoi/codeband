@@ -61,6 +61,21 @@ async def send_task(config: CodebandConfig, project_dir: Path, description: str)
     room_id = room.data.id
     logger.info("Created task room: %s", room_id)
 
+    # Shadow mode (RFC WS1 / Phase 1): record the task in the durable state
+    # store. ``task_id == room_id`` — that is the only identifier available at
+    # kickoff. Record-only and fully guarded: a store write must never affect
+    # task kickoff, so any failure is swallowed with a warning.
+    try:
+        from codeband.state import StateStore
+
+        workspace_path = Path(config.workspace.path)
+        if not workspace_path.is_absolute():
+            workspace_path = project_dir / workspace_path
+        store = StateStore(workspace_path / "state" / "orchestration.db")
+        store.create_task(task_id=room_id, description=description, room_id=room_id)
+    except Exception:  # noqa: BLE001 - shadow mode must never break kickoff
+        logger.warning("StateStore task write skipped (shadow mode)", exc_info=True)
+
     # Human adds only the Conductor — the human's first message @mentions the
     # Conductor, so the Conductor must be a participant for that message to
     # land. Every other agent is invited lazily by the inviting agent

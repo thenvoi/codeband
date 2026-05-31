@@ -368,6 +368,18 @@ async def _install_memory_backend(
         print(status_line)
         print("Memory: Band.ai remote API")
 
+    # Shadow mode (RFC WS1 / Phase 1): initialise the durable state store
+    # alongside the memory backend so its schema exists for later phases.
+    # Record-only — its result is never used to drive orchestration, and a
+    # failure here must not change observable behaviour of `cb run`, so it is
+    # fully guarded. The swarm behaves identically whether or not this succeeds.
+    try:
+        from codeband.state import StateStore
+
+        StateStore(Path(workspace_path) / "state" / "orchestration.db")
+    except Exception:  # noqa: BLE001 - shadow mode must never break the swarm
+        logger.warning("StateStore init skipped (shadow mode)", exc_info=True)
+
     return mode
 
 
