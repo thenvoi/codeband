@@ -40,11 +40,12 @@ class CodexPlayerRunner:
             ) from e
 
         self.model = model
-        from codeband.agents.prompts import load_prompt
+        from codeband.agents.prompts import load_knowledge, load_prompt
 
         prompt = custom_prompt or load_prompt(_DEFAULT_PROMPT)
         if worker_roster:
             prompt += f"\n\n{worker_roster}"
+        prompt += load_knowledge("coding-standards", "testing", "security")
         if recovery_context:
             prompt = f"{recovery_context}\n\n---\n\n{prompt}"
 

@@ -12,11 +12,12 @@ _DEFAULT_PROMPT = Path(__file__).parent.parent / "prompts" / "planner.md"
 
 def _build_prompt(custom_prompt: str | None, worker_roster: str | None) -> str:
     """Compose the system prompt — shared by both framework runners."""
-    from codeband.agents.prompts import load_prompt
+    from codeband.agents.prompts import load_knowledge, load_prompt
 
     prompt = custom_prompt or load_prompt(_DEFAULT_PROMPT)
     if worker_roster:
         prompt += f"\n\n{worker_roster}"
+    prompt += load_knowledge("testing")
     return prompt
 
 

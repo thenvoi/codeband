@@ -31,9 +31,10 @@ class ClaudePlanReviewerRunner:
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
 
-        from codeband.agents.prompts import build_review_prompt
+        from codeband.agents.prompts import build_review_prompt, load_knowledge
 
         prompt = build_review_prompt(custom_prompt, review_guidelines, _DEFAULT_PROMPT)
+        prompt += load_knowledge("testing")
         if recovery_context:
             prompt = f"{recovery_context}\n\n---\n\n{prompt}"
         # See planner.py for why `dontAsk` + `approval_mode=None` — this lets
@@ -77,9 +78,10 @@ class CodexPlanReviewerRunner:
                 "Codex support."
             ) from e
 
-        from codeband.agents.prompts import build_review_prompt
+        from codeband.agents.prompts import build_review_prompt, load_knowledge
 
         prompt = build_review_prompt(custom_prompt, review_guidelines, _DEFAULT_PROMPT)
+        prompt += load_knowledge("testing")
         if recovery_context:
             prompt = f"{recovery_context}\n\n---\n\n{prompt}"
         config = CodexAdapterConfig(

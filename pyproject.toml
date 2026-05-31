@@ -66,7 +66,7 @@ Changelog = "https://github.com/thenvoi/codeband/blob/main/CHANGELOG.md"
 where = ["src"]
 
 [tool.setuptools.package-data]
-codeband = ["prompts/*.md"]
+codeband = ["prompts/*.md", "knowledge/*.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

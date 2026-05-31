@@ -26,6 +26,7 @@ def patch_gates(monkeypatch, store):
     monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
     monkeypatch.setattr(handoff, "_verify_command", lambda project_dir: "verify-cmd")
     monkeypatch.setattr(handoff, "_max_verify_attempts", lambda project_dir: 20)
+    monkeypatch.setattr(handoff, "_max_review_rounds", lambda project_dir: 3)
     monkeypatch.setattr(handoff, "_uncommitted_files", lambda worktree: [])
     monkeypatch.setattr(handoff, "_current_branch", lambda worktree: "feat-x")
     monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)

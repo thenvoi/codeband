@@ -81,10 +81,7 @@ def test_coder_dispatches_review_directly_to_opposite_framework_reviewer():
         "Coder prompt still routes through the Conductor — the relay was "
         "supposed to be removed in Bug 4."
     )
-    assert (
-        "@mentioning **both an opposite-framework Code Reviewer and @Conductor**"
-        in coder
-    )
+    assert "@mention @Conductor for awareness" in coder
     # Coder picks the reviewer themselves via peer discovery — not via a
     # Conductor relay, and not from a static hard-coded roster (lazy invites).
     # Discovery filters on `description` (the semantic field), not on a name
@@ -97,7 +94,7 @@ def test_coder_dispatches_review_directly_to_opposite_framework_reviewer():
 
     # Code Reviewer side: expects direct dispatch from the Coder and direct
     # failure reporting back to the PR owner.
-    assert "A Coder @mentions you directly at PR completion" in code_reviewer
+    assert "A Coder @mentions you directly once their PR has passed verification" in code_reviewer
     assert "@mention **both the PR-owning Coder and @Conductor**" in code_reviewer
     assert (
         "Codeband task branches have the form `codeband/<coder-worker-id>/<branch_slug>`"
@@ -105,7 +102,7 @@ def test_coder_dispatches_review_directly_to_opposite_framework_reviewer():
     )
 
     # Coder side: after fixes, go back to the same reviewer, not via a generic relay.
-    assert "both the same Reviewer and @Conductor" in coder
+    assert "@mention **the same Reviewer and @Conductor**" in coder
     assert "Use the Reviewer who failed the PR" in coder
 
     # Conductor side: stays silent whenever the direct path already reached the

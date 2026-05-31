@@ -161,3 +161,32 @@ class TestWorkerRosterFormat:
         assert "Coder-Claude-0, Coder-Claude-1" in roster
         assert "Reviewer-Codex-0, Reviewer-Codex-1" in roster
         assert "Planner-Claude-0" in roster
+
+
+class TestKnowledgeInjection:
+    """Knowledge files must be loadable and injected into built prompts."""
+
+    def test_load_knowledge_returns_nonempty(self):
+        from codeband.agents.prompts import load_knowledge
+
+        result = load_knowledge("coding-standards")
+        assert result
+        assert "# Engineering Knowledge Base" in result
+
+    def test_load_knowledge_empty_args(self):
+        from codeband.agents.prompts import load_knowledge
+
+        assert load_knowledge() == ""
+
+    def test_built_coder_prompt_contains_knowledge_header(self):
+        from codeband.agents.player_claude import ClaudePlayerRunner
+
+        runner = ClaudePlayerRunner()
+        assert "# Engineering Knowledge Base" in runner.adapter.custom_section
+
+    def test_knowledge_files_exist_in_package(self):
+        from codeband.agents.prompts import _KNOWLEDGE_DIR
+
+        assert (_KNOWLEDGE_DIR / "coding-standards.md").is_file()
+        assert (_KNOWLEDGE_DIR / "testing.md").is_file()
+        assert (_KNOWLEDGE_DIR / "security.md").is_file()
