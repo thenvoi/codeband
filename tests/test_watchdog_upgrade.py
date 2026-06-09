@@ -470,3 +470,219 @@ async def test_no_resolvable_owner_does_not_burn_escalate_once(tmp_path):
     # The marker must NOT be set — a later patrol can still escalate once an
     # owner is recorded on the task row.
     assert (TASK_ID, SUBTASK_ID) not in daemon._owner_escalated
+
+
+# ── owner-awareness: nudge exclusion, marker-after-send, active-only patrol ──
+
+def _supersede(store) -> None:
+    """Mark the seeded task superseded, as #23's re-registration would."""
+    conn = sqlite3.connect(store.db_path)
+    conn.execute(
+        "UPDATE tasks SET status = 'superseded' WHERE task_id = ?", (TASK_ID,),
+    )
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_owner_agent_participant_is_never_nudged(tmp_path, monkeypatch):
+    """An Agent-typed participant whose id == task.owner_id is never nudged
+    (mission control is not a stalled worker); a non-owner agent in the same
+    room is still nudge-eligible.
+    """
+    from codeband.state import StateStore
+
+    store = StateStore(tmp_path / "state" / "orchestration.db")
+    store.create_task(TASK_ID, "demo task", ROOM_ID, owner_id="owner-agent")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: None)
+
+    room = MagicMock()
+    room.id = ROOM_ID
+
+    rest = _mock_rest()
+    rest.agent_api_chats = MagicMock()
+    rest.agent_api_chats.list_agent_chats = AsyncMock(
+        return_value=_chats_resp([room]),
+    )
+    rest.agent_api_messages.list_agent_messages = AsyncMock(
+        return_value=MagicMock(data=[
+            _msg("owner-agent", minutes_ago=30),  # Agent-typed owner, very stale
+            _msg("agent-p0", minutes_ago=30),     # non-owner agent, stale
+        ]),
+    )
+    parts = MagicMock()
+    parts.data = [
+        _participant("agent-cond", "Conductor"),
+        _participant("owner-agent", "MissionControl"),  # type="Agent"
+        _participant("agent-p0", "Coder-Claude-0"),
+    ]
+    rest.agent_api_participants = MagicMock()
+    rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+        return_value=parts,
+    )
+
+    from codeband.agents.watchdog import WatchdogDaemon
+
+    daemon = WatchdogDaemon(
+        config=WatchdogConfig(stale_threshold_seconds=300),
+        rest_client=rest,
+        agent_id="agent-cond",
+        conductor_id="agent-cond",
+        state_store=store,
+    )
+    # Two patrols: if the owner were tracked, the second would escalate it.
+    await daemon._patrol()
+    await daemon._patrol()
+
+    calls = rest.agent_api_messages.create_agent_chat_message.call_args_list
+    assert calls, "the non-owner stale agent must still be nudged"
+    for call in calls:
+        msg = call.kwargs["message"]
+        assert all(m.id != "owner-agent" for m in msg.mentions)
+        assert "MissionControl" not in msg.content
+    assert [m.id for m in calls[0].kwargs["message"].mentions] == ["agent-p0"]
+    assert "owner-agent" not in daemon._state
+
+
+@pytest.mark.asyncio
+async def test_owner_escalation_transient_failure_retries(tmp_path):
+    """A transient send failure leaves the escalate-once marker unburned; the
+    next patrol retries and the successful send burns it — exactly one
+    successful escalation total (marker-after-send).
+    """
+    store = _seed_blocked(tmp_path)
+    rest = _mock_rest()
+    rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+        side_effect=[RuntimeError("simulated transient failure"), None],
+    )
+    activity = MagicMock()
+    daemon = _owner_daemon(store, rest, activity=activity)
+
+    now = datetime.now(UTC)
+    await daemon._check_blocked_subtasks(now)
+    assert (TASK_ID, SUBTASK_ID) not in daemon._owner_escalated, (
+        "transient send failure must not burn the escalate-once marker"
+    )
+
+    await daemon._check_blocked_subtasks(now)  # retry succeeds → marker burns
+    assert (TASK_ID, SUBTASK_ID) in daemon._owner_escalated
+
+    await daemon._check_blocked_subtasks(now)  # escalate-once holds
+    assert rest.agent_api_messages.create_agent_chat_message.await_count == 2
+    events = [c.args[0] for c in activity.log.call_args_list]
+    assert events.count("SUBTASK_BLOCKED_OWNER_ESCALATION") == 1, (
+        "the activity log must record exactly one successful escalation"
+    )
+
+
+@pytest.mark.asyncio
+async def test_owner_escalation_422_burns_and_logs_critical(tmp_path, caplog):
+    """A 422 mention rejection (owner not mentionable in the room) is
+    permanent: burn the marker anyway, log at CRITICAL, never retry.
+    """
+    import logging
+
+    from thenvoi_rest.core.api_error import ApiError
+
+    store = _seed_blocked(tmp_path)
+    rest = _mock_rest()
+    rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+        side_effect=ApiError(
+            status_code=422, headers={},
+            body="mentioned_participant_not_in_room",
+        ),
+    )
+    daemon = _owner_daemon(store, rest, owner_id="owner-1")
+
+    with caplog.at_level(logging.CRITICAL, logger="codeband.agents.watchdog"):
+        await daemon._check_blocked_subtasks(datetime.now(UTC))
+
+    assert (TASK_ID, SUBTASK_ID) in daemon._owner_escalated
+    critical = [r for r in caplog.records if r.levelno == logging.CRITICAL]
+    assert len(critical) == 1
+    message = critical[0].getMessage()
+    assert "owner owner-1" in message
+    assert ROOM_ID in message
+    assert "escalation undeliverable" in message
+
+    # No retry on subsequent patrols.
+    await daemon._check_blocked_subtasks(datetime.now(UTC))
+    assert rest.agent_api_messages.create_agent_chat_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_superseded_task_blocked_subtask_not_escalated(tmp_path):
+    """A blocked subtask of a status='superseded' task is invisible to the
+    owner-escalation scan: no send, no marker burn, no owner/room resolution.
+    """
+    store = _seed_blocked(tmp_path, owner_id="initiator-7")
+    _supersede(store)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest)
+    get_task_spy = MagicMock(wraps=store.get_task)
+    store.get_task = get_task_spy
+
+    await daemon._check_blocked_subtasks(datetime.now(UTC))
+
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+    assert (TASK_ID, SUBTASK_ID) not in daemon._owner_escalated
+    get_task_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_superseded_task_room_not_patrolled(tmp_path, monkeypatch):
+    """Chat-recency: a superseded task's room is skipped before any REST read,
+    retiring the stale-room warning for superseded rows.
+    """
+    store = _seed_store(tmp_path, state="merged")
+    _supersede(store)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: None)
+
+    room = MagicMock()
+    room.id = ROOM_ID
+
+    rest = _mock_rest()
+    rest.agent_api_chats = MagicMock()
+    rest.agent_api_chats.list_agent_chats = AsyncMock(
+        return_value=_chats_resp([room]),
+    )
+    rest.agent_api_messages.list_agent_messages = AsyncMock(
+        return_value=MagicMock(data=[_msg("agent-p0", minutes_ago=30)]),
+    )
+    rest.agent_api_participants = MagicMock()
+    rest.agent_api_participants.list_agent_chat_participants = AsyncMock()
+
+    from codeband.agents.watchdog import WatchdogDaemon
+
+    daemon = WatchdogDaemon(
+        config=WatchdogConfig(stale_threshold_seconds=300),
+        rest_client=rest,
+        agent_id="agent-cond",
+        conductor_id="agent-cond",
+        state_store=store,
+    )
+    await daemon._patrol()
+
+    rest.agent_api_messages.list_agent_messages.assert_not_awaited()
+    rest.agent_api_participants.list_agent_chat_participants.assert_not_awaited()
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_superseded_task_subtask_progress_not_tracked(tmp_path, monkeypatch):
+    """Mechanical-progress: in-flight subtasks of a superseded task are not
+    tracked — no git/gh shell-outs, no health entry, no escalation.
+    """
+    store = _seed_store(tmp_path, state="in_progress")
+    _supersede(store)
+    calls: list = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: calls.append(1))
+
+    rest = _mock_rest()
+    daemon = _daemon(store, config=WatchdogConfig(max_phase_visits=2), rest=rest)
+    for _ in range(4):
+        await daemon._check_subtask_progress(datetime.now(UTC))
+
+    assert calls == []
+    assert (TASK_ID, SUBTASK_ID) not in daemon._subtask_state
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()

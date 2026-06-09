@@ -1056,16 +1056,8 @@ class TestWatchdogDaemon:
         assert "agent-p0" in mention_ids
         assert "Coder-Claude-0" in msg.content
 
-    @pytest.mark.asyncio
-    async def test_escalation_flag_set_even_on_send_failure(
-        self, watchdog_config, mock_rest_client,
-    ):
-        """``state.escalated`` must flip to True once an escalation is attempted.
-
-        Regression: previously the flag was set only after a successful send,
-        so any 422 left escalation unflipped and the Watchdog retried the
-        same escalation on every patrol interval forever.
-        """
+    def _stale_escalation_daemon(self, watchdog_config, mock_rest_client):
+        """A daemon with one stale, already-nudged agent — ripe for escalation."""
         from codeband.agents.watchdog import AgentHealthState, WatchdogDaemon
 
         mock_rest_client.agent_api_chats.list_agent_chats = AsyncMock(
@@ -1084,9 +1076,6 @@ class TestWatchdogDaemon:
                 ("agent-p0", "Coder-Claude-0"),
             ]),
         )
-        mock_rest_client.agent_api_messages.create_agent_chat_message = AsyncMock(
-            side_effect=RuntimeError("simulated server rejection"),
-        )
 
         daemon = WatchdogDaemon(
             config=watchdog_config,
@@ -1099,19 +1088,75 @@ class TestWatchdogDaemon:
             nudged_at=datetime.now(UTC) - timedelta(seconds=120),
             nudge_count=1,
         )
+        return daemon
+
+    @pytest.mark.asyncio
+    async def test_escalation_transient_failure_retries_then_burns(
+        self, watchdog_config, mock_rest_client,
+    ):
+        """A transient send failure leaves escalate-once unburned; the next
+        patrol retries, and the successful send burns it — exactly one
+        successful escalation total (marker-after-send).
+        """
+        mock_rest_client.agent_api_messages.create_agent_chat_message = AsyncMock(
+            side_effect=[RuntimeError("simulated transient failure"), None],
+        )
+        daemon = self._stale_escalation_daemon(watchdog_config, mock_rest_client)
 
         await daemon._patrol()
-        assert daemon._state["agent-p0"].escalated is True
-
-        # Second patrol under the same conditions must not attempt another send.
-        call_count_after_first = (
-            mock_rest_client.agent_api_messages.create_agent_chat_message.call_count
+        assert daemon._state["agent-p0"].escalated is False, (
+            "transient send failure must not burn the escalate-once marker"
         )
+
+        # Second patrol retries; the send succeeds and burns the marker.
+        await daemon._patrol()
+        assert daemon._state["agent-p0"].escalated is True
+        assert (
+            mock_rest_client.agent_api_messages.create_agent_chat_message.call_count
+            == 2
+        )
+
+        # Third patrol: escalate-once holds on the success path — no more sends.
         await daemon._patrol()
         assert (
             mock_rest_client.agent_api_messages.create_agent_chat_message.call_count
-            == call_count_after_first
-        ), "escalation retried after failure — escalate-once invariant broken"
+            == 2
+        ), "escalation re-sent after success — escalate-once invariant broken"
+
+    @pytest.mark.asyncio
+    async def test_escalation_422_burns_marker_and_logs_critical(
+        self, watchdog_config, mock_rest_client, caplog,
+    ):
+        """A 422 mention rejection is permanent: burn the marker anyway, log
+        at CRITICAL, and never retry on subsequent patrols.
+        """
+        import logging
+
+        from thenvoi_rest.core.api_error import ApiError
+
+        mock_rest_client.agent_api_messages.create_agent_chat_message = AsyncMock(
+            side_effect=ApiError(
+                status_code=422, headers={},
+                body="mentioned_participant_not_in_room",
+            ),
+        )
+        daemon = self._stale_escalation_daemon(watchdog_config, mock_rest_client)
+
+        with caplog.at_level(logging.CRITICAL, logger="codeband.agents.watchdog"):
+            await daemon._patrol()
+
+        assert daemon._state["agent-p0"].escalated is True
+        critical = [r for r in caplog.records if r.levelno == logging.CRITICAL]
+        assert len(critical) == 1
+        assert "not mentionable" in critical[0].getMessage()
+        assert "escalation undeliverable" in critical[0].getMessage()
+
+        # No retry: the marker is burned despite the failed send.
+        await daemon._patrol()
+        assert (
+            mock_rest_client.agent_api_messages.create_agent_chat_message.call_count
+            == 1
+        )
 
     @pytest.mark.asyncio
     async def test_skips_own_messages(self, watchdog_config, mock_rest_client):

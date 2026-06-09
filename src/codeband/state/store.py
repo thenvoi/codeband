@@ -239,8 +239,10 @@ class StateStore:
     ) -> None:
         """Insert a task row (idempotent on ``task_id``).
 
-        Re-creating the same task is a no-op rather than an error, so a kickoff
-        that is retried against an existing DB stays safe.
+        Internal to task registration — do not call directly; use
+        :func:`codeband.state.registration.register_task`, the sole writer of
+        "a task exists". Re-creating the same task is a no-op rather than an
+        error, so a retried registration against an existing DB stays safe.
         """
         with self._transaction() as conn:
             conn.execute(

@@ -117,4 +117,4 @@ We are implementing [`docs/rfc-deterministic-orchestration.md`](docs/rfc-determi
 uv venv && uv pip install -e ".[dev]"
 .venv/bin/python -m pytest -q
 ```
-**Baseline on `main` (2026-05-31): 531 passed, 3 PRE-EXISTING failures — do NOT fix:** `tests/test_cli_dotenv.py::test_clirunner_subcommand_dir_loads_env`, `tests/test_diff.py::test_cli_diff_missing_arg_lists_workers`, `tests/test_diff.py::test_cli_diff_resolves_and_renders` (unrelated `CliRunner` `TypeError`). Acceptance for any phase = those same 3 (and only those 3) still fail; your new tests pass.
+**Baseline on `main`: the full suite passes** (the 3 `CliRunner` failures previously listed here have been fixed). Acceptance for any phase = the suite stays fully green and your new tests pass.

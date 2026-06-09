@@ -307,6 +307,8 @@ class WatchdogDaemon:
 
     async def _patrol(self) -> None:
         """Single patrol cycle: check all rooms for stale agents."""
+        import asyncio
+
         now = datetime.now(UTC)
 
         # Gate: if the Conductor has reported task completion or is waiting on
@@ -341,6 +343,26 @@ class WatchdogDaemon:
         from thenvoi_rest.core.api_error import ApiError
         from thenvoi_rest.errors.not_found_error import NotFoundError
 
+        # Active-only patrol: task rows drive which rooms matter. A room whose
+        # task row is no longer 'active' (e.g. superseded by a later
+        # registration — see state/registration.py) is dead to the watchdog
+        # and skipped before any REST call, which also retires the stale-room
+        # NotFoundError warning for superseded rows. Each active room's owner
+        # is resolved here too, for the nudge-eligibility filter below. With
+        # no store (or a failed read) both maps stay empty and the patrol
+        # degrades to the unfiltered behavior.
+        task_rows = await asyncio.to_thread(self._task_rows)
+        active_room_owners: dict[str, str | None] = {}
+        inactive_rooms: set[str] = set()
+        if task_rows:
+            active_room_owners = {
+                room: owner for _, room, status, owner in task_rows
+                if status == "active"
+            }
+            inactive_rooms = {
+                room for _, room, status, _ in task_rows if status != "active"
+            } - set(active_room_owners)
+
         try:
             rooms = await self._list_rooms()
         except ApiError as e:
@@ -356,6 +378,8 @@ class WatchdogDaemon:
 
         for room in rooms:
             room_id = room.id
+            if room_id in inactive_rooms:
+                continue
             try:
                 messages = await self._list_messages(room_id, since)
                 # Participant list is always via the agent API — the write
@@ -397,9 +421,13 @@ class WatchdogDaemon:
             # `mentioned_participant_not_in_room` from the server. Human
             # participants (type="User") are excluded so the watchdog never
             # nudges or escalates at the human user who opened the session.
+            # The task owner is excluded regardless of type: mission control
+            # may be an Agent-typed peer (initiator-as-owner), and it receives
+            # owner escalations but must never be treated as a stalled worker.
+            room_owner = active_room_owners.get(room_id) or self._owner_id
             participant_names: dict[str, str] = {
                 p.id: (p.name or p.id) for p in parts_response.data
-                if p.type == "Agent"
+                if p.type == "Agent" and p.id != room_owner
             }
 
             # Per-agent activity signals.
@@ -497,13 +525,19 @@ class WatchdogDaemon:
                         and (now - state.nudged_at)
                         >= timedelta(seconds=self._config.nudge_grace_seconds)
                     ):
-                        # Escalate-once: flip state before attempting the send so
-                        # a server rejection (e.g. mention validation) doesn't
-                        # produce an unbounded retry loop on every patrol.
-                        state.escalated = True
-                        await self._send_escalation(
-                            room_id, agent_id, staleness, participant_names,
-                        )
+                        # Escalate-once, marker-after-send: the flag flips only
+                        # when the send lands (or is permanently undeliverable,
+                        # HTTP 422), so a transient failure retries next patrol
+                        # instead of being silently burned forever. See
+                        # _attempt_escalation_send for the full policy.
+                        if await self._attempt_escalation_send(
+                            self._send_escalation(
+                                room_id, agent_id, staleness, participant_names,
+                            ),
+                            target=f"agent {agent_id}",
+                            room_id=room_id,
+                        ):
+                            state.escalated = True
                 except Exception:
                     logger.exception(
                         "Failed to nudge/escalate %s in room %s", agent_id, room_id,
@@ -519,6 +553,80 @@ class WatchdogDaemon:
         # owner_id is supplied (post-activation); guarded so a notify failure
         # never breaks the patrol loop.
         await self._check_blocked_subtasks(now)
+
+    def _task_rows(self) -> list[tuple[str, str, str, str | None]] | None:
+        """Return ``(task_id, room_id, status, owner_id)`` for every task row.
+
+        Returns ``None`` when no store is wired or the read fails — callers
+        degrade to the unfiltered (pre-store) behavior. Reads the store's
+        SQLite file directly (read-only), mirroring :meth:`_latest_transition`,
+        since the Workstream-1 store surface does not expose a task-listing
+        query.
+        """
+        if self._store is None:
+            return None
+        db_path = getattr(self._store, "db_path", None)
+        if db_path is None:
+            return None
+        try:
+            conn = sqlite3.connect(db_path, timeout=5.0)
+            try:
+                rows = conn.execute(
+                    "SELECT task_id, room_id, status, owner_id FROM tasks",
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            logger.debug("Could not read task rows", exc_info=True)
+            return None
+        return [(r[0], r[1], r[2], r[3]) for r in rows]
+
+    def _active_task_ids(self) -> set[str] | None:
+        """Task ids with ``status='active'``, or ``None`` to disable filtering."""
+        rows = self._task_rows()
+        if rows is None:
+            return None
+        return {task_id for task_id, _, status, _ in rows if status == "active"}
+
+    async def _attempt_escalation_send(
+        self, send: Any, *, target: str, room_id: str,
+    ) -> bool:
+        """Await an escalation *send*; return True when its once-marker may burn.
+
+        Marker-after-send: an escalate-once marker burns only on a successful
+        send, so a transient failure (network, 429, 5xx) is retried on the
+        next patrol instead of being silently burned forever. Accepted trade:
+        a send that succeeds but whose response is lost burns nothing and can
+        produce a duplicate escalation. The one permanent failure is the
+        server's HTTP 422 mention rejection
+        (``mentioned_participant_not_in_room`` — see the participant-filter
+        comment in :meth:`_patrol`): retrying the same message can only be
+        rejected again, so burn the marker anyway and log at CRITICAL.
+        """
+        from thenvoi_rest.core.api_error import ApiError
+
+        try:
+            await send
+        except ApiError as e:
+            if e.status_code == 422:
+                logger.critical(
+                    "%s not mentionable in room %s — escalation undeliverable",
+                    target, room_id,
+                )
+                return True
+            logger.warning(
+                "Escalation send to %s in room %s failed (HTTP %s) — "
+                "will retry next patrol",
+                target, room_id, e.status_code,
+            )
+            return False
+        except Exception:
+            logger.warning(
+                "Escalation send to %s in room %s failed — will retry next patrol",
+                target, room_id, exc_info=True,
+            )
+            return False
+        return True
 
     async def _check_subtask_progress(self, now: datetime) -> None:
         """Detect stalled subtasks via mechanical signals and escalate (RFC WS4).
@@ -545,7 +653,13 @@ class WatchdogDaemon:
             logger.debug("Watchdog could not list subtasks from store", exc_info=True)
             return
 
+        active_task_ids = await asyncio.to_thread(self._active_task_ids)
+
         for sub in subtasks:
+            # Active-only: a subtask of a superseded/closed task is dead to
+            # the watchdog. None (read failure) degrades to no filtering.
+            if active_task_ids is not None and sub.task_id not in active_task_ids:
+                continue
             if sub.state not in {"in_progress", "verify_pending"}:
                 continue
             try:
@@ -762,13 +876,16 @@ class WatchdogDaemon:
 
         Independent of how the subtask reached ``blocked`` — the watchdog's own
         stall cap, the ``cb-phase verify`` attempt cap, or the FSM review-round
-        cap all land here. Each blocked subtask is announced to the owner exactly
-        once (escalate-once via ``_owner_escalated``).
+        cap all land here. Each blocked subtask is announced to the owner once,
+        on the first patrol whose send succeeds (escalate-once via
+        ``_owner_escalated``, marker-after-send — see
+        :meth:`_attempt_escalation_send`).
 
         The owner is resolved per blocked subtask from its task row
         (``task.owner_id``, persisted at kickoff), falling back to the optional
         ``self._owner_id`` constructor override. Fully no-ops when no store is
-        wired. When no owner can be resolved for a subtask it is skipped WITHOUT
+        wired, and skips subtasks of non-``active`` tasks entirely. When no
+        owner (or room) can be resolved for a subtask it is skipped WITHOUT
         burning its escalate-once marker, so it can still escalate later if an
         owner appears. Guarded so a store read or a notify failure never breaks
         the patrol loop.
@@ -787,28 +904,35 @@ class WatchdogDaemon:
             )
             return
 
+        active_task_ids = await asyncio.to_thread(self._active_task_ids)
+
         for sub in subtasks:
             key = (sub.task_id, sub.subtask_id)
             if sub.state != "blocked" or key in self._owner_escalated:
                 continue
+            # Active-only: a blocked subtask of a superseded task is never
+            # escalated — no owner or room resolution is even attempted.
+            if active_task_ids is not None and sub.task_id not in active_task_ids:
+                continue
             # Resolve the owner from the subtask's task row (set at kickoff),
-            # falling back to the constructor override. Do this BEFORE flipping
-            # escalate-once: with no resolvable owner there is nobody to mention,
-            # so skip without consuming the marker — it can escalate later once
-            # an owner is recorded.
+            # falling back to the constructor override. Do this BEFORE any
+            # marker burn: with no resolvable owner there is nobody to mention
+            # and with no room there is nowhere to post — both skip without
+            # consuming the marker, so the subtask can still escalate later.
             owner_id = await self._resolve_owner_id(sub.task_id)
             if owner_id is None:
                 continue
-            # Flip escalate-once BEFORE the send so a server rejection (e.g.
-            # mention validation) doesn't re-fire the owner every patrol.
-            self._owner_escalated.add(key)
-            try:
-                await self._send_owner_blocked_escalation(sub, owner_id)
-            except Exception:
-                logger.exception(
-                    "Failed owner escalation for blocked subtask %s",
-                    sub.subtask_id,
-                )
+            room_id = await self._resolve_room_id(sub.task_id)
+            if room_id is None:
+                continue
+            # Marker-after-send: burn escalate-once only when the send lands
+            # (or is permanently undeliverable — HTTP 422 mention rejection).
+            if await self._attempt_escalation_send(
+                self._send_owner_blocked_escalation(sub, owner_id, room_id),
+                target=f"owner {owner_id}",
+                room_id=room_id,
+            ):
+                self._owner_escalated.add(key)
 
     async def _resolve_owner_id(self, task_id: str) -> str | None:
         """Return the initiator id for *task_id*, or the constructor override.
@@ -830,14 +954,35 @@ class WatchdogDaemon:
             )
         return owner_id or self._owner_id
 
-    async def _send_owner_blocked_escalation(self, sub: Any, owner_id: str) -> None:
+    async def _resolve_room_id(self, task_id: str) -> str | None:
+        """Return the room id from the task row, or ``None`` if unresolvable.
+
+        Guarded so a store read failure degrades to ``None`` (the caller skips
+        without burning any escalate-once marker) rather than breaking patrol.
+        """
+        import asyncio
+
+        try:
+            task = await asyncio.to_thread(self._store.get_task, task_id)
+            return getattr(task, "room_id", None) if task else None
+        except Exception:
+            logger.debug(
+                "Could not resolve room for task %s", task_id, exc_info=True,
+            )
+            return None
+
+    async def _send_owner_blocked_escalation(
+        self, sub: Any, owner_id: str, room_id: str,
+    ) -> None:
         """@mention the owner about a blocked subtask, with its blocked reason.
 
-        *owner_id* is the resolved task initiator (from the task row, or the
-        constructor override). The owner is a distinct room participant (not the
-        Conductor whose credentials the watchdog borrows), so the mention is
-        valid. The message carries the subtask id and the durable reason recorded
-        on the blocked transition so the owner has actionable context.
+        *owner_id* and *room_id* are resolved by the caller from the task row
+        (owner falling back to the constructor override). The owner is a
+        distinct room participant (not the Conductor whose credentials the
+        watchdog borrows), so the mention is valid. The message carries the
+        subtask id and the durable reason recorded on the blocked transition so
+        the owner has actionable context. Send failures propagate to the
+        caller, which owns the escalate-once marker (marker-after-send).
         """
         import asyncio
 
@@ -846,28 +991,12 @@ class WatchdogDaemon:
             or "no mechanical progress / cap reached"
         )
 
-        room_id: str | None = None
-        try:
-            task = await asyncio.to_thread(self._store.get_task, sub.task_id)
-            room_id = getattr(task, "room_id", None) if task else None
-        except Exception:
-            logger.debug(
-                "Could not resolve room for owner escalation", exc_info=True,
-            )
-        if room_id is None:
-            return
-
         from thenvoi_rest.types import (
             ChatMessageRequest,
             ChatMessageRequestMentionsItem,
         )
 
         handle = self._owner_handle or owner_id
-        if self._activity:
-            self._activity.log(
-                "SUBTASK_BLOCKED_OWNER_ESCALATION", "watchdog",
-                f"Escalated blocked subtask {sub.subtask_id} to owner {handle}",
-            )
         await self._rest.agent_api_messages.create_agent_chat_message(
             chat_id=room_id,
             message=ChatMessageRequest(
@@ -879,6 +1008,13 @@ class WatchdogDaemon:
                 mentions=[ChatMessageRequestMentionsItem(id=owner_id)],
             ),
         )
+        # Log only after the send lands — a retried transient failure would
+        # otherwise record one phantom escalation per attempt.
+        if self._activity:
+            self._activity.log(
+                "SUBTASK_BLOCKED_OWNER_ESCALATION", "watchdog",
+                f"Escalated blocked subtask {sub.subtask_id} to owner {handle}",
+            )
 
     def _blocked_reason(self, subtask_id: str, task_id: str) -> str | None:
         """Return the ``reason`` of the latest ``→ blocked`` transition, if any.
