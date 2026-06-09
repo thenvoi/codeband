@@ -571,7 +571,7 @@ async def check_memory_mode(ctx: Context) -> CheckResult:
         return CheckResult(Status.OK, "Memory: Band.ai remote API (paid tier)")
     return CheckResult(
         Status.INFO,
-        "Memory: local JSONL store (Band.ai memory unavailable — free tier)",
+        "Memory: local store (Band.ai memory is a paid-tier feature)",
         remediation=(
             "Free-tier mode works fine on a single machine. Multi-host deployments "
             "require paid Band.ai."

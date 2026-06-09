@@ -327,7 +327,7 @@ async def query_status(
     print("\n" + "=" * 56)
     print("  CODEBAND STATUS")
     if mode == "local":
-        print("  (local JSONL — Band.ai memory unavailable)")
+        print("  (memory: local store — Band.ai memory is a paid-tier feature)")
     print("=" * 56)
     if protocols_data:
         print()
