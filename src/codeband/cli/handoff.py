@@ -4,9 +4,16 @@ This is the enforcement seam. Coding agents (Claude *and* Codex) request a
 phase advance by shelling out to ``cb-phase verify``; the effect only happens
 if every gate passes, regardless of what the Conductor intended.
 
-    cb-phase verify <subtask_id> --task <task_id> --pr <n> [--worktree <path>]
+    cb-phase verify <subtask_id> --pr <n> [--worktree <path>] [--project-dir <p>]
 
-A coder also runs ``cb-phase start <subtask_id> --task <task_id>`` at pickup to
+The authoritative ``task_id`` (the FK target of every subtask row) is *not*
+taken from the command line: it is resolved from the active-room pointer
+``<project_dir>/.codeband_room`` that ``kickoff.send_task`` writes (where
+``tasks.task_id == room_id``). The ``--task`` flag is accepted for readability
+but is a non-authoritative label only — agents pass the semantic ``task_key``
+there, which would FK-fail if trusted (see :func:`_resolve_task_id`).
+
+A coder also runs ``cb-phase start <subtask_id>`` at pickup to
 seed the subtask into ``in_progress`` — the Conductor never drives the FSM
 directly, so without this nothing would advance the subtask off ``planned`` and
 the first ``verify`` would dead-end. ``verify`` self-seeds from a
@@ -54,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -61,6 +69,8 @@ from pathlib import Path
 from codeband.config import load_config
 from codeband.state import StateStore
 from codeband.state.fsm import InvalidTransitionError, transition
+
+logger = logging.getLogger(__name__)
 
 # Per-subtask verify-attempt cap default (RFC two-level model). After this many
 # *rejected* ``cb-phase verify`` attempts, the subtask is escalated
@@ -84,6 +94,12 @@ EXIT_DIRTY_TREE = 2
 EXIT_NO_PR = 3
 EXIT_VERIFY_FAILED = 4
 EXIT_CAP_REACHED = 5
+# No active task could be resolved from ``<project_dir>/.codeband_room`` (the
+# pointer is missing/empty, or names a room with no matching ``tasks`` row).
+# Distinct from the gate rejections above: nothing was attempted and nothing
+# written — the caller cannot proceed because the authoritative task_id (the FK
+# target of every subtask row) is unknown.
+EXIT_NO_ACTIVE_TASK = 6
 
 # How many trailing lines of a failing verify command's output to surface in
 # the ``REJECTED [verify_failed]`` message — enough to see the failure without
@@ -103,6 +119,61 @@ def _resolve_store(project_dir: Path) -> StateStore:
         workspace_path = project_dir / workspace_path
     store = StateStore(workspace_path / "state" / "orchestration.db")
     return store
+
+
+def _resolve_task_id(
+    project_dir: Path,
+    store: StateStore,
+    task_arg: str | None,
+) -> tuple[str | None, int | None]:
+    """Resolve the authoritative ``task_id`` from the active-room pointer.
+
+    ``kickoff.send_task`` sets ``tasks.task_id == room_id`` and writes that room
+    UUID to ``<project_dir>/.codeband_room``. Every ``subtask_states`` row FKs to
+    ``tasks.task_id``, so the room UUID — not whatever label an agent passes — is
+    the only value that satisfies the constraint. Agents are trained on the
+    semantic ``task_key`` (e.g. ``add-redact-helper``) and pass *that* to
+    ``--task``; using it for the FK is exactly the bug this resolves. So the
+    authoritative id is read from ``.codeband_room`` and ``--task`` is treated as
+    a non-authoritative label only.
+
+    Returns ``(task_id, None)`` on success. On failure returns
+    ``(None, EXIT_NO_ACTIVE_TASK)`` after printing a clear, actionable error —
+    never an FK crash, never a silent proceed. The two failure modes (no pointer,
+    or a pointer with no matching ``tasks`` row) both mean the same thing to the
+    caller: there is no seeded task to attach work to.
+    """
+    room_file = project_dir / ".codeband_room"
+    room_id = ""
+    if room_file.is_file():
+        room_id = room_file.read_text(encoding="utf-8").strip()
+
+    if not room_id:
+        print(
+            f"cb-phase: no active task — {room_file} missing or empty; "
+            "was the task seeded via `cb task`?",
+            file=sys.stderr,
+        )
+        return None, EXIT_NO_ACTIVE_TASK
+
+    if store.get_task(room_id) is None:
+        print(
+            f"cb-phase: no active task — no tasks row matches active room "
+            f"{room_id} (from {room_file}); was the task seeded via `cb task`?",
+            file=sys.stderr,
+        )
+        return None, EXIT_NO_ACTIVE_TASK
+
+    # ``--task`` is a non-authoritative label. If it disagrees with the active
+    # room, the room wins — log the discrepancy at debug for traceability and
+    # never let the label reach the FK.
+    if task_arg is not None and task_arg != room_id:
+        logger.debug(
+            "cb-phase: ignoring non-authoritative --task %r; "
+            "using active room %r from %s",
+            task_arg, room_id, room_file,
+        )
+    return room_id, None
 
 
 def _verify_command(project_dir: Path) -> str | None:
@@ -378,13 +449,17 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     worktree = Path(args.worktree).resolve()
     store = _resolve_store(project_dir)
 
+    task_id, error_code = _resolve_task_id(project_dir, store, args.task)
+    if error_code is not None:
+        return error_code
+
     # Walk the subtask to verify_pending from its current state. This handles
     # first-submit (in_progress), rework (review_failed), and retry
     # (verify_pending) entry paths, walking only legal FSM edges. The
     # review-round cap is checked proactively before attempting the
     # review_failed → in_progress transition.
     walk_result = _walk_to_verify_pending(
-        args.subtask_id, args.task, store,
+        args.subtask_id, task_id, store,
         max_review_rounds=_max_review_rounds(project_dir),
     )
     if walk_result is not None:
@@ -402,7 +477,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         try:
             transition(
                 args.subtask_id,
-                args.task,
+                task_id,
                 "blocked",
                 caller_role="coder",
                 reason=f"verify-attempt cap {max_attempts} reached",
@@ -453,7 +528,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     try:
         transition(
             args.subtask_id,
-            args.task,
+            task_id,
             "review_pending",
             caller_role="coder",
             reason="cb-phase verify",
@@ -465,7 +540,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
     print(
         f"cb-phase: subtask {args.subtask_id} → review_pending "
-        f"(PR #{args.pr}, task {args.task})."
+        f"(PR #{args.pr}, task {task_id})."
     )
     return 0
 
@@ -483,25 +558,29 @@ def _cmd_start(args: argparse.Namespace) -> int:
     project_dir = Path(args.project_dir).resolve()
     store = _resolve_store(project_dir)
 
+    task_id, error_code = _resolve_task_id(project_dir, store, args.task)
+    if error_code is not None:
+        return error_code
+
     # Was the subtask already underway/past before we touched it? Only a subtask
     # that is missing/planned/assigned is actually moved by start; anything else
     # is a non-regressing no-op and is reported as such.
     pre = store.get_subtask(args.subtask_id)
     already_underway = pre is not None and pre.state not in _PRE_START_STATES
 
-    state, error_code = _walk_to_in_progress(args.subtask_id, args.task, store)
+    state, error_code = _walk_to_in_progress(args.subtask_id, task_id, store)
     if error_code is not None:
         return error_code
 
     if already_underway:
         print(
             f"cb-phase: subtask {args.subtask_id} already at {state} "
-            f"(task {args.task}); start is a no-op."
+            f"(task {task_id}); start is a no-op."
         )
     else:
         print(
             f"cb-phase: subtask {args.subtask_id} → in_progress "
-            f"(task {args.task})."
+            f"(task {task_id})."
         )
     return 0
 
@@ -523,12 +602,17 @@ def _cmd_review(args: argparse.Namespace) -> int:
     """
     project_dir = Path(args.project_dir).resolve()
     store = _resolve_store(project_dir)
+
+    task_id, error_code = _resolve_task_id(project_dir, store, args.task)
+    if error_code is not None:
+        return error_code
+
     new_state = "review_passed" if args.approve else "review_failed"
 
     try:
         transition(
             args.subtask_id,
-            args.task,
+            task_id,
             new_state,
             caller_role="reviewer",
             reason="cb-phase review --approve" if args.approve else "cb-phase review --reject",
@@ -539,7 +623,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
         return 1
 
     print(
-        f"cb-phase: subtask {args.subtask_id} → {new_state} (task {args.task})."
+        f"cb-phase: subtask {args.subtask_id} → {new_state} (task {task_id})."
     )
     return 0
 
@@ -556,7 +640,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Seed a subtask into in_progress at coder pickup (no PR yet).",
     )
     start.add_argument("subtask_id", help="Subtask identifier.")
-    start.add_argument("--task", required=True, help="Task identifier (room_id).")
+    start.add_argument(
+        "--task",
+        required=False,
+        help="Task label (non-authoritative; active room resolved from "
+        ".codeband_room).",
+    )
     start.add_argument(
         "--worktree",
         default=".",
@@ -574,7 +663,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Gate a subtask into review_pending (clean tree + open PR + verify).",
     )
     verify.add_argument("subtask_id", help="Subtask identifier.")
-    verify.add_argument("--task", required=True, help="Task identifier (room_id).")
+    verify.add_argument(
+        "--task",
+        required=False,
+        help="Task label (non-authoritative; active room resolved from "
+        ".codeband_room).",
+    )
     verify.add_argument("--pr", type=int, required=True, help="Pull request number.")
     verify.add_argument(
         "--worktree",
@@ -593,7 +687,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Record a reviewer verdict (review_pending → review_passed/failed).",
     )
     review.add_argument("subtask_id", help="Subtask identifier.")
-    review.add_argument("--task", required=True, help="Task identifier (room_id).")
+    review.add_argument(
+        "--task",
+        required=False,
+        help="Task label (non-authoritative; active room resolved from "
+        ".codeband_room).",
+    )
     verdict = review.add_mutually_exclusive_group(required=True)
     verdict.add_argument(
         "--approve", action="store_true", help="Pass review → review_passed.",

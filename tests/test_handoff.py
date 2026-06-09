@@ -24,6 +24,12 @@ def store(tmp_path) -> StateStore:
 def patch_gates(monkeypatch, store):
     """Wire the handoff helpers to controllable defaults (all gates pass)."""
     monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
+    # task_id resolution is its own seam (tested for real below); here the active
+    # room is always the fixture's ``room-1`` regardless of the ``--task`` label.
+    monkeypatch.setattr(
+        handoff, "_resolve_task_id",
+        lambda project_dir, store, task_arg: ("room-1", None),
+    )
     monkeypatch.setattr(handoff, "_verify_command", lambda project_dir: "verify-cmd")
     monkeypatch.setattr(handoff, "_max_verify_attempts", lambda project_dir: 20)
     monkeypatch.setattr(handoff, "_max_review_rounds", lambda project_dir: 3)
@@ -138,8 +144,9 @@ def test_each_failure_mode_has_a_distinct_exit_code():
         handoff.EXIT_NO_PR,
         handoff.EXIT_VERIFY_FAILED,
         handoff.EXIT_CAP_REACHED,
+        handoff.EXIT_NO_ACTIVE_TASK,
     }
-    assert len(codes) == 4  # all distinct
+    assert len(codes) == 5  # all distinct
     assert 0 not in codes  # never collide with success
 
 
@@ -191,6 +198,10 @@ def test_pr_is_open_parses_state(monkeypatch):
 
 def _start(store, monkeypatch, subtask_id):
     monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
+    monkeypatch.setattr(
+        handoff, "_resolve_task_id",
+        lambda project_dir, store, task_arg: ("room-1", None),
+    )
     return handoff.main(["start", subtask_id, "--task", "room-1"])
 
 
@@ -234,28 +245,39 @@ def test_start_from_assigned_walks_to_in_progress(monkeypatch, tmp_path, capsys)
     assert s.get_subtask("st-1").state == "in_progress"
 
 
-def test_start_requires_task():
-    with pytest.raises(SystemExit):
-        handoff.main(["start", "st-1"])
+def test_start_task_label_is_optional(store, monkeypatch):
+    # ``--task`` is now an optional, non-authoritative label: omitting it must
+    # not error at the parser. The active room is resolved from .codeband_room
+    # (stubbed here), so start still seeds the subtask.
+    monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
+    monkeypatch.setattr(
+        handoff, "_resolve_task_id",
+        lambda project_dir, s, task_arg: ("room-1", None),
+    )
+    assert handoff.main(["start", "st-new"]) == 0
+    assert store.get_subtask("st-new").state == "in_progress"
 
 
 # ── cb-phase review — reviewer verdict routed through the FSM ────────────────
 
-def _review(verdict: str):
+def _review(monkeypatch, store, verdict: str):
+    monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
+    monkeypatch.setattr(
+        handoff, "_resolve_task_id",
+        lambda project_dir, s, task_arg: ("room-1", None),
+    )
     return handoff.main(["review", "st-1", "--task", "room-1", verdict])
 
 
 def test_review_approve_advances_to_review_passed(store, monkeypatch):
     transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
-    monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
-    assert _review("--approve") == 0
+    assert _review(monkeypatch, store, "--approve") == 0
     assert store.get_subtask("st-1").state == "review_passed"
 
 
 def test_review_reject_advances_to_review_failed(store, monkeypatch):
     transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
-    monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
-    assert _review("--reject") == 0
+    assert _review(monkeypatch, store, "--reject") == 0
     sub = store.get_subtask("st-1")
     assert sub.state == "review_failed"
     assert sub.review_round == 1  # a reject is one failed review round
@@ -263,8 +285,7 @@ def test_review_reject_advances_to_review_failed(store, monkeypatch):
 
 def test_review_illegal_from_verify_pending_writes_nothing(store, monkeypatch, capsys):
     # The `store` fixture leaves st-1 at verify_pending (no review yet).
-    monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
-    assert _review("--approve") == 1
+    assert _review(monkeypatch, store, "--approve") == 1
     assert store.get_subtask("st-1").state == "verify_pending"
     assert "review verdict rejected" in capsys.readouterr().err
 

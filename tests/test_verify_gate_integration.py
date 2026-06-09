@@ -17,8 +17,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from codeband.cli import handoff
 from codeband.config import AgentsConfig, CodebandConfig, RepoConfig, WorkspaceConfig
 from codeband.state import StateStore
@@ -61,6 +59,9 @@ def _project(tmp_path, *, verify_command=None):
         workspace=WorkspaceConfig(path=str(workspace)),
     )
     cfg.to_yaml(project_dir / "codeband.yaml")
+    # Active-room pointer: cb-phase resolves the authoritative task_id (room
+    # UUID) from this, not from the --task label the agents pass.
+    (project_dir / ".codeband_room").write_text("room-1", encoding="utf-8")
     store = StateStore(workspace / "state" / "orchestration.db")
     store.create_task("room-1", "demo", "room-1")
     return project_dir, store

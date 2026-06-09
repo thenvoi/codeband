@@ -295,6 +295,9 @@ class TestCbPhaseGate:
             workspace=WorkspaceConfig(path=str(workspace)),
         )
         cfg.to_yaml(project_dir / "codeband.yaml")
+        # Active-room pointer: kickoff writes this; cb-phase resolves the
+        # authoritative task_id (room UUID) from it, not from --task.
+        (project_dir / ".codeband_room").write_text("room-1", encoding="utf-8")
 
         store = StateStore(workspace / "state" / "orchestration.db")
         store.create_task("room-1", "demo", "room-1")
@@ -397,6 +400,9 @@ class TestCbPhaseReviewVerdict:
             workspace=WorkspaceConfig(path=str(workspace)),
         )
         cfg.to_yaml(project_dir / "codeband.yaml")
+        # Active-room pointer: kickoff writes this; cb-phase resolves the
+        # authoritative task_id (room UUID) from it, not from --task.
+        (project_dir / ".codeband_room").write_text("room-1", encoding="utf-8")
         store = StateStore(workspace / "state" / "orchestration.db")
         store.create_task("room-1", "demo", "room-1")
         return project_dir, store
@@ -1041,6 +1047,9 @@ class TestVerifyAttemptCap:
             workspace=WorkspaceConfig(path=str(workspace)),
         )
         cfg.to_yaml(project_dir / "codeband.yaml")
+        # Active-room pointer: kickoff writes this; cb-phase resolves the
+        # authoritative task_id (room UUID) from it, not from --task.
+        (project_dir / ".codeband_room").write_text("room-1", encoding="utf-8")
         store = StateStore(workspace / "state" / "orchestration.db")
         store.create_task("room-1", "demo", "room-1")
         return project_dir, store
@@ -1259,3 +1268,126 @@ class TestVerifyAttemptCap:
         sub = store.get_subtask("st-i")
         assert sub.review_round == 1
         assert sub.verify_attempts == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Active-room resolution — cb-phase derives the authoritative task_id from
+# <project_dir>/.codeband_room, never from the agent-supplied --task label.
+#
+# Regression guard for the room_id-vs-task_key bug: tasks.task_id is the room
+# UUID (kickoff sets task_id == room_id), but agents are trained on the semantic
+# task_key (e.g. "subtract-fn") and pass *that* to --task. Trusting it FK-failed
+# ``ensure_subtask`` and the verify gate never seeded. Now the room UUID from
+# .codeband_room wins and the bogus label is ignored.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestActiveRoomResolution:
+    """cb-phase resolves the room UUID from .codeband_room; --task is a label."""
+
+    # The authoritative id (what kickoff writes to .codeband_room and uses as
+    # tasks.task_id) vs the semantic key an agent wrongly passes to --task.
+    ROOM = "058dafc0-7913-4c09-98e5-d1b6a96b1358"
+    BOGUS = "subtract-fn"
+
+    def _project(self, tmp_path, *, write_room=True, verify_command=None):
+        """Real project_dir + codeband.yaml + store with an active task row.
+
+        ``write_room`` controls whether the active-room pointer exists. The
+        store path matches what ``handoff._resolve_store`` resolves from config.
+        """
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        workspace = tmp_path / "workspace"
+        cfg = CodebandConfig(
+            repo=RepoConfig(url="https://github.com/example/repo.git",
+                            branch="main"),
+            agents=AgentsConfig(handoff_verify_command=verify_command),
+            workspace=WorkspaceConfig(path=str(workspace)),
+        )
+        cfg.to_yaml(project_dir / "codeband.yaml")
+        if write_room:
+            (project_dir / ".codeband_room").write_text(
+                self.ROOM, encoding="utf-8",
+            )
+        store = StateStore(workspace / "state" / "orchestration.db")
+        store.create_task(self.ROOM, "subtract demo", self.ROOM)
+        return project_dir, store
+
+    def test_start_resolves_room_and_ignores_bogus_task(self, tmp_path):
+        # cb-phase start with a bogus --task label: it must resolve the room
+        # UUID from .codeband_room, seed the subtask FK'd to THAT, and walk to
+        # in_progress — exactly the path that FK-crashed before this fix.
+        project_dir, store = self._project(tmp_path)
+
+        rc = handoff.main([
+            "start", "st-1", "--task", self.BOGUS,
+            "--project-dir", str(project_dir),
+        ])
+        assert rc == 0
+
+        sub = store.get_subtask("st-1")
+        assert sub is not None
+        assert sub.task_id == self.ROOM      # FK target is the room UUID …
+        assert sub.task_id != self.BOGUS     # … never the semantic label
+        assert sub.state == "in_progress"
+
+        # The walk really happened, and no stray task row was minted for the key.
+        trail = [(r["from_state"], r["to_state"]) for r in _log_rows(store, "st-1")]
+        assert trail == [("planned", "assigned"), ("assigned", "in_progress")]
+        assert store.get_task(self.BOGUS) is None
+
+    def test_verify_resolves_room_and_advances(self, tmp_path, monkeypatch):
+        # cb-phase verify with a bogus --task: self-seeds from missing using the
+        # resolved room, then the gate advances it to review_pending. Real clean
+        # git tree + real passing verify command; only the gh PR call is stubbed.
+        project_dir, store = self._project(tmp_path, verify_command="exit 0")
+        repo = _init_repo(tmp_path / "repo")
+        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+
+        rc = handoff.main([
+            "verify", "st-1", "--task", self.BOGUS, "--pr", "42",
+            "--worktree", str(repo), "--project-dir", str(project_dir),
+        ])
+        assert rc == 0
+
+        sub = store.get_subtask("st-1")
+        assert sub.task_id == self.ROOM
+        assert sub.state == "review_pending"
+        last = _log_rows(store, "st-1")[-1]
+        assert (last["from_state"], last["to_state"]) == (
+            "verify_pending", "review_pending",
+        )
+
+    def test_missing_pointer_errors_clean_and_writes_nothing(self, tmp_path, capsys):
+        # No .codeband_room: must NOT FK-crash and must NOT silently proceed —
+        # a clear non-zero "no active task" error, and nothing written.
+        project_dir, store = self._project(tmp_path, write_room=False)
+
+        rc = handoff.main([
+            "start", "st-1", "--task", self.BOGUS,
+            "--project-dir", str(project_dir),
+        ])
+        assert rc == handoff.EXIT_NO_ACTIVE_TASK
+        assert "no active task" in capsys.readouterr().err
+        assert store.get_subtask("st-1") is None      # no partial row
+        assert _log_count(store, "st-1") == 0         # no transition written
+
+    def test_pointer_without_task_row_errors_clean(self, tmp_path, capsys):
+        # Pointer present but names a room with no tasks row (the other failure
+        # branch): same clean error, same nothing-written guarantee.
+        project_dir, store = self._project(tmp_path, write_room=True)
+        (project_dir / ".codeband_room").write_text(
+            "room-does-not-exist", encoding="utf-8",
+        )
+
+        rc = handoff.main([
+            "start", "st-1", "--task", self.BOGUS,
+            "--project-dir", str(project_dir),
+        ])
+        assert rc == handoff.EXIT_NO_ACTIVE_TASK
+        err = capsys.readouterr().err
+        assert "no active task" in err
+        assert "room-does-not-exist" in err
+        assert store.get_subtask("st-1") is None
+        assert _log_count(store, "st-1") == 0
