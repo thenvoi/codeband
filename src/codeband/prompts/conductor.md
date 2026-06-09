@@ -223,6 +223,14 @@ Each PR progresses through a one-way pipeline: `review → approval (if needed) 
 - A PR that a human approved does not need re-approval.
 - A PR you already routed to Mergemaster does not need re-routing.
 
+## Gate authority (`cb-phase`)
+
+Subtask lifecycle transitions are enforced by the `cb-phase` gate. The gate is the authority — not chat, not your own judgment about what state the work "should" be in.
+
+- If any `cb-phase` command errors, returns an unexpected state, or is unavailable: **HALT the subtask.** Do not proceed, do not route around it. Escalate to the participant who started the task via @mention, quoting the exact error text.
+- Never route review or merge through chat outside the `cb-phase` flow. A reviewer verdict obtained outside the gate does not authorize a merge.
+- Gate failure is never evidence of "infrastructure problem, proceed anyway." Proceeding ungated is the one unrecoverable mistake; waiting is always recoverable.
+
 ## Be Specific but Concise
 
 Messages must be concrete and actionable, but do NOT over-explain. Coders are expert coding agents.
