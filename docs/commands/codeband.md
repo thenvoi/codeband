@@ -143,24 +143,24 @@ This is the heart of it. Bypass jam's `--with` (buggy pager) and use the agent A
 ```bash
 cd "$CB_HOME"
 GR_TASK="$ARGUMENTS" "$HOME/.local/share/uv/tools/codeband/bin/python" - "$TARGET_DIR" "$CB_HOME" <<'PYEOF'
-import asyncio, os, sys, glob, json, yaml
+import asyncio, os, subprocess, sys, glob, json, yaml
 from thenvoi_rest import AsyncRestClient, ChatRoomRequest, ChatMessageRequest, ParticipantRequest
 from thenvoi_rest.types import ChatMessageRequestMentionsItem as Mention
 target_dir, cb_home = sys.argv[1], sys.argv[2]
 task = os.environ.get("GR_TASK", "").strip() or "(no task text provided)"
 
-# Find this session's jam state (CC's own agent key) by matching cwd
-cc_key = handle = None
+# Find this session's jam state (CC's own agent key + id) by matching cwd
+cc_key = cc_id = handle = None
 for p in glob.glob(os.path.expanduser("~/.config/jam/sessions/*/*.json")):
     try:
         d = json.load(open(p))
     except Exception:
         continue
-    if d.get("cwd") == target_dir and d.get("agent_api_key"):
-        cc_key, handle = d["agent_api_key"], d.get("handle")
+    if d.get("cwd") == target_dir and d.get("agent_api_key") and d.get("agent_id"):
+        cc_key, cc_id, handle = d["agent_api_key"], d["agent_id"], d.get("handle")
         break
 if not cc_key:
-    print("ERROR: could not find CC's jam agent key for cwd", target_dir); sys.exit(1)
+    print("ERROR: could not find CC's jam agent key/id for cwd", target_dir); sys.exit(1)
 
 cfg = yaml.safe_load(open(os.path.join(cb_home, "codeband.yaml")))
 rest = cfg["band"]["rest_url"]
@@ -174,6 +174,16 @@ async def main():
     cond_name = (await AsyncRestClient(api_key=cond_key, base_url=rest).agent_api_identity.get_agent_me()).data.name
     room = await cc.agent_api_chats.create_agent_chat(chat=ChatRoomRequest())
     rid = room.data.id
+    # Register the task (tasks row + .codeband_room pointer, atomically) BEFORE any agent hears about it.
+    reg_cmd = ["cb", "register-task", "--room", rid, "--owner", cc_id, "--description", task, "--dir", cb_home]
+    if handle:
+        reg_cmd += ["--owner-handle", handle]
+    reg = subprocess.run(reg_cmd, capture_output=True, text=True)
+    if reg.returncode != 0:
+        print("REGISTRATION FAILED (cb register-task exit", reg.returncode, ") — the seed is ABORTED: no task message was sent and no agent was activated.", file=sys.stderr)
+        print(reg.stderr, file=sys.stderr)
+        print("Report this registration failure to the user verbatim and STOP. Do not retry, do not message the swarm.", file=sys.stderr)
+        sys.exit(1)
     for k, aid in agent_ids:
         await cc.agent_api_participants.add_agent_chat_participant(rid, participant=ParticipantRequest(participant_id=aid))
     msg = (f"@{cond_name} here's a new task for the team. Please send it to the Planner for analysis, "
@@ -181,7 +191,6 @@ async def main():
            f"Task: {task}\n\n"
            f"Repository: {cfg['repo']['url']} (branch: {cfg['repo']['branch']})")
     await cc.agent_api_messages.create_agent_chat_message(rid, message=ChatMessageRequest(content=msg, mentions=[Mention(id=cond_id, name=cond_name)]))
-    open(os.path.join(cb_home, ".codeband_room"), "w").write(rid)  # so cb status/cleanup can target this room
     print("ROOM", rid)
     print("HANDLE", handle)
     print("CONDUCTOR", cond_name)
