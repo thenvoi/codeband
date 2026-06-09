@@ -40,6 +40,7 @@ class ClaudePlannerRunner:
         recovery_context: str | None = None,
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
+        from thenvoi.core.types import AdapterFeatures, Capability, Emit
 
         prompt = _build_prompt(custom_prompt, worker_roster)
         if recovery_context:
@@ -56,8 +57,10 @@ class ClaudePlannerRunner:
             custom_section=prompt,
             permission_mode="dontAsk",  # type: ignore[arg-type]
             approval_mode=None,
-            enable_execution_reporting=True,
-            enable_memory_tools=True,
+            features=AdapterFeatures(
+                capabilities={Capability.MEMORY},
+                emit={Emit.EXECUTION, Emit.THOUGHTS},
+            ),
             cwd=workspace,
         )
 

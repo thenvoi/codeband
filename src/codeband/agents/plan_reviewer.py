@@ -30,6 +30,7 @@ class ClaudePlanReviewerRunner:
         recovery_context: str | None = None,
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
+        from thenvoi.core.types import AdapterFeatures, Capability, Emit
 
         from codeband.agents.prompts import build_review_prompt, load_knowledge
 
@@ -46,8 +47,10 @@ class ClaudePlanReviewerRunner:
             permission_mode="dontAsk",  # type: ignore[arg-type]
             approval_mode=None,
             cwd=workspace,
-            enable_execution_reporting=True,
-            enable_memory_tools=True,
+            features=AdapterFeatures(
+                capabilities={Capability.MEMORY},
+                emit={Emit.EXECUTION, Emit.THOUGHTS},
+            ),
         )
 
     @property

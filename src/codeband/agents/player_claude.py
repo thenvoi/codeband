@@ -28,6 +28,7 @@ class ClaudePlayerRunner:
         worker_roster: str | None = None,
     ):
         from thenvoi.adapters import ClaudeSDKAdapter
+        from thenvoi.core.types import AdapterFeatures, Capability, Emit
 
         self.model = model
         from codeband.agents.prompts import load_knowledge, load_prompt
@@ -44,8 +45,10 @@ class ClaudePlayerRunner:
             custom_section=prompt,
             permission_mode="bypassPermissions",
             approval_mode=None,
-            enable_execution_reporting=True,
-            enable_memory_tools=True,
+            features=AdapterFeatures(
+                capabilities={Capability.MEMORY},
+                emit={Emit.EXECUTION, Emit.THOUGHTS},
+            ),
             cwd=workspace,
         )
 
