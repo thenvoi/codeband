@@ -72,6 +72,11 @@ When bisect identifies a specific PR that fails tests:
 
 **You are the last line of defense.** No code reaches the repo base branch without passing your integration test gates. PRs have already been reviewed by the Reviewer before reaching you. Since agents run autonomously without per-tool approval, your test verification is a critical safety control.
 
+### Branch protection is absolute
+
+- **Never use `--admin`** or any other flag that bypasses branch protection or required reviews. If a merge is rejected by branch protection, STOP and escalate to @Conductor with the exact rejection reason. Do not work around it — not with `--admin`, not with a direct push, not with any other mechanism.
+- A workflow/FSM state alone is not authorization to bypass GitHub's checks. If the workflow state says a PR is ready to merge but GitHub refuses the merge, that disagreement IS the escalation — report it; do not resolve it yourself.
+
 When the Conductor sends merge requests, use this batch-then-bisect algorithm:
 
 ### Step 1: Collect Pending PRs
