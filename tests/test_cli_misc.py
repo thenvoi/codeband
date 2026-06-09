@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import click
 import pytest
 from click.testing import CliRunner
@@ -65,3 +67,63 @@ class TestScaleNextSteps:
         assert "Next steps:" in result.output
         assert "cb setup-agents" in result.output
         assert "Restart the interactive shell to pick up changes" in result.output
+
+
+class TestFeedBannerAndHistory:
+    """`cb feed` prints a startup banner (stderr) and exposes --history."""
+
+    @pytest.fixture
+    def _patched_feed(self, monkeypatch):
+        """Stub out everything `cb feed` touches except banner + LiveFeed wiring.
+
+        Captures the kwargs `LiveFeed` is constructed with so we can assert on
+        `show_history`, and no-ops the poll loop so the command returns at once.
+        """
+        captured: dict[str, object] = {}
+
+        class _FakeLiveFeed:
+            def __init__(self, rest, formatter, *, show_history=False):
+                captured["show_history"] = show_history
+
+            def run(self):  # called inside _run_async (also stubbed) — return nothing
+                return None
+
+        monkeypatch.setenv("BAND_API_KEY", "test-key")
+        monkeypatch.setattr(
+            "codeband.cli.load_config",
+            lambda project: SimpleNamespace(band=SimpleNamespace(rest_url="http://x")),
+        )
+        monkeypatch.setattr(
+            "codeband.config.load_agent_config",
+            lambda project: SimpleNamespace(agents={}),
+        )
+        monkeypatch.setattr(
+            "thenvoi.client.rest.AsyncRestClient",
+            lambda **kwargs: object(),
+        )
+        monkeypatch.setattr("codeband.monitoring.feed.LiveFeed", _FakeLiveFeed)
+        monkeypatch.setattr("codeband.cli._run_async", lambda coro: None)
+        return captured
+
+    def test_live_mode_banner_on_stderr_only(self, _patched_feed):
+        runner = CliRunner(mix_stderr=False)
+        result = runner.invoke(cli, ["feed"])
+        assert result.exit_code == 0
+        assert "Live feed" in result.stderr
+        assert "live only" in result.stderr
+        # Banner must not pollute stdout (piped/redirected feed output).
+        assert "Live feed" not in result.stdout
+        assert _patched_feed["show_history"] is False
+
+    def test_history_flag_enables_replay(self, _patched_feed):
+        runner = CliRunner(mix_stderr=False)
+        result = runner.invoke(cli, ["feed", "--history"])
+        assert result.exit_code == 0
+        assert "replaying history" in result.stderr
+        assert _patched_feed["show_history"] is True
+
+    def test_history_short_flag(self, _patched_feed):
+        runner = CliRunner(mix_stderr=False)
+        result = runner.invoke(cli, ["feed", "-H"])
+        assert result.exit_code == 0
+        assert _patched_feed["show_history"] is True

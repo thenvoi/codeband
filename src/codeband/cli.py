@@ -1164,10 +1164,12 @@ def reset(project_dir: str) -> None:
 @click.option("--type", "event_type", default=None, help="Filter by message type (comma-separated)")
 @click.option("--no-thoughts", is_flag=True, help="Hide agent thinking")
 @click.option("--verbose", is_flag=True, help="Show full event content")
+@click.option("--history", "-H", is_flag=True,
+              help="Replay existing room history before streaming new activity")
 @click.option("--dir", "project_dir", default=".", help="Project directory")
 @_project_aware
 def feed(agent: str | None, event_type: str | None, no_thoughts: bool,
-         verbose: bool, project_dir: str) -> None:
+         verbose: bool, history: bool, project_dir: str) -> None:
     """Live stream of agent activity from Band.ai."""
     import os
 
@@ -1198,7 +1200,22 @@ def feed(agent: str | None, event_type: str | None, no_thoughts: bool,
     from thenvoi.client.rest import AsyncRestClient
 
     rest = AsyncRestClient(api_key=api_key, base_url=config.band.rest_url)
-    live_feed = LiveFeed(rest, formatter)
+
+    # Banner to stderr so an empty stream is distinguishable from a dead feed,
+    # and so piped/redirected stdout stays clean.
+    if history:
+        click.echo(
+            "● Live feed — replaying history, then streaming new activity. Ctrl-C to stop.",
+            err=True,
+        )
+    else:
+        click.echo(
+            "● Live feed — watching for new activity (live only). "
+            "Run 'cb log' for history. Ctrl-C to stop.",
+            err=True,
+        )
+
+    live_feed = LiveFeed(rest, formatter, show_history=history)
     _run_async(live_feed.run())
 
 
