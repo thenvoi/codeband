@@ -159,16 +159,21 @@ class WatchdogDaemon:
         self._owner_id = owner_id
         self._owner_handle = owner_handle
         # Escalate-once per subtask, so a blocked subtask is announced to the
-        # owner a single time rather than every patrol.
-        self._owner_escalated: set[str] = set()
+        # owner a single time rather than every patrol. Keyed by
+        # ``(task_id, subtask_id)`` — subtask ids repeat across tasks (planners
+        # emit st-1, st-2, … fresh per plan), so a bare subtask_id key would let
+        # one task's escalation swallow another's.
+        self._owner_escalated: set[tuple[str, str]] = set()
         self._state: dict[str, AgentHealthState] = {}
         # Durable state store (RFC WS1). May be None — when absent the watchdog
         # degrades to chat-recency-only behavior and the mechanical-progress
         # path is skipped entirely.
         self._store = state_store
-        # Per-subtask mechanical-progress health, keyed by subtask_id. Separate
-        # from `_state` (which is keyed by agent_id for the chat-recency path).
-        self._subtask_state: dict[str, AgentHealthState] = {}
+        # Per-subtask mechanical-progress health, keyed by
+        # ``(task_id, subtask_id)`` — task-scoped like the store rows it
+        # mirrors. Separate from `_state` (which is keyed by agent_id for the
+        # chat-recency path).
+        self._subtask_state: dict[tuple[str, str], AgentHealthState] = {}
         self._activity = activity
         self._role_map = agent_id_to_role or {}
         # Rooms we've already warned about for stale state — log once per
@@ -564,7 +569,7 @@ class WatchdogDaemon:
             else None
         )
         transition_ts = await asyncio.to_thread(
-            self._latest_transition, sub.subtask_id,
+            self._latest_transition, sub.subtask_id, sub.task_id,
         )
         # Newest of the two timestamped signals (PR update vs. transition log).
         latest_ts = max(
@@ -572,10 +577,11 @@ class WatchdogDaemon:
             default=None,
         )
 
-        health = self._subtask_state.get(sub.subtask_id)
+        key = (sub.task_id, sub.subtask_id)
+        health = self._subtask_state.get(key)
         if health is None:
             health = AgentHealthState(last_seen=now)
-            self._subtask_state[sub.subtask_id] = health
+            self._subtask_state[key] = health
 
         progressed = False
         if git_head is not None and git_head != health.last_git_head:
@@ -643,13 +649,14 @@ class WatchdogDaemon:
             return None
         return _parse_ts(data.get("updatedAt"))
 
-    def _latest_transition(self, subtask_id: str) -> datetime | None:
+    def _latest_transition(self, subtask_id: str, task_id: str) -> datetime | None:
         """Return ``MAX(timestamp)`` from the transition log for a subtask.
 
         Reads the store's SQLite file directly (read-only) since the
         Workstream-1 store surface does not expose a transition-log query. The
         table may be empty (e.g. before the FSM from Workstream 2 is wired up),
-        in which case this returns ``None``.
+        in which case this returns ``None``. The read is task-scoped — a same-id
+        subtask from another task must not count as progress here.
         """
         db_path = getattr(self._store, "db_path", None)
         if db_path is None:
@@ -658,8 +665,9 @@ class WatchdogDaemon:
             conn = sqlite3.connect(db_path, timeout=5.0)
             try:
                 row = conn.execute(
-                    "SELECT MAX(timestamp) FROM transition_log WHERE subtask_id = ?",
-                    (subtask_id,),
+                    "SELECT MAX(timestamp) FROM transition_log "
+                    "WHERE task_id = ? AND subtask_id = ?",
+                    (task_id, subtask_id),
                 ).fetchone()
             finally:
                 conn.close()
@@ -780,7 +788,8 @@ class WatchdogDaemon:
             return
 
         for sub in subtasks:
-            if sub.state != "blocked" or sub.subtask_id in self._owner_escalated:
+            key = (sub.task_id, sub.subtask_id)
+            if sub.state != "blocked" or key in self._owner_escalated:
                 continue
             # Resolve the owner from the subtask's task row (set at kickoff),
             # falling back to the constructor override. Do this BEFORE flipping
@@ -792,7 +801,7 @@ class WatchdogDaemon:
                 continue
             # Flip escalate-once BEFORE the send so a server rejection (e.g.
             # mention validation) doesn't re-fire the owner every patrol.
-            self._owner_escalated.add(sub.subtask_id)
+            self._owner_escalated.add(key)
             try:
                 await self._send_owner_blocked_escalation(sub, owner_id)
             except Exception:
@@ -833,7 +842,7 @@ class WatchdogDaemon:
         import asyncio
 
         reason = (
-            await asyncio.to_thread(self._blocked_reason, sub.subtask_id)
+            await asyncio.to_thread(self._blocked_reason, sub.subtask_id, sub.task_id)
             or "no mechanical progress / cap reached"
         )
 
@@ -871,12 +880,13 @@ class WatchdogDaemon:
             ),
         )
 
-    def _blocked_reason(self, subtask_id: str) -> str | None:
+    def _blocked_reason(self, subtask_id: str, task_id: str) -> str | None:
         """Return the ``reason`` of the latest ``→ blocked`` transition, if any.
 
         Reads the store's SQLite file directly (read-only), mirroring
-        :meth:`_latest_transition`. Returns ``None`` when no blocked transition
-        is recorded or the reason is empty.
+        :meth:`_latest_transition` — task-scoped, since subtask ids repeat
+        across tasks. Returns ``None`` when no blocked transition is recorded
+        or the reason is empty.
         """
         db_path = getattr(self._store, "db_path", None)
         if db_path is None:
@@ -886,9 +896,9 @@ class WatchdogDaemon:
             try:
                 row = conn.execute(
                     "SELECT reason FROM transition_log "
-                    "WHERE subtask_id = ? AND to_state = 'blocked' "
+                    "WHERE task_id = ? AND subtask_id = ? AND to_state = 'blocked' "
                     "ORDER BY id DESC LIMIT 1",
-                    (subtask_id,),
+                    (task_id, subtask_id),
                 ).fetchone()
             finally:
                 conn.close()

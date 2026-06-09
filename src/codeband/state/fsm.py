@@ -145,8 +145,8 @@ def transition(
         try:
             row = conn.execute(
                 "SELECT state, review_round FROM subtask_states "
-                "WHERE subtask_id = ?",
-                (subtask_id,),
+                "WHERE task_id = ? AND subtask_id = ?",
+                (task_id, subtask_id),
             ).fetchone()
             current_state = row["state"] if row is not None else "planned"
             review_round = row["review_round"] if row is not None else 0
@@ -181,20 +181,24 @@ def transition(
                 conn.execute(
                     "UPDATE subtask_states "
                     "SET state = ?, updated_at = ?, review_round = review_round + 1 "
-                    "WHERE subtask_id = ?",
-                    (new_state, now, subtask_id),
+                    "WHERE task_id = ? AND subtask_id = ?",
+                    (new_state, now, task_id, subtask_id),
                 )
             else:
                 conn.execute(
                     "UPDATE subtask_states SET state = ?, updated_at = ? "
-                    "WHERE subtask_id = ?",
-                    (new_state, now, subtask_id),
+                    "WHERE task_id = ? AND subtask_id = ?",
+                    (new_state, now, task_id, subtask_id),
                 )
             conn.execute(
                 "INSERT INTO transition_log "
-                "(subtask_id, from_state, to_state, caller_role, timestamp, reason) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (subtask_id, current_state, new_state, caller_role, now, reason),
+                "(subtask_id, task_id, from_state, to_state, caller_role, "
+                "timestamp, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    subtask_id, task_id, current_state, new_state,
+                    caller_role, now, reason,
+                ),
             )
             conn.execute("COMMIT")
         except BaseException:

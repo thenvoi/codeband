@@ -56,9 +56,9 @@ def _insert_transition(store, *, timestamp: str) -> None:
     conn = sqlite3.connect(store.db_path)
     conn.execute(
         "INSERT INTO transition_log "
-        "(subtask_id, from_state, to_state, caller_role, timestamp) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (SUBTASK_ID, "planned", "in_progress", "conductor", timestamp),
+        "(subtask_id, task_id, from_state, to_state, caller_role, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (SUBTASK_ID, TASK_ID, "planned", "in_progress", "conductor", timestamp),
     )
     conn.commit()
     conn.close()
@@ -134,7 +134,7 @@ async def test_cycle_cap_marks_blocked_after_no_progress(tmp_path, monkeypatch):
     msg = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
     assert SUBTASK_ID in msg.content
     assert "could not be applied" not in msg.content
-    assert store.get_subtask(SUBTASK_ID).state == "blocked"
+    assert store.get_subtask(SUBTASK_ID, TASK_ID).state == "blocked"
 
 
 @pytest.mark.asyncio
@@ -150,7 +150,7 @@ async def test_git_head_change_resets_counter(tmp_path, monkeypatch):
     await daemon._check_subtask_progress(now)  # baseline
     await daemon._check_subtask_progress(now)  # stale → 1
     await daemon._check_subtask_progress(now)  # stale → 2
-    health = daemon._subtask_state[SUBTASK_ID]
+    health = daemon._subtask_state[(TASK_ID, SUBTASK_ID)]
     assert health.patrol_visits_without_progress == 2
 
     signals["head"] = "def456"  # progress
@@ -170,7 +170,7 @@ async def test_new_transition_resets_counter(tmp_path, monkeypatch):
 
     await daemon._check_subtask_progress(now)  # baseline
     await daemon._check_subtask_progress(now)  # stale → 1
-    health = daemon._subtask_state[SUBTASK_ID]
+    health = daemon._subtask_state[(TASK_ID, SUBTASK_ID)]
     assert health.patrol_visits_without_progress == 1
 
     _insert_transition(store, timestamp="2026-06-01T00:00:00+00:00")
@@ -199,7 +199,7 @@ async def test_fsm_transition_called_when_present(tmp_path, monkeypatch):
         await daemon._check_subtask_progress(now)
 
     # Durable, real effect: the subtask is actually blocked and audit-logged.
-    assert store.get_subtask(SUBTASK_ID).state == "blocked"
+    assert store.get_subtask(SUBTASK_ID, TASK_ID).state == "blocked"
     conn = sqlite3.connect(store.db_path)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -248,7 +248,7 @@ async def test_terminal_subtask_ignored(tmp_path, monkeypatch):
 
     daemon = _daemon(store, config=WatchdogConfig(max_phase_visits=2))
     await daemon._check_subtask_progress(datetime.now(UTC))
-    assert SUBTASK_ID not in daemon._subtask_state
+    assert (TASK_ID, SUBTASK_ID) not in daemon._subtask_state
     assert calls == []
 
 
@@ -469,4 +469,4 @@ async def test_no_resolvable_owner_does_not_burn_escalate_once(tmp_path):
     rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
     # The marker must NOT be set — a later patrol can still escalate once an
     # owner is recorded on the task row.
-    assert SUBTASK_ID not in daemon._owner_escalated
+    assert (TASK_ID, SUBTASK_ID) not in daemon._owner_escalated

@@ -201,6 +201,8 @@ For the full design, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Codeband is alpha software. The current architecture is prompt-driven: agents follow structured prompts, and the Conductor relies on model context plus memory state to track protocol progress. The roadmap is to move more protocol state and branch enforcement into deterministic Python code.
 
+The state-store schema is not migrated across structural changes: after upgrading past the task-scoped subtask-identity change, delete any pre-existing `{workspace}/state/orchestration.db` before the next run.
+
 Pool scaling is supported, but first-dispatch worker arbitration is still prompt-enforced. For best results, scale coders and their opposite-framework reviewers together, keep planner/plan-reviewer pools small, and avoid configurations where several coders must share one reviewer unless you are comfortable with queued or overlapping review turns.
 
 Current planned work:

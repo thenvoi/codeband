@@ -130,7 +130,7 @@ def test_ensure_subtask_creates_row(store: StateStore) -> None:
     store.create_task(task_id="room-1", description="t", room_id="room-1")
     store.ensure_subtask("sub-1", "room-1")
 
-    sub = store.get_subtask("sub-1")
+    sub = store.get_subtask("sub-1", "room-1")
     assert isinstance(sub, SubtaskRow)
     assert sub.subtask_id == "sub-1"
     assert sub.task_id == "room-1"
@@ -159,14 +159,14 @@ def test_ensure_subtask_persists_metadata(store: StateStore) -> None:
         "sub-1", "room-1", assigned_worker="coder-claude-1", metadata={"files": 3}
     )
 
-    sub = store.get_subtask("sub-1")
+    sub = store.get_subtask("sub-1", "room-1")
     assert sub is not None
     assert sub.assigned_worker == "coder-claude-1"
     assert sub.metadata == {"files": 3}
 
 
 def test_get_missing_subtask_returns_none(store: StateStore) -> None:
-    assert store.get_subtask("nope") is None
+    assert store.get_subtask("nope", "room-1") is None
 
 
 def test_list_active_subtasks_excludes_terminal(store: StateStore) -> None:

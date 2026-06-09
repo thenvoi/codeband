@@ -108,7 +108,7 @@ class TestVerifyFromInProgress:
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
 
         assert _run_verify(project_dir, repo) == 0
-        assert store.get_subtask("st-1").state == "review_pending"
+        assert store.get_subtask("st-1", "room-1").state == "review_pending"
 
     def test_dirty_tree_rejects_at_verify_pending(self, tmp_path, monkeypatch):
         project_dir, store = _project(tmp_path)
@@ -117,7 +117,7 @@ class TestVerifyFromInProgress:
         (repo / "uncommitted.txt").write_text("dirty\n", encoding="utf-8")
 
         assert _run_verify(project_dir, repo) == handoff.EXIT_DIRTY_TREE
-        assert store.get_subtask("st-1").state == "verify_pending"
+        assert store.get_subtask("st-1", "room-1").state == "verify_pending"
 
     def test_no_pr_rejects_at_verify_pending(self, tmp_path, monkeypatch):
         project_dir, store = _project(tmp_path)
@@ -126,7 +126,7 @@ class TestVerifyFromInProgress:
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: False)
 
         assert _run_verify(project_dir, repo) == handoff.EXIT_NO_PR
-        assert store.get_subtask("st-1").state == "verify_pending"
+        assert store.get_subtask("st-1", "room-1").state == "verify_pending"
 
     def test_verify_command_failure_rejects(self, tmp_path, monkeypatch):
         project_dir, store = _project(tmp_path, verify_command="exit 1")
@@ -135,7 +135,7 @@ class TestVerifyFromInProgress:
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
 
         assert _run_verify(project_dir, repo) == handoff.EXIT_VERIFY_FAILED
-        assert store.get_subtask("st-1").state == "verify_pending"
+        assert store.get_subtask("st-1", "room-1").state == "verify_pending"
 
 
 class TestVerifyFromReviewFailed:
@@ -148,7 +148,7 @@ class TestVerifyFromReviewFailed:
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
 
         assert _run_verify(project_dir, repo) == 0
-        assert store.get_subtask("st-1").state == "review_pending"
+        assert store.get_subtask("st-1", "room-1").state == "review_pending"
 
     def test_rework_gate_rejection_lands_at_verify_pending(self, tmp_path, monkeypatch):
         project_dir, store = _project(tmp_path)
@@ -157,7 +157,7 @@ class TestVerifyFromReviewFailed:
         (repo / "uncommitted.txt").write_text("dirty\n", encoding="utf-8")
 
         assert _run_verify(project_dir, repo) == handoff.EXIT_DIRTY_TREE
-        assert store.get_subtask("st-1").state == "verify_pending"
+        assert store.get_subtask("st-1", "room-1").state == "verify_pending"
 
 
 class TestVerifyAttemptCapFromInProgress:
@@ -171,10 +171,10 @@ class TestVerifyAttemptCapFromInProgress:
         monkeypatch.setattr(handoff, "_max_verify_attempts", lambda project_dir: 3)
 
         for _ in range(3):
-            store.increment_verify_attempts("st-1")
+            store.increment_verify_attempts("st-1", "room-1")
 
         assert _run_verify(project_dir, repo) == handoff.EXIT_CAP_REACHED
-        assert store.get_subtask("st-1").state == "blocked"
+        assert store.get_subtask("st-1", "room-1").state == "blocked"
 
 
 class TestReviewRoundCapEscalation:
@@ -192,11 +192,11 @@ class TestReviewRoundCapEscalation:
             transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
             transition("st-1", "room-1", "review_failed", caller_role="reviewer", store=store)
 
-        assert store.get_subtask("st-1").review_round == MAX_REVIEW_ROUNDS
-        assert store.get_subtask("st-1").state == "review_failed"
+        assert store.get_subtask("st-1", "room-1").review_round == MAX_REVIEW_ROUNDS
+        assert store.get_subtask("st-1", "room-1").state == "review_failed"
 
         assert _run_verify(project_dir, repo) == handoff.EXIT_CAP_REACHED
-        assert store.get_subtask("st-1").state == "blocked"
+        assert store.get_subtask("st-1", "room-1").state == "blocked"
         err = capsys.readouterr().err
         assert "BLOCKED [review_cap_reached]" in err
 
@@ -211,13 +211,13 @@ class TestVerifyCountDurability:
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
 
         assert _run_verify(project_dir, repo) != 0
-        assert store.get_subtask("st-1").verify_attempts == 1
+        assert store.get_subtask("st-1", "room-1").verify_attempts == 1
 
         db_path = store.db_path
         del store
         reopened = StateStore(db_path)
-        assert reopened.get_subtask("st-1").verify_attempts == 1
-        assert reopened.get_subtask("st-1").state == "verify_pending"
+        assert reopened.get_subtask("st-1", "room-1").verify_attempts == 1
+        assert reopened.get_subtask("st-1", "room-1").state == "verify_pending"
 
 
 class TestNonCapTransitionErrorNotMisclassified:
@@ -234,8 +234,8 @@ class TestNonCapTransitionErrorNotMisclassified:
         repo = _init_repo(tmp_path / "repo")
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
 
-        assert store.get_subtask("st-1").review_round == 1
-        assert store.get_subtask("st-1").review_round < MAX_REVIEW_ROUNDS
+        assert store.get_subtask("st-1", "room-1").review_round == 1
+        assert store.get_subtask("st-1", "room-1").review_round < MAX_REVIEW_ROUNDS
 
         original_transition = handoff.transition
 
@@ -249,7 +249,7 @@ class TestNonCapTransitionErrorNotMisclassified:
 
         assert exit_code == 1
         assert exit_code != handoff.EXIT_CAP_REACHED
-        sub = store.get_subtask("st-1")
+        sub = store.get_subtask("st-1", "room-1")
         assert sub.state == "review_failed"
         assert sub.state != "blocked"
         err = capsys.readouterr().err
@@ -263,10 +263,10 @@ class TestStartSeedsLifecycle:
     def test_start_on_nonexistent_subtask_lands_in_progress(self, tmp_path):
         project_dir, store = _project(tmp_path)
         repo = _init_repo(tmp_path / "repo")
-        assert store.get_subtask("st-1") is None
+        assert store.get_subtask("st-1", "room-1") is None
 
         assert _run_start(project_dir, repo) == 0
-        assert store.get_subtask("st-1").state == "in_progress"
+        assert store.get_subtask("st-1", "room-1").state == "in_progress"
 
     def test_start_is_idempotent_and_non_regressing(self, tmp_path):
         project_dir, store = _project(tmp_path)
@@ -274,7 +274,7 @@ class TestStartSeedsLifecycle:
 
         assert _run_start(project_dir, repo) == 0
         assert _run_start(project_dir, repo) == 0  # twice → still in_progress
-        assert store.get_subtask("st-1").state == "in_progress"
+        assert store.get_subtask("st-1", "room-1").state == "in_progress"
 
     def test_start_never_rewinds_a_later_state(self, tmp_path):
         project_dir, store = _project(tmp_path)
@@ -282,7 +282,7 @@ class TestStartSeedsLifecycle:
         _seed_review_failed(store)  # st-1 at review_failed (round 1)
 
         assert _run_start(project_dir, repo) == 0
-        sub = store.get_subtask("st-1")
+        sub = store.get_subtask("st-1", "room-1")
         assert sub.state == "review_failed"  # not moved backward
         assert sub.review_round == 1  # start touched no counters
 
@@ -293,9 +293,9 @@ class TestStartSeedsLifecycle:
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
 
         assert _run_start(project_dir, repo) == 0
-        assert store.get_subtask("st-1").state == "in_progress"
+        assert store.get_subtask("st-1", "room-1").state == "in_progress"
         assert _run_verify(project_dir, repo) == 0
-        assert store.get_subtask("st-1").state == "review_pending"
+        assert store.get_subtask("st-1", "room-1").state == "review_pending"
 
 
 class TestVerifySelfSeedsFromMissingOrPlanned:
@@ -312,10 +312,10 @@ class TestVerifySelfSeedsFromMissingOrPlanned:
         project_dir, store = _project(tmp_path, verify_command="exit 0")
         repo = _init_repo(tmp_path / "repo")
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
-        assert store.get_subtask("st-1") is None  # nothing ran start
+        assert store.get_subtask("st-1", "room-1") is None  # nothing ran start
 
         assert _run_verify(project_dir, repo) == 0
-        assert store.get_subtask("st-1").state == "review_pending"
+        assert store.get_subtask("st-1", "room-1").state == "review_pending"
 
     def test_verify_on_planned_self_seeds_then_gate_rejects(
         self, tmp_path, monkeypatch
@@ -328,7 +328,7 @@ class TestVerifySelfSeedsFromMissingOrPlanned:
         # Self-seeds past planned, runs the gate, lands at verify_pending — the
         # gate's no_pr rejection, NOT the old "not a valid entry state" exit.
         assert _run_verify(project_dir, repo) == handoff.EXIT_NO_PR
-        assert store.get_subtask("st-1").state == "verify_pending"
+        assert store.get_subtask("st-1", "room-1").state == "verify_pending"
 
     def test_verify_on_assigned_self_seeds_and_passes(self, tmp_path, monkeypatch):
         project_dir, store = _project(tmp_path, verify_command="exit 0")
@@ -337,7 +337,7 @@ class TestVerifySelfSeedsFromMissingOrPlanned:
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
 
         assert _run_verify(project_dir, repo) == 0
-        assert store.get_subtask("st-1").state == "review_pending"
+        assert store.get_subtask("st-1", "room-1").state == "review_pending"
 
 
 class TestInvalidEntryState:

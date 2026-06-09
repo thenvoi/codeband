@@ -4,9 +4,12 @@ A single local SQLite database at ``{workspace_path}/state/orchestration.db``
 holds three tables:
 
 * ``tasks`` — one row per task (keyed by ``room_id``).
-* ``subtask_states`` — one row per subtask, its current FSM state plus
-  assignment / PR / metadata.
-* ``transition_log`` — append-only audit of every state transition.
+* ``subtask_states`` — one row per ``(task_id, subtask_id)``, its current FSM
+  state plus assignment / PR / metadata. Subtask identity is task-scoped:
+  planners number subtasks ``st-1``, ``st-2``, … fresh per plan, so a bare
+  ``subtask_id`` is NOT unique across tasks in a reused DB.
+* ``transition_log`` — append-only audit of every state transition, keyed by
+  ``(task_id, subtask_id)`` like the rows it audits.
 
 Design notes:
 
@@ -106,7 +109,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 CREATE TABLE IF NOT EXISTS subtask_states (
-    subtask_id      TEXT PRIMARY KEY,
+    subtask_id      TEXT NOT NULL,
     task_id         TEXT NOT NULL REFERENCES tasks(task_id),
     state           TEXT NOT NULL DEFAULT 'planned',
     assigned_worker TEXT,
@@ -115,12 +118,14 @@ CREATE TABLE IF NOT EXISTS subtask_states (
     updated_at      TEXT NOT NULL,
     metadata        TEXT,
     review_round    INTEGER NOT NULL DEFAULT 0,
-    verify_attempts INTEGER NOT NULL DEFAULT 0
+    verify_attempts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (task_id, subtask_id)
 );
 
 CREATE TABLE IF NOT EXISTS transition_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     subtask_id  TEXT NOT NULL,
+    task_id     TEXT NOT NULL,
     from_state  TEXT NOT NULL,
     to_state    TEXT NOT NULL,
     caller_role TEXT NOT NULL,
@@ -186,6 +191,11 @@ class StateStore:
         table_info`` so it runs at most once and never on a fresh DB. The
         ``DEFAULT 0`` backfills existing rows, so a subtask that predates the
         review-round cap simply starts the loop at round 0.
+
+        Structural changes are NOT migrated: the task-scoped composite key on
+        ``subtask_states`` / ``transition_log`` only applies to freshly created
+        tables (``CREATE TABLE IF NOT EXISTS`` cannot rewrite a PRIMARY KEY),
+        so pre-existing dev ``orchestration.db`` files must be deleted.
         """
         cols = {
             row[1]
@@ -282,15 +292,22 @@ class StateStore:
                 ),
             )
 
-    def get_subtask(self, subtask_id: str) -> SubtaskRow | None:
-        """Return the subtask row, or ``None`` if it does not exist."""
+    def get_subtask(self, subtask_id: str, task_id: str) -> SubtaskRow | None:
+        """Return the subtask row for ``(task_id, subtask_id)``, or ``None``.
+
+        Subtask ids are only unique *within* a task (planners emit ``st-1``,
+        ``st-2``, … fresh per plan), so the lookup requires both keys — there
+        is deliberately no unscoped fallback.
+        """
         with self._transaction() as conn:
             row = conn.execute(
-                "SELECT * FROM subtask_states WHERE subtask_id = ?", (subtask_id,)
+                "SELECT * FROM subtask_states "
+                "WHERE task_id = ? AND subtask_id = ?",
+                (task_id, subtask_id),
             ).fetchone()
         return _subtask_from_row(row) if row is not None else None
 
-    def increment_verify_attempts(self, subtask_id: str) -> int:
+    def increment_verify_attempts(self, subtask_id: str, task_id: str) -> int:
         """Atomically bump ``verify_attempts`` for a subtask; return the new count.
 
         Called by the ``cb-phase`` handoff CLI on each *rejected* verify attempt
@@ -306,12 +323,13 @@ class StateStore:
             conn.execute(
                 "UPDATE subtask_states "
                 "SET verify_attempts = COALESCE(verify_attempts, 0) + 1, "
-                "updated_at = ? WHERE subtask_id = ?",
-                (_now_iso(), subtask_id),
+                "updated_at = ? WHERE task_id = ? AND subtask_id = ?",
+                (_now_iso(), task_id, subtask_id),
             )
             row = conn.execute(
-                "SELECT verify_attempts FROM subtask_states WHERE subtask_id = ?",
-                (subtask_id,),
+                "SELECT verify_attempts FROM subtask_states "
+                "WHERE task_id = ? AND subtask_id = ?",
+                (task_id, subtask_id),
             ).fetchone()
         return row["verify_attempts"] if row is not None else 0
 

@@ -186,7 +186,7 @@ class TestHappyPath:
             transition("st-1", "room-1", new_state, caller_role=role,
                        reason=f"step-{i}", store=store)
 
-            row = store.get_subtask("st-1")
+            row = store.get_subtask("st-1", "room-1")
             assert row is not None
             assert row.state == new_state
             assert row.task_id == "room-1"
@@ -201,7 +201,7 @@ class TestHappyPath:
             prev_state = new_state
 
         # Terminal — the full ordered trail is durable.
-        assert store.get_subtask("st-1").state == "merged"
+        assert store.get_subtask("st-1", "room-1").state == "merged"
         trail = [(r["from_state"], r["to_state"]) for r in _log_rows(store, "st-1")]
         assert trail == [
             ("planned", "assigned"),
@@ -227,7 +227,7 @@ class TestRejectionEdgesFsm:
         store.create_task("room-1", "demo", "room-1")
         for new_state, role in role_chain:
             transition("st-1", "room-1", new_state, caller_role=role, store=store)
-        assert store.get_subtask("st-1").state == state
+        assert store.get_subtask("st-1", "room-1").state == state
         return store
 
     def test_illegal_edge_not_in_table_rejected(self, tmp_path):
@@ -242,7 +242,7 @@ class TestRejectionEdgesFsm:
 
         # ensure_subtask creates the row at 'planned', but no state change and
         # no transition_log row may be written.
-        assert store.get_subtask("st-1").state == "planned"
+        assert store.get_subtask("st-1", "room-1").state == "planned"
         assert _log_count(store, "st-1") == before == 0
 
     def test_wrong_caller_role_rejected(self, tmp_path):
@@ -257,7 +257,7 @@ class TestRejectionEdgesFsm:
             transition("st-1", "room-1", "in_progress", caller_role="reviewer",
                        store=store)
 
-        assert store.get_subtask("st-1").state == "assigned"
+        assert store.get_subtask("st-1", "room-1").state == "assigned"
         assert _log_count(store, "st-1") == before  # nothing appended
 
 
@@ -324,7 +324,7 @@ class TestCbPhaseGate:
         before = _log_count(store, "st-1")
 
         assert self._run(project_dir, repo) != 0
-        assert store.get_subtask("st-1").state == "verify_pending"
+        assert store.get_subtask("st-1", "room-1").state == "verify_pending"
         assert _log_count(store, "st-1") == before
 
     def test_no_open_pr_rejected(self, tmp_path, monkeypatch):
@@ -335,7 +335,7 @@ class TestCbPhaseGate:
         before = _log_count(store, "st-1")
 
         assert self._run(project_dir, repo) != 0
-        assert store.get_subtask("st-1").state == "verify_pending"
+        assert store.get_subtask("st-1", "room-1").state == "verify_pending"
         assert _log_count(store, "st-1") == before
 
     def test_verify_command_nonzero_rejected(self, tmp_path, monkeypatch):
@@ -347,7 +347,7 @@ class TestCbPhaseGate:
         before = _log_count(store, "st-1")
 
         assert self._run(project_dir, repo) != 0
-        assert store.get_subtask("st-1").state == "verify_pending"
+        assert store.get_subtask("st-1", "room-1").state == "verify_pending"
         assert _log_count(store, "st-1") == before
 
     def test_happy_verify_advances_to_review_pending(self, tmp_path, monkeypatch):
@@ -359,7 +359,7 @@ class TestCbPhaseGate:
         before = _log_count(store, "st-1")
 
         assert self._run(project_dir, repo) == 0
-        assert store.get_subtask("st-1").state == "review_pending"
+        assert store.get_subtask("st-1", "room-1").state == "review_pending"
         assert _log_count(store, "st-1") == before + 1
         last = _log_rows(store, "st-1")[-1]
         assert (last["from_state"], last["to_state"]) == (
@@ -430,7 +430,7 @@ class TestCbPhaseReviewVerdict:
         before = _log_count(store, "st-1")
 
         assert self._run(project_dir, "st-1", "--approve") == 0
-        assert store.get_subtask("st-1").state == "review_passed"
+        assert store.get_subtask("st-1", "room-1").state == "review_passed"
         assert _log_count(store, "st-1") == before + 1
         last = _log_rows(store, "st-1")[-1]
         assert (last["from_state"], last["to_state"]) == (
@@ -443,7 +443,7 @@ class TestCbPhaseReviewVerdict:
         self._seed(store, "st-1", self._TO_REVIEW_PENDING)
 
         assert self._run(project_dir, "st-1", "--reject") == 0
-        sub = store.get_subtask("st-1")
+        sub = store.get_subtask("st-1", "room-1")
         assert sub.state == "review_failed"
         assert sub.review_round == 1  # a reject counts as one failed review round
         last = _log_rows(store, "st-1")[-1]
@@ -482,14 +482,14 @@ class TestCbPhaseReviewVerdict:
     ):
         project_dir, store = self._project(tmp_path)
         self._seed(store, "st-1", chain)
-        state_before = store.get_subtask("st-1").state
+        state_before = store.get_subtask("st-1", "room-1").state
         before = _log_count(store, "st-1")
 
         # The CLI surfaces the FSM rejection as a non-zero exit…
         assert self._run(project_dir, "st-1", "--approve") != 0
         assert self._run(project_dir, "st-1", "--reject") != 0
         # …and nothing was written for either attempt.
-        assert store.get_subtask("st-1").state == state_before
+        assert store.get_subtask("st-1", "room-1").state == state_before
         assert _log_count(store, "st-1") == before
 
         # The FSM is the actual guard: a direct transition raises, writing nothing.
@@ -598,7 +598,7 @@ class TestFanoutInvariants:
         # Every subtask is merged; a SECOND merge of any of them is rejected
         # (terminal state) and appends no extra 'merged' row.
         for sid in sids:
-            assert store.get_subtask(sid).state == "merged"
+            assert store.get_subtask(sid, "room-1").state == "merged"
             merged_rows_before = sum(
                 1 for r in _log_rows(store, sid) if r["to_state"] == "merged"
             )
@@ -633,7 +633,7 @@ class TestFanoutInvariants:
             with pytest.raises(InvalidTransitionError):
                 transition(sid, "room-1", "merged",
                            caller_role="mergemaster", store=store)
-            assert store.get_subtask(sid).state == "review_pending"
+            assert store.get_subtask(sid, "room-1").state == "review_pending"
             assert not any(
                 r["to_state"] in ("merge_pending", "merged")
                 for r in _log_rows(store, sid)
@@ -682,9 +682,9 @@ class TestFanoutInvariants:
         _git(repo, "checkout", "main")
         await daemon._check_subtask_progress(now)          # patrol 3: 0,2 stall→2→blocked
 
-        assert store.get_subtask("st-0").state == "blocked"
-        assert store.get_subtask("st-2").state == "blocked"
-        assert store.get_subtask("st-1").state == "in_progress"
+        assert store.get_subtask("st-0", "room-1").state == "blocked"
+        assert store.get_subtask("st-2", "room-1").state == "blocked"
+        assert store.get_subtask("st-1", "room-1").state == "in_progress"
         # Exactly one blocked-alert per stalled subtask (global, not per-run).
         assert rest.agent_api_messages.create_agent_chat_message.await_count == 2
         # The blocks were applied by the real FSM with the watchdog role.
@@ -730,7 +730,7 @@ class TestWatchdogRealGit:
         now = datetime.now(timezone.utc)
 
         await daemon._check_subtask_progress(now)            # baseline
-        health = daemon._subtask_state["st-a"]
+        health = daemon._subtask_state[("room-1", "st-a")]
         assert health.last_git_head == sha1                  # read REAL git HEAD
         assert health.patrol_visits_without_progress == 0
 
@@ -762,10 +762,10 @@ class TestWatchdogRealGit:
 
         await daemon._check_subtask_progress(now)   # baseline (counts as progress)
         await daemon._check_subtask_progress(now)   # stall → 1
-        assert store.get_subtask("st-b").state == "in_progress"
+        assert store.get_subtask("st-b", "room-1").state == "in_progress"
         await daemon._check_subtask_progress(now)   # stall → 2 == cap → blocked
 
-        assert store.get_subtask("st-b").state == "blocked"
+        assert store.get_subtask("st-b", "room-1").state == "blocked"
         rest.agent_api_messages.create_agent_chat_message.assert_awaited_once()
         msg = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs[
             "message"
@@ -829,35 +829,35 @@ class TestReviewRoundCap:
         # Round 1: assign → … → review_failed, with a real commit.
         self._fsm_cycle_to_review_failed(store, "st-cap", first=True)
         heads.append(_commit_on(repo, "feat-cap", "round-1"))
-        assert store.get_subtask("st-cap").review_round == 1
+        assert store.get_subtask("st-cap", "room-1").review_round == 1
 
         # Rounds 2..MAX: rework is legal each time (count below cap), and every
         # round lands a real commit so HEAD keeps moving.
         for r in range(2, MAX_REVIEW_ROUNDS + 1):
             self._fsm_cycle_to_review_failed(store, "st-cap", first=False)
             heads.append(_commit_on(repo, "feat-cap", f"round-{r}"))
-            assert store.get_subtask("st-cap").review_round == r
+            assert store.get_subtask("st-cap", "room-1").review_round == r
 
         # Every round advanced HEAD — this is a progressing loop, not a stall.
         assert len(set(heads)) == len(heads) == MAX_REVIEW_ROUNDS
 
         # At the cap, the rework edge is rejected with an ACTIONABLE error and
         # NOTHING is written (no state change, no log row, count unchanged).
-        assert store.get_subtask("st-cap").state == "review_failed"
-        assert store.get_subtask("st-cap").review_round == MAX_REVIEW_ROUNDS
+        assert store.get_subtask("st-cap", "room-1").state == "review_failed"
+        assert store.get_subtask("st-cap", "room-1").review_round == MAX_REVIEW_ROUNDS
         before = _log_count(store, "st-cap")
         with pytest.raises(InvalidTransitionError) as exc:
             transition("st-cap", "room-1", "in_progress", caller_role="coder",
                        store=store)
         message = str(exc.value).lower()
         assert "cap" in message and "blocked" in message  # actionable: how to escape
-        assert store.get_subtask("st-cap").state == "review_failed"
-        assert store.get_subtask("st-cap").review_round == MAX_REVIEW_ROUNDS
+        assert store.get_subtask("st-cap", "room-1").state == "review_failed"
+        assert store.get_subtask("st-cap", "room-1").review_round == MAX_REVIEW_ROUNDS
         assert _log_count(store, "st-cap") == before  # nothing written on rejection
 
         # The legal escalation out of review_failed at the cap is → blocked.
         transition("st-cap", "room-1", "blocked", caller_role="coder", store=store)
-        assert store.get_subtask("st-cap").state == "blocked"
+        assert store.get_subtask("st-cap", "room-1").state == "blocked"
         assert _log_count(store, "st-cap") == before + 1
 
     def test_configurable_cap_rejects_at_explicit_max(self, tmp_path):
@@ -866,7 +866,7 @@ class TestReviewRoundCap:
         store = _new_store(tmp_path)
         store.create_task("room-1", "demo", "room-1")
         self._fsm_cycle_to_review_failed(store, "st-1", first=True)  # round 1
-        assert store.get_subtask("st-1").review_round == 1
+        assert store.get_subtask("st-1", "room-1").review_round == 1
 
         before = _log_count(store, "st-1")
         with pytest.raises(InvalidTransitionError):
@@ -877,7 +877,7 @@ class TestReviewRoundCap:
         # The default cap (3) would still allow this rework — proving the bound
         # came from the override, not the default.
         transition("st-1", "room-1", "in_progress", caller_role="coder", store=store)
-        assert store.get_subtask("st-1").state == "in_progress"
+        assert store.get_subtask("st-1", "room-1").state == "in_progress"
 
     # ── durability: the count survives a crash/reopen mid-loop ───────────────
 
@@ -889,20 +889,20 @@ class TestReviewRoundCap:
         store = StateStore(db_path)
         store.create_task("room-1", "demo", "room-1")
         self._drive_to_cap(store, "st-d")
-        assert store.get_subtask("st-d").review_round == MAX_REVIEW_ROUNDS
+        assert store.get_subtask("st-d", "room-1").review_round == MAX_REVIEW_ROUNDS
 
         # Simulate a crash/restart: drop the handle, reopen the same file fresh.
         del store
         reopened = StateStore(db_path)
-        assert reopened.get_subtask("st-d").review_round == MAX_REVIEW_ROUNDS
-        assert reopened.get_subtask("st-d").state == "review_failed"
+        assert reopened.get_subtask("st-d", "room-1").review_round == MAX_REVIEW_ROUNDS
+        assert reopened.get_subtask("st-d", "room-1").state == "review_failed"
 
         before = _log_count(reopened, "st-d")
         with pytest.raises(InvalidTransitionError):
             transition("st-d", "room-1", "in_progress", caller_role="coder",
                        store=reopened)
         assert _log_count(reopened, "st-d") == before          # nothing written
-        assert reopened.get_subtask("st-d").review_round == MAX_REVIEW_ROUNDS
+        assert reopened.get_subtask("st-d", "room-1").review_round == MAX_REVIEW_ROUNDS
 
     # ── isolation: one subtask's cap does not affect another's counter ───────
 
@@ -918,9 +918,9 @@ class TestReviewRoundCap:
         self._fsm_cycle_to_review_failed(store, "st-mid", first=True)
         self._fsm_cycle_to_review_failed(store, "st-mid", first=False)   # → 2
 
-        assert store.get_subtask("st-capped").review_round == MAX_REVIEW_ROUNDS
-        assert store.get_subtask("st-fresh").review_round == 1
-        assert store.get_subtask("st-mid").review_round == 2
+        assert store.get_subtask("st-capped", "room-1").review_round == MAX_REVIEW_ROUNDS
+        assert store.get_subtask("st-fresh", "room-1").review_round == 1
+        assert store.get_subtask("st-mid", "room-1").review_round == 2
 
         # The capped subtask rejects rework…
         with pytest.raises(InvalidTransitionError):
@@ -930,9 +930,9 @@ class TestReviewRoundCap:
         transition("st-fresh", "room-1", "in_progress", caller_role="coder",
                    store=store)
         transition("st-mid", "room-1", "in_progress", caller_role="coder", store=store)
-        assert store.get_subtask("st-fresh").state == "in_progress"
-        assert store.get_subtask("st-mid").state == "in_progress"
-        assert store.get_subtask("st-capped").state == "review_failed"
+        assert store.get_subtask("st-fresh", "room-1").state == "in_progress"
+        assert store.get_subtask("st-mid", "room-1").state == "in_progress"
+        assert store.get_subtask("st-capped", "room-1").state == "review_failed"
 
     # ── independence: round cap and watchdog stall cap catch disjoint faults ──
 
@@ -984,10 +984,10 @@ class TestReviewRoundCap:
 
         # The watchdog never blocked it — HEAD advanced every patrol, so its
         # stall counter kept resetting. This is the loop it cannot catch.
-        assert daemon._subtask_state["st-x"].patrol_visits_without_progress == 0
+        assert daemon._subtask_state[("room-1", "st-x")].patrol_visits_without_progress == 0
         assert rest.agent_api_messages.create_agent_chat_message.await_count == 0
-        assert store.get_subtask("st-x").state == "review_failed"
-        assert store.get_subtask("st-x").review_round == MAX_REVIEW_ROUNDS
+        assert store.get_subtask("st-x", "room-1").state == "review_failed"
+        assert store.get_subtask("st-x", "room-1").review_round == MAX_REVIEW_ROUNDS
 
         # …but the FSM round cap DOES bound the same progressing loop.
         before = _log_count(store, "st-x")
@@ -1113,20 +1113,20 @@ class TestVerifyAttemptCap:
             _git(repo, "checkout", "main")
             await daemon._check_subtask_progress(now)    # watchdog sees progress
             assert self._run_verify(project_dir, repo, "st-v") != 0
-            sub = store.get_subtask("st-v")
+            sub = store.get_subtask("st-v", "room-1")
             assert sub.verify_attempts == i              # one count per rejection
             assert sub.state == "verify_pending"         # rejection ≠ transition
             assert _log_count(store, "st-v") == base_log  # no log row on rejection
 
         # The progressing loop never tripped the (tight) watchdog stall cap.
-        assert daemon._subtask_state["st-v"].patrol_visits_without_progress == 0
+        assert daemon._subtask_state[("room-1", "st-v")].patrol_visits_without_progress == 0
         assert rest.agent_api_messages.create_agent_chat_message.await_count == 0
-        assert store.get_subtask("st-v").verify_attempts == MAX_VERIFY_ATTEMPTS
+        assert store.get_subtask("st-v", "room-1").verify_attempts == MAX_VERIFY_ATTEMPTS
 
         # The next verify call hits the cap: escalate verify_pending → blocked,
         # writing nothing but the blocked transition (no further increment).
         assert self._run_verify(project_dir, repo, "st-v") != 0
-        sub = store.get_subtask("st-v")
+        sub = store.get_subtask("st-v", "room-1")
         assert sub.state == "blocked"
         assert sub.verify_attempts == MAX_VERIFY_ATTEMPTS  # not bumped on escalate
         assert _log_count(store, "st-v") == base_log + 1
@@ -1147,15 +1147,15 @@ class TestVerifyAttemptCap:
 
         assert self._run_verify(project_dir, repo, "st-c") != 0   # attempt 1
         assert self._run_verify(project_dir, repo, "st-c") != 0   # attempt 2
-        sub = store.get_subtask("st-c")
+        sub = store.get_subtask("st-c", "room-1")
         assert sub.verify_attempts == 2
         assert sub.state == "verify_pending"
         assert _log_count(store, "st-c") == base                  # no log rows
 
         # Third call: count has reached the (overridden) cap → blocked.
         assert self._run_verify(project_dir, repo, "st-c") != 0
-        assert store.get_subtask("st-c").state == "blocked"
-        assert store.get_subtask("st-c").verify_attempts == 2     # not re-bumped
+        assert store.get_subtask("st-c", "room-1").state == "blocked"
+        assert store.get_subtask("st-c", "room-1").verify_attempts == 2     # not re-bumped
         assert _log_count(store, "st-c") == base + 1
 
     # ── durability: the count survives a crash/reopen mid-loop ───────────────
@@ -1173,23 +1173,23 @@ class TestVerifyAttemptCap:
 
         assert self._run_verify(project_dir, repo, "st-d") != 0   # attempt 1
         assert self._run_verify(project_dir, repo, "st-d") != 0   # attempt 2
-        assert store.get_subtask("st-d").verify_attempts == 2
+        assert store.get_subtask("st-d", "room-1").verify_attempts == 2
 
         # Simulate a crash/restart: drop the handle, reopen the same file fresh.
         db_path = store.db_path
         del store
         reopened = StateStore(db_path)
-        assert reopened.get_subtask("st-d").verify_attempts == 2  # survived reopen
-        assert reopened.get_subtask("st-d").state == "verify_pending"
+        assert reopened.get_subtask("st-d", "room-1").verify_attempts == 2  # survived reopen
+        assert reopened.get_subtask("st-d", "room-1").state == "verify_pending"
 
         base = _log_count(reopened, "st-d")
         assert self._run_verify(project_dir, repo, "st-d") != 0   # attempt 3 → cap
-        assert reopened.get_subtask("st-d").verify_attempts == 3
+        assert reopened.get_subtask("st-d", "room-1").verify_attempts == 3
         assert _log_count(reopened, "st-d") == base               # still no log row
 
         # Next call after reopen escalates — the cap fired across the "crash".
         assert self._run_verify(project_dir, repo, "st-d") != 0
-        assert reopened.get_subtask("st-d").state == "blocked"
+        assert reopened.get_subtask("st-d", "room-1").state == "blocked"
         assert _log_count(reopened, "st-d") == base + 1
 
     # ── isolation: one subtask's cap does not affect another's counter ───────
@@ -1215,18 +1215,18 @@ class TestVerifyAttemptCap:
         for _ in range(2):
             assert self._run_verify(project_dir, repo, "st-c") != 0
 
-        assert store.get_subtask("st-a").state == "blocked"
-        assert store.get_subtask("st-a").verify_attempts == 3
-        assert store.get_subtask("st-b").state == "verify_pending"
-        assert store.get_subtask("st-b").verify_attempts == 1
-        assert store.get_subtask("st-c").state == "verify_pending"
-        assert store.get_subtask("st-c").verify_attempts == 2
+        assert store.get_subtask("st-a", "room-1").state == "blocked"
+        assert store.get_subtask("st-a", "room-1").verify_attempts == 3
+        assert store.get_subtask("st-b", "room-1").state == "verify_pending"
+        assert store.get_subtask("st-b", "room-1").verify_attempts == 1
+        assert store.get_subtask("st-c", "room-1").state == "verify_pending"
+        assert store.get_subtask("st-c", "room-1").verify_attempts == 2
 
         # The capped subtask is blocked, but the others — below their own caps —
         # keep accepting attempts independently.
         assert self._run_verify(project_dir, repo, "st-b") != 0
-        assert store.get_subtask("st-b").state == "verify_pending"
-        assert store.get_subtask("st-b").verify_attempts == 2
+        assert store.get_subtask("st-b", "room-1").state == "verify_pending"
+        assert store.get_subtask("st-b", "room-1").verify_attempts == 2
 
     # ── interaction: verify cap and review-round cap are independent loops ────
 
@@ -1248,7 +1248,7 @@ class TestVerifyAttemptCap:
         # Two verify rejections: verify_attempts climbs, review_round stays 0.
         assert self._run_verify(project_dir, repo, "st-i") != 0
         assert self._run_verify(project_dir, repo, "st-i") != 0
-        sub = store.get_subtask("st-i")
+        sub = store.get_subtask("st-i", "room-1")
         assert sub.verify_attempts == 2
         assert sub.review_round == 0
 
@@ -1256,7 +1256,7 @@ class TestVerifyAttemptCap:
         # review_pending; a success leaves verify_attempts untouched.
         monkeypatch.setattr(handoff, "_verify_command", lambda project_dir: "exit 0")
         assert self._run_verify(project_dir, repo, "st-i") == 0
-        sub = store.get_subtask("st-i")
+        sub = store.get_subtask("st-i", "room-1")
         assert sub.state == "review_pending"
         assert sub.verify_attempts == 2          # success never increments
         assert sub.review_round == 0
@@ -1265,7 +1265,7 @@ class TestVerifyAttemptCap:
         # other cap's counter and stays put.
         transition("st-i", "room-1", "review_failed", caller_role="reviewer",
                    store=store)
-        sub = store.get_subtask("st-i")
+        sub = store.get_subtask("st-i", "room-1")
         assert sub.review_round == 1
         assert sub.verify_attempts == 2
 
@@ -1326,7 +1326,7 @@ class TestActiveRoomResolution:
         ])
         assert rc == 0
 
-        sub = store.get_subtask("st-1")
+        sub = store.get_subtask("st-1", self.ROOM)
         assert sub is not None
         assert sub.task_id == self.ROOM      # FK target is the room UUID …
         assert sub.task_id != self.BOGUS     # … never the semantic label
@@ -1351,7 +1351,7 @@ class TestActiveRoomResolution:
         ])
         assert rc == 0
 
-        sub = store.get_subtask("st-1")
+        sub = store.get_subtask("st-1", self.ROOM)
         assert sub.task_id == self.ROOM
         assert sub.state == "review_pending"
         last = _log_rows(store, "st-1")[-1]
@@ -1370,7 +1370,7 @@ class TestActiveRoomResolution:
         ])
         assert rc == handoff.EXIT_NO_ACTIVE_TASK
         assert "no active task" in capsys.readouterr().err
-        assert store.get_subtask("st-1") is None      # no partial row
+        assert store.get_subtask("st-1", self.ROOM) is None      # no partial row
         assert _log_count(store, "st-1") == 0         # no transition written
 
     def test_pointer_without_task_row_errors_clean(self, tmp_path, capsys):
@@ -1389,5 +1389,5 @@ class TestActiveRoomResolution:
         err = capsys.readouterr().err
         assert "no active task" in err
         assert "room-does-not-exist" in err
-        assert store.get_subtask("st-1") is None
+        assert store.get_subtask("st-1", self.ROOM) is None
         assert _log_count(store, "st-1") == 0

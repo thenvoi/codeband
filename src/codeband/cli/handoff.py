@@ -258,7 +258,13 @@ def _output_tail(output: str, lines: int = _VERIFY_OUTPUT_TAIL_LINES) -> str:
     return "\n".join(kept[-lines:])
 
 
-def _reject(store: StateStore, subtask_id: str, message: str, exit_code: int) -> int:
+def _reject(
+    store: StateStore,
+    subtask_id: str,
+    task_id: str,
+    message: str,
+    exit_code: int,
+) -> int:
     """Record one rejected verify attempt and return its failure exit code.
 
     Bumps the subtask's durable ``verify_attempts`` (this is the *only* place a
@@ -267,7 +273,7 @@ def _reject(store: StateStore, subtask_id: str, message: str, exit_code: int) ->
     ``transition_log`` row is written — a rejection is a non-event for the FSM;
     only the cumulative attempt count advances.
     """
-    store.increment_verify_attempts(subtask_id)
+    store.increment_verify_attempts(subtask_id, task_id)
     print(message, file=sys.stderr)
     return exit_code
 
@@ -305,7 +311,7 @@ def _walk_to_in_progress(
     (idempotent, non-regressing). A non-``None`` ``error_code`` means a
     transition was rejected and the caller should return it.
     """
-    subtask = store.get_subtask(subtask_id)
+    subtask = store.get_subtask(subtask_id, task_id)
     current = subtask.state if subtask is not None else "planned"
 
     # Already underway, escalated, or terminal — never move backward.
@@ -364,7 +370,7 @@ def _walk_to_verify_pending(
 
     Any other state prints a clear error and returns exit code 1.
     """
-    subtask = store.get_subtask(subtask_id)
+    subtask = store.get_subtask(subtask_id, task_id)
     current = subtask.state if subtask is not None else "planned"
 
     # Backstop for a skipped ``cb-phase start``: a missing/planned/assigned
@@ -471,7 +477,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     # transition (no further increment). The count is read from durable state, so
     # the cap holds across a crash/reopen mid-loop.
     max_attempts = _max_verify_attempts(project_dir)
-    subtask = store.get_subtask(args.subtask_id)
+    subtask = store.get_subtask(args.subtask_id, task_id)
     attempts = subtask.verify_attempts if subtask is not None else 0
     if attempts >= max_attempts:
         try:
@@ -498,6 +504,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         return _reject(
             store,
             args.subtask_id,
+            task_id,
             f"REJECTED [dirty_tree]: {len(dirty)} uncommitted files. "
             "Commit or stash, then re-run cb-phase verify.",
             EXIT_DIRTY_TREE,
@@ -508,6 +515,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         return _reject(
             store,
             args.subtask_id,
+            task_id,
             f"REJECTED [no_pr]: no open PR for branch {branch}. "
             "Push and open a PR, then re-run.",
             EXIT_NO_PR,
@@ -521,6 +529,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
             return _reject(
                 store,
                 args.subtask_id,
+                task_id,
                 f"REJECTED [verify_failed] (exit {code}): {tail}. Fix and re-run.",
                 EXIT_VERIFY_FAILED,
             )
@@ -565,7 +574,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     # Was the subtask already underway/past before we touched it? Only a subtask
     # that is missing/planned/assigned is actually moved by start; anything else
     # is a non-regressing no-op and is reported as such.
-    pre = store.get_subtask(args.subtask_id)
+    pre = store.get_subtask(args.subtask_id, task_id)
     already_underway = pre is not None and pre.state not in _PRE_START_STATES
 
     state, error_code = _walk_to_in_progress(args.subtask_id, task_id, store)

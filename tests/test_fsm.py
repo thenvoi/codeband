@@ -52,9 +52,9 @@ def test_valid_transitions_matches_rfc_table():
 
 
 def test_ensure_subtask_auto_creates_row(store):
-    assert store.get_subtask("st-1") is None
+    assert store.get_subtask("st-1", "room-1") is None
     transition("st-1", "room-1", "assigned", caller_role="conductor", store=store)
-    row = store.get_subtask("st-1")
+    row = store.get_subtask("st-1", "room-1")
     assert row is not None
     assert row.task_id == "room-1"
 
@@ -62,7 +62,7 @@ def test_ensure_subtask_auto_creates_row(store):
 def test_legal_transition_writes_state_and_one_log_row(store):
     transition("st-1", "room-1", "assigned", caller_role="conductor", store=store)
 
-    assert store.get_subtask("st-1").state == "assigned"
+    assert store.get_subtask("st-1", "room-1").state == "assigned"
     rows = _log_rows(store, "st-1")
     assert len(rows) == 1
     assert rows[0]["from_state"] == "planned"
@@ -75,7 +75,7 @@ def test_illegal_target_raises_and_leaves_state_unchanged(store):
     with pytest.raises(InvalidTransitionError):
         transition("st-1", "room-1", "merged", caller_role="conductor", store=store)
 
-    assert store.get_subtask("st-1").state == "planned"
+    assert store.get_subtask("st-1", "room-1").state == "planned"
     assert _log_rows(store, "st-1") == []
 
 
@@ -84,7 +84,7 @@ def test_wrong_caller_role_is_rejected(store):
     with pytest.raises(InvalidTransitionError):
         transition("st-1", "room-1", "assigned", caller_role="coder", store=store)
 
-    assert store.get_subtask("st-1").state == "planned"
+    assert store.get_subtask("st-1", "room-1").state == "planned"
     assert _log_rows(store, "st-1") == []
 
 
@@ -101,7 +101,7 @@ def test_full_happy_path(store):
     for new_state, role in steps:
         transition("st-1", "room-1", new_state, caller_role=role, store=store)
 
-    assert store.get_subtask("st-1").state == "merged"
+    assert store.get_subtask("st-1", "room-1").state == "merged"
     assert len(_log_rows(store, "st-1")) == len(steps)
 
 
@@ -115,14 +115,14 @@ def test_review_failed_loops_back_to_in_progress(store):
         ("in_progress", "coder"),
     ]:
         transition("st-1", "room-1", new_state, caller_role=role, store=store)
-    assert store.get_subtask("st-1").state == "in_progress"
+    assert store.get_subtask("st-1", "room-1").state == "in_progress"
 
 
 def test_conductor_can_abandon_any_non_terminal_state(store):
     transition("st-1", "room-1", "assigned", caller_role="conductor", store=store)
     transition("st-1", "room-1", "in_progress", caller_role="coder", store=store)
     transition("st-1", "room-1", "abandoned", caller_role="conductor", store=store)
-    assert store.get_subtask("st-1").state == "abandoned"
+    assert store.get_subtask("st-1", "room-1").state == "abandoned"
 
 
 def test_no_transition_out_of_terminal_state(store):
@@ -140,4 +140,4 @@ def test_no_transition_out_of_terminal_state(store):
     # merged is terminal — even the conductor cannot abandon it.
     with pytest.raises(InvalidTransitionError):
         transition("st-1", "room-1", "abandoned", caller_role="conductor", store=store)
-    assert store.get_subtask("st-1").state == "merged"
+    assert store.get_subtask("st-1", "room-1").state == "merged"

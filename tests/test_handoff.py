@@ -47,28 +47,28 @@ def _run():
 def test_verify_success_advances_to_review_pending(patch_gates):
     store = patch_gates
     assert _run() == 0
-    assert store.get_subtask("st-1").state == "review_pending"
+    assert store.get_subtask("st-1", "room-1").state == "review_pending"
 
 
 def test_verify_fails_on_dirty_tree(patch_gates, monkeypatch):
     store = patch_gates
     monkeypatch.setattr(handoff, "_uncommitted_files", lambda worktree: ["M a.py"])
     assert _run() != 0
-    assert store.get_subtask("st-1").state == "verify_pending"
+    assert store.get_subtask("st-1", "room-1").state == "verify_pending"
 
 
 def test_verify_fails_on_non_open_pr(patch_gates, monkeypatch):
     store = patch_gates
     monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: False)
     assert _run() != 0
-    assert store.get_subtask("st-1").state == "verify_pending"
+    assert store.get_subtask("st-1", "room-1").state == "verify_pending"
 
 
 def test_verify_fails_on_failing_verify_command(patch_gates, monkeypatch):
     store = patch_gates
     monkeypatch.setattr(handoff, "_run_verify_command", lambda cmd, cwd: (1, "boom"))
     assert _run() != 0
-    assert store.get_subtask("st-1").state == "verify_pending"
+    assert store.get_subtask("st-1", "room-1").state == "verify_pending"
 
 
 def test_verify_skips_command_when_unconfigured(patch_gates, monkeypatch):
@@ -80,7 +80,7 @@ def test_verify_skips_command_when_unconfigured(patch_gates, monkeypatch):
 
     monkeypatch.setattr(handoff, "_run_verify_command", _boom)
     assert _run() == 0
-    assert store.get_subtask("st-1").state == "review_pending"
+    assert store.get_subtask("st-1", "room-1").state == "review_pending"
 
 
 # ── structured, actionable rejections (one stable tag + exit code per mode) ──
@@ -130,12 +130,12 @@ def test_cap_reached_emits_blocked_tag_and_exit_code(patch_gates, monkeypatch, c
     # Force the subtask to the cap so the next call escalates.
     monkeypatch.setattr(handoff, "_max_verify_attempts", lambda project_dir: 3)
     for _ in range(3):
-        store.increment_verify_attempts("st-1")
+        store.increment_verify_attempts("st-1", "room-1")
     assert _run() == handoff.EXIT_CAP_REACHED
     err = capsys.readouterr().err
     assert "BLOCKED [cap_reached]: 3 verify attempts." in err
     assert "Escalated to human; stop and await." in err
-    assert store.get_subtask("st-1").state == "blocked"
+    assert store.get_subtask("st-1", "room-1").state == "blocked"
 
 
 def test_each_failure_mode_has_a_distinct_exit_code():
@@ -207,9 +207,9 @@ def _start(store, monkeypatch, subtask_id):
 
 def test_start_creates_nonexistent_subtask_in_progress(store, monkeypatch, capsys):
     # st-new does not exist yet — start must create it and land it in_progress.
-    assert store.get_subtask("st-new") is None
+    assert store.get_subtask("st-new", "room-1") is None
     assert _start(store, monkeypatch, "st-new") == 0
-    assert store.get_subtask("st-new").state == "in_progress"
+    assert store.get_subtask("st-new", "room-1").state == "in_progress"
     out = capsys.readouterr().out
     assert "subtask st-new → in_progress (task room-1)." in out
 
@@ -218,14 +218,14 @@ def test_start_is_idempotent(store, monkeypatch, capsys):
     # Starting twice is a no-op the second time — never moves backward.
     assert _start(store, monkeypatch, "st-new") == 0
     assert _start(store, monkeypatch, "st-new") == 0
-    assert store.get_subtask("st-new").state == "in_progress"
+    assert store.get_subtask("st-new", "room-1").state == "in_progress"
     assert "already at in_progress" in capsys.readouterr().out
 
 
 def test_start_non_regressing_on_verify_pending(store, monkeypatch, capsys):
     # The `store` fixture leaves st-1 at verify_pending — start must not rewind.
     assert _start(store, monkeypatch, "st-1") == 0
-    assert store.get_subtask("st-1").state == "verify_pending"
+    assert store.get_subtask("st-1", "room-1").state == "verify_pending"
     assert "already at verify_pending" in capsys.readouterr().out
 
 
@@ -233,7 +233,7 @@ def test_start_non_regressing_on_review_failed(store, monkeypatch, capsys):
     transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
     transition("st-1", "room-1", "review_failed", caller_role="reviewer", store=store)
     assert _start(store, monkeypatch, "st-1") == 0
-    assert store.get_subtask("st-1").state == "review_failed"
+    assert store.get_subtask("st-1", "room-1").state == "review_failed"
     assert "already at review_failed" in capsys.readouterr().out
 
 
@@ -242,7 +242,7 @@ def test_start_from_assigned_walks_to_in_progress(monkeypatch, tmp_path, capsys)
     s.create_task(task_id="room-1", description="demo", room_id="room-1")
     transition("st-1", "room-1", "assigned", caller_role="conductor", store=s)
     assert _start(s, monkeypatch, "st-1") == 0
-    assert s.get_subtask("st-1").state == "in_progress"
+    assert s.get_subtask("st-1", "room-1").state == "in_progress"
 
 
 def test_start_task_label_is_optional(store, monkeypatch):
@@ -255,7 +255,7 @@ def test_start_task_label_is_optional(store, monkeypatch):
         lambda project_dir, s, task_arg: ("room-1", None),
     )
     assert handoff.main(["start", "st-new"]) == 0
-    assert store.get_subtask("st-new").state == "in_progress"
+    assert store.get_subtask("st-new", "room-1").state == "in_progress"
 
 
 # ── cb-phase review — reviewer verdict routed through the FSM ────────────────
@@ -272,13 +272,13 @@ def _review(monkeypatch, store, verdict: str):
 def test_review_approve_advances_to_review_passed(store, monkeypatch):
     transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
     assert _review(monkeypatch, store, "--approve") == 0
-    assert store.get_subtask("st-1").state == "review_passed"
+    assert store.get_subtask("st-1", "room-1").state == "review_passed"
 
 
 def test_review_reject_advances_to_review_failed(store, monkeypatch):
     transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
     assert _review(monkeypatch, store, "--reject") == 0
-    sub = store.get_subtask("st-1")
+    sub = store.get_subtask("st-1", "room-1")
     assert sub.state == "review_failed"
     assert sub.review_round == 1  # a reject is one failed review round
 
@@ -286,7 +286,7 @@ def test_review_reject_advances_to_review_failed(store, monkeypatch):
 def test_review_illegal_from_verify_pending_writes_nothing(store, monkeypatch, capsys):
     # The `store` fixture leaves st-1 at verify_pending (no review yet).
     assert _review(monkeypatch, store, "--approve") == 1
-    assert store.get_subtask("st-1").state == "verify_pending"
+    assert store.get_subtask("st-1", "room-1").state == "verify_pending"
     assert "review verdict rejected" in capsys.readouterr().err
 
 
