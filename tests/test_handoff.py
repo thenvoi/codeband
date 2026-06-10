@@ -84,6 +84,42 @@ def test_verify_skips_command_when_unconfigured(patch_gates, monkeypatch):
     assert store.get_subtask("st-1", "room-1").state == "review_pending"
 
 
+# ── rebase rework: verify re-entry from the merge gate's send-back ──────────
+
+def _send_back_for_rebase(store):
+    """Drive the fixture subtask to ``needs_rebase`` via legal FSM edges."""
+    transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
+    transition("st-1", "room-1", "review_passed", caller_role="reviewer", store=store)
+    transition("st-1", "room-1", "needs_rebase", caller_role="mergemaster", store=store)
+
+
+def test_verify_from_needs_rebase_walks_to_review_pending(patch_gates):
+    """The rebased commit re-enters the normal verify walk — the coder's only
+    exit from the merge gate's send-back is ``cb-phase verify``."""
+    store = patch_gates
+    _send_back_for_rebase(store)
+    assert _run() == 0
+    assert store.get_subtask("st-1", "room-1").state == "review_pending"
+
+
+def test_verify_from_needs_rebase_ignores_review_round_cap(patch_gates, monkeypatch):
+    """A merge-gate send-back is not a review round: the walk must succeed even
+    when the review-round cap would reject a ``review_failed`` rework."""
+    store = patch_gates
+    monkeypatch.setattr(handoff, "_max_review_rounds", lambda project_dir: 0)
+    _send_back_for_rebase(store)
+    assert _run() == 0
+    assert store.get_subtask("st-1", "room-1").state == "review_pending"
+
+
+def test_verify_from_needs_rebase_does_not_increment_review_round(patch_gates):
+    store = patch_gates
+    _send_back_for_rebase(store)
+    before = store.get_subtask("st-1", "room-1").review_round
+    assert _run() == 0
+    assert store.get_subtask("st-1", "room-1").review_round == before
+
+
 # ── structured, actionable rejections (one stable tag + exit code per mode) ──
 
 def test_dirty_tree_emits_tag_and_exit_code(patch_gates, monkeypatch, capsys):

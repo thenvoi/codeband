@@ -391,6 +391,12 @@ def _walk_to_verify_pending(
     * ``review_failed`` — check the review-round cap first; if at cap,
       escalate to ``blocked``. Otherwise walk
       ``review_failed → in_progress → verify_pending``.
+    * ``needs_rebase`` — the merge gate's send-back (head moved while queued,
+      or a conflicted PR). Walk ``needs_rebase → in_progress →
+      verify_pending``: the rebased commit re-enters the normal verify walk
+      and re-earns every SHA-pinned verdict from scratch. This rework is NOT
+      a review round — the review-round cap counts reviewer rejections, not
+      merge-gate send-backs; the watchdog's stall cap backstops a rebase loop.
 
     Any other state prints a clear error and returns exit code 1.
     """
@@ -465,10 +471,33 @@ def _walk_to_verify_pending(
             return 1
         return None
 
+    if current == "needs_rebase":
+        try:
+            transition(
+                subtask_id, task_id, "in_progress",
+                caller_role="coder",
+                reason="cb-phase verify: auto-walk needs_rebase → in_progress (rebase rework)",
+                store=store,
+            )
+        except InvalidTransitionError as exc:
+            print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
+            return 1
+        try:
+            transition(
+                subtask_id, task_id, "verify_pending",
+                caller_role="coder",
+                reason="cb-phase verify: auto-walk in_progress → verify_pending",
+                store=store,
+            )
+        except InvalidTransitionError as exc:
+            print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
+            return 1
+        return None
+
     print(
         f"cb-phase: subtask {subtask_id!r} is in state {current!r}, "
         "which is not a valid entry state for cb-phase verify. "
-        "Expected in_progress, verify_pending, or review_failed.",
+        "Expected in_progress, verify_pending, review_failed, or needs_rebase.",
         file=sys.stderr,
     )
     return 1
