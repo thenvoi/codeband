@@ -342,6 +342,9 @@ class TestSendTask:
         """send_task uses human API to create room and send task message."""
         from codeband.orchestration import kickoff
 
+        # Registration resolves the default verdict list (includes 'verify'),
+        # so the config must carry an executable verify command.
+        sample_config.agents.handoff_verify_command = "true"
         sample_agent_config.to_yaml(tmp_path / "agent_config.yaml")
 
         human_client = AsyncMock()
@@ -404,6 +407,9 @@ class TestSendTask:
         """Task message includes repo URL and branch for specificity."""
         from codeband.orchestration import kickoff
 
+        # Registration resolves the default verdict list (includes 'verify'),
+        # so the config must carry an executable verify command.
+        sample_config.agents.handoff_verify_command = "true"
         sample_agent_config.to_yaml(tmp_path / "agent_config.yaml")
 
         human_client = AsyncMock()

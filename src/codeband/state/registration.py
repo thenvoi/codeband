@@ -34,12 +34,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from codeband.config import AgentsConfig
 from codeband.state.store import StateStore
 
 # Name of the active-room pointer file, relative to the project dir. The
 # single source of truth for "which task is active" as read by cb-phase,
 # cb approve/reject, cleanup and doctor.
 ROOM_POINTER_NAME = ".codeband_room"
+
+# The verdict legs registration understands. Anything else in
+# ``agents.required_verdicts`` is a typo and fails registration loudly —
+# a misspelled verdict must never silently become an ungated merge.
+KNOWN_VERDICTS: frozenset[str] = frozenset({"verify", "review"})
+
+# What an absent ``agents.required_verdicts`` key resolves to: both legs.
+DEFAULT_REQUIRED_VERDICTS: tuple[str, ...] = ("verify", "review")
 
 
 @dataclass
@@ -52,6 +61,66 @@ class RegistrationResult:
     # "superseded"    — a *different* active task was superseded first.
     outcome: str
     superseded_task_id: str | None = None
+
+
+def resolve_required_verdicts(agents: AgentsConfig) -> list[str]:
+    """Resolve and validate ``agents.required_verdicts`` for registration.
+
+    Resolution happens at *registration* time — the result is snapshotted onto
+    the tasks row so later config edits cannot change an in-flight task:
+
+    * key absent (``None``) → the default ``["verify", "review"]``
+    * present and non-empty → taken verbatim
+    * explicitly ``[]`` → :class:`ValueError`, unless
+      ``agents.allow_ungated_merge`` is also set (the deliberately ugly
+      escape hatch for "merge with zero verdicts")
+
+    Every verdict in the resolved list is then validated as *executable*:
+
+    * an unknown name (not in :data:`KNOWN_VERDICTS`) fails, naming the entry
+      — typo protection, since a missing verdict would silently weaken gating
+    * ``verify`` requires ``agents.handoff_verify_command`` to be set; this
+      intentionally turns a fresh install's silent verify-skip into a loud
+      fail-at-seed
+    * ``review`` has no precondition
+
+    Raises :class:`ValueError` with an actionable message; returns the
+    resolved list on success.
+    """
+    configured = agents.required_verdicts
+    if configured is None:
+        resolved = list(DEFAULT_REQUIRED_VERDICTS)
+    elif not configured:
+        if not agents.allow_ungated_merge:
+            raise ValueError(
+                "register_task: agents.required_verdicts is [] — every PR "
+                "would merge with zero verdicts. Set agents.allow_ungated_merge: "
+                "true to explicitly allow ungated merges, or list the verdicts "
+                "this task requires (e.g. [verify, review])."
+            )
+        resolved = []
+    else:
+        resolved = list(configured)
+
+    unknown = [v for v in resolved if v not in KNOWN_VERDICTS]
+    if unknown:
+        known = ", ".join(sorted(KNOWN_VERDICTS))
+        raise ValueError(
+            f"register_task: unknown verdict {unknown[0]!r} in "
+            f"agents.required_verdicts — known verdicts: {known}. "
+            "Fix the typo or remove the entry."
+        )
+
+    if "verify" in resolved and not agents.handoff_verify_command:
+        raise ValueError(
+            "register_task: agents.required_verdicts includes 'verify' but "
+            "agents.handoff_verify_command is not set — the verify leg would "
+            "be unexecutable. Set your test command (agents."
+            "handoff_verify_command in codeband.yaml) or remove 'verify' "
+            "from required_verdicts."
+        )
+
+    return resolved
 
 
 def _read_pointer(project_dir: Path) -> str | None:
@@ -69,6 +138,7 @@ def register_task(
     room_id: str,
     description: str,
     owner_id: str,
+    agents: AgentsConfig,
     owner_handle: str | None = None,
     project_dir: Path,
     store: StateStore,
@@ -76,13 +146,24 @@ def register_task(
     """Register *room_id* as the active task: tasks row + pointer, row-first.
 
     ``owner_id`` is required and must be non-empty — a missing owner raises
-    :class:`ValueError` before anything is written. One active task at a time
-    is enforced here: if the pointer currently names a *different* room with a
-    live row, that task is marked ``'superseded'`` in the same transaction
-    that registers the new one. Re-registering the same room updates only the
-    owner fields (description/status untouched) and rewrites the pointer, so
-    the call is safe to retry — including over the half-states the old writers
-    could leave behind (row-without-pointer, pointer-without-row).
+    :class:`ValueError` before anything is written. ``agents`` (the project's
+    ``AgentsConfig``) is required because the task's verdict legs are resolved
+    and validated here, at registration time — see
+    :func:`resolve_required_verdicts` — and the resolved list is snapshotted
+    onto the tasks row. Validation lives in this primitive, not the CLI
+    wrappers, so both seeding paths (``cb task`` and ``cb register-task``)
+    fail loudly on an unexecutable or mistyped verdict list before anything
+    is written.
+
+    One active task at a time is enforced here: if the pointer currently
+    names a *different* room with a live row, that task is marked
+    ``'superseded'`` in the same transaction that registers the new one.
+    Re-registering the same room updates only the owner fields and the
+    verdict snapshot (description/status untouched — the snapshot is
+    re-resolved from *current* config, consistent with re-register-updates-
+    owner) and rewrites the pointer, so the call is safe to retry — including
+    over the half-states the old writers could leave behind
+    (row-without-pointer, pointer-without-row).
 
     The pointer write happens strictly after the DB commit and any failure
     propagates loudly: the resulting row-without-pointer state is exactly what
@@ -95,6 +176,10 @@ def register_task(
         )
     if not room_id:
         raise ValueError("register_task: room_id is required and must be non-empty.")
+
+    # Resolve + validate the verdict legs before anything is written — a bad
+    # list (typo, unexecutable verify, accidental []) must fail at seed time.
+    required_verdicts = resolve_required_verdicts(agents)
 
     pointer_room = _read_pointer(project_dir)
 
@@ -113,6 +198,7 @@ def register_task(
         room_id=room_id,
         owner_id=owner_id,
         owner_handle=owner_handle,
+        required_verdicts=required_verdicts,
         supersede_task_id=supersede_task_id,
     )
 

@@ -37,6 +37,7 @@ def patch_gates(monkeypatch, store):
     monkeypatch.setattr(handoff, "_current_branch", lambda worktree: "feat-x")
     monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
     monkeypatch.setattr(handoff, "_run_verify_command", lambda cmd, cwd: (0, ""))
+    monkeypatch.setattr(handoff, "_git_head", lambda worktree: "cafe1234")
     return store
 
 
@@ -266,6 +267,7 @@ def _review(monkeypatch, store, verdict: str):
         handoff, "_resolve_task_id",
         lambda project_dir, s, task_arg: ("room-1", None),
     )
+    monkeypatch.setattr(handoff, "_git_head", lambda worktree: "beef5678")
     return handoff.main(["review", "st-1", "--task", "room-1", verdict])
 
 
@@ -294,3 +296,72 @@ def test_review_requires_an_explicit_verdict():
     # Mutually-exclusive --approve/--reject is required → argparse exits.
     with pytest.raises(SystemExit):
         handoff.main(["review", "st-1", "--task", "room-1"])
+
+
+# ── head_sha — SHA-pinned verify / review outcome records (additive) ─────────
+
+def _last_transition_row(store, to_state: str):
+    """Fetch the newest transition_log row landing in ``to_state``."""
+    import sqlite3
+
+    conn = sqlite3.connect(store.db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(
+            "SELECT * FROM transition_log WHERE to_state = ? ORDER BY id DESC LIMIT 1",
+            (to_state,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def test_verify_outcome_records_head_sha(patch_gates):
+    store = patch_gates
+    assert _run() == 0
+    row = _last_transition_row(store, "review_pending")
+    assert row is not None
+    assert row["head_sha"] == "cafe1234"
+
+
+def test_review_outcome_records_head_sha_on_approve(store, monkeypatch):
+    transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
+    assert _review(monkeypatch, store, "--approve") == 0
+    row = _last_transition_row(store, "review_passed")
+    assert row is not None
+    assert row["head_sha"] == "beef5678"
+
+
+def test_review_outcome_records_head_sha_on_reject(store, monkeypatch):
+    transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
+    assert _review(monkeypatch, store, "--reject") == 0
+    row = _last_transition_row(store, "review_failed")
+    assert row is not None
+    assert row["head_sha"] == "beef5678"
+
+
+def test_transitions_without_head_sha_store_null(store):
+    # Every non-outcome transition (and any legacy caller) leaves head_sha
+    # NULL — the field is additive and the read path is untouched.
+    row = _last_transition_row(store, "verify_pending")  # from the fixture walk
+    assert row is not None
+    assert row["head_sha"] is None
+
+
+def test_git_head_returns_none_outside_a_repo(monkeypatch, tmp_path):
+    class _Result:
+        returncode = 128
+        stdout = ""
+
+    monkeypatch.setattr(handoff.subprocess, "run", lambda cmd, **kw: _Result())
+    # Best-effort by design: an unresolvable HEAD pins nothing (NULL), it
+    # never blocks the transition.
+    assert handoff._git_head(tmp_path) is None
+
+
+def test_git_head_parses_rev_parse_output(monkeypatch, tmp_path):
+    class _Result:
+        returncode = 0
+        stdout = "a3f9c2e8b1d4567890abcdef12345678deadbeef\n"
+
+    monkeypatch.setattr(handoff.subprocess, "run", lambda cmd, **kw: _Result())
+    assert handoff._git_head(tmp_path) == "a3f9c2e8b1d4567890abcdef12345678deadbeef"

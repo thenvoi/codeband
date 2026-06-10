@@ -73,6 +73,13 @@ class TaskRow:
     # handle like ``yoni/claude-lyra-5ebd4a``). Informational only — mentions
     # use ``owner_id``; nullable like ``owner_id`` and for the same reasons.
     owner_handle: str | None = None
+    # Verdict legs this task requires before merge, resolved from config at
+    # registration time and snapshotted here (JSON list in the DB) so a
+    # mid-task config edit cannot change an in-flight task's requirements.
+    # Nullable — predates the column on older DBs; nothing reads it yet (the
+    # merge leg lands in the next chunk). ``register_task`` writes it on every
+    # registration, including re-registration (snapshot refresh).
+    required_verdicts: list[str] | None = None
 
 
 @dataclass
@@ -105,13 +112,14 @@ class SubtaskRow:
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
-    task_id      TEXT PRIMARY KEY,
-    description  TEXT NOT NULL,
-    room_id      TEXT NOT NULL,
-    created_at   TEXT NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'active',
-    owner_id     TEXT,
-    owner_handle TEXT
+    task_id           TEXT PRIMARY KEY,
+    description       TEXT NOT NULL,
+    room_id           TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'active',
+    owner_id          TEXT,
+    owner_handle      TEXT,
+    required_verdicts TEXT
 );
 
 CREATE TABLE IF NOT EXISTS subtask_states (
@@ -136,7 +144,8 @@ CREATE TABLE IF NOT EXISTS transition_log (
     to_state    TEXT NOT NULL,
     caller_role TEXT NOT NULL,
     timestamp   TEXT NOT NULL,
-    reason      TEXT
+    reason      TEXT,
+    head_sha    TEXT
 );
 """
 
@@ -224,6 +233,14 @@ class StateStore:
             conn.execute("ALTER TABLE tasks ADD COLUMN owner_id TEXT")
         if "owner_handle" not in task_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN owner_handle TEXT")
+        if "required_verdicts" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN required_verdicts TEXT")
+        log_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(transition_log)").fetchall()
+        }
+        if "head_sha" not in log_cols:
+            conn.execute("ALTER TABLE transition_log ADD COLUMN head_sha TEXT")
 
     # ── tasks ──────────────────────────────────────────────────────────────
 
@@ -266,6 +283,7 @@ class StateStore:
         description: str,
         room_id: str,
         owner_id: str,
+        required_verdicts: list[str],
         owner_handle: str | None = None,
         supersede_task_id: str | None = None,
     ) -> str:
@@ -279,14 +297,19 @@ class StateStore:
         * If ``supersede_task_id`` is given, that row's status is set to
           ``'superseded'`` (idempotent UPDATE; a missing row is a no-op).
         * If a row for ``task_id`` already exists, only ``owner_id`` /
-          ``owner_handle`` are updated — description, status and created_at
-          are deliberately left untouched (re-registration changes ownership,
-          not history).
+          ``owner_handle`` / ``required_verdicts`` are updated — description,
+          status and created_at are deliberately left untouched
+          (re-registration changes ownership and refreshes the verdict
+          snapshot from *current* config, not history).
         * Otherwise a fresh ``'active'`` row is inserted.
+
+        ``required_verdicts`` is the list already resolved and validated by
+        ``register_task`` — this method only persists it (JSON-encoded).
 
         Returns ``"inserted"`` or ``"updated"`` so the caller can report the
         outcome without a second read.
         """
+        verdicts_json = json.dumps(required_verdicts)
         with self._transaction() as conn:
             if supersede_task_id is not None:
                 conn.execute(
@@ -298,17 +321,25 @@ class StateStore:
             ).fetchone()
             if existing is not None:
                 conn.execute(
-                    "UPDATE tasks SET owner_id = ?, owner_handle = ? "
-                    "WHERE task_id = ?",
-                    (owner_id, owner_handle, task_id),
+                    "UPDATE tasks SET owner_id = ?, owner_handle = ?, "
+                    "required_verdicts = ? WHERE task_id = ?",
+                    (owner_id, owner_handle, verdicts_json, task_id),
                 )
                 return "updated"
             conn.execute(
                 "INSERT INTO tasks "
                 "(task_id, description, room_id, created_at, status, "
-                "owner_id, owner_handle) "
-                "VALUES (?, ?, ?, ?, 'active', ?, ?)",
-                (task_id, description, room_id, _now_iso(), owner_id, owner_handle),
+                "owner_id, owner_handle, required_verdicts) "
+                "VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+                (
+                    task_id,
+                    description,
+                    room_id,
+                    _now_iso(),
+                    owner_id,
+                    owner_handle,
+                    verdicts_json,
+                ),
             )
             return "inserted"
 
@@ -419,6 +450,7 @@ def _task_from_row(row: sqlite3.Row) -> TaskRow:
     # migration ran (or in a hand-built row in tests); tolerate their absence
     # rather than KeyError.
     keys = row.keys()
+    raw_verdicts = row["required_verdicts"] if "required_verdicts" in keys else None
     return TaskRow(
         task_id=row["task_id"],
         description=row["description"],
@@ -427,6 +459,7 @@ def _task_from_row(row: sqlite3.Row) -> TaskRow:
         status=row["status"],
         owner_id=row["owner_id"] if "owner_id" in keys else None,
         owner_handle=row["owner_handle"] if "owner_handle" in keys else None,
+        required_verdicts=json.loads(raw_verdicts) if raw_verdicts else None,
     )
 
 

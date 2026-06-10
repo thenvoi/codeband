@@ -112,6 +112,95 @@ def test_owner_id_migrated_onto_legacy_tasks_table(tmp_path: Path) -> None:
     assert store.get_task("new-1").owner_id == "owner-9"
 
 
+def test_required_verdicts_and_head_sha_migrated_onto_legacy_schema(
+    tmp_path: Path,
+) -> None:
+    """Pre-existing tasks / transition_log tables gain the Stage-2 columns.
+
+    ``CREATE TABLE IF NOT EXISTS`` is a no-op against old tables, so the
+    guarded ALTERs must add ``tasks.required_verdicts`` and
+    ``transition_log.head_sha``; legacy rows read back with both NULL (no
+    KeyError, read path untouched) and new writes can persist them.
+    """
+    db_path = tmp_path / "state" / "orchestration.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE tasks ("
+        "task_id TEXT PRIMARY KEY, description TEXT NOT NULL, "
+        "room_id TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'active', "
+        "owner_id TEXT, owner_handle TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (task_id, description, room_id, created_at, status) "
+        "VALUES ('old-1', 'legacy', 'old-1', '2020-01-01T00:00:00+00:00', 'active')"
+    )
+    conn.execute(
+        "CREATE TABLE transition_log ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "subtask_id TEXT NOT NULL, task_id TEXT NOT NULL, "
+        "from_state TEXT NOT NULL, to_state TEXT NOT NULL, "
+        "caller_role TEXT NOT NULL, timestamp TEXT NOT NULL, reason TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO transition_log "
+        "(subtask_id, task_id, from_state, to_state, caller_role, timestamp) "
+        "VALUES ('st-1', 'old-1', 'planned', 'assigned', 'conductor', "
+        "'2020-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    store = StateStore(db_path)  # runs the guarded migrations
+
+    legacy = store.get_task("old-1")
+    assert legacy is not None
+    assert legacy.required_verdicts is None  # legacy row tolerated as NULL
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM transition_log").fetchone()
+        assert row["head_sha"] is None  # column added, legacy row NULL
+    finally:
+        conn.close()
+
+    # New registration writes persist the snapshot through the migrated table.
+    store.register_task_atomic(
+        task_id="new-1",
+        description="t",
+        room_id="new-1",
+        owner_id="owner-9",
+        required_verdicts=["review"],
+    )
+    assert store.get_task("new-1").required_verdicts == ["review"]
+
+
+def test_register_task_atomic_snapshot_roundtrip(store: StateStore) -> None:
+    # Insert persists the resolved list; an update (re-register) overwrites it.
+    store.register_task_atomic(
+        task_id="room-1",
+        description="t",
+        room_id="room-1",
+        owner_id="owner-1",
+        required_verdicts=["verify", "review"],
+    )
+    assert store.get_task("room-1").required_verdicts == ["verify", "review"]
+
+    outcome = store.register_task_atomic(
+        task_id="room-1",
+        description="ignored on update",
+        room_id="room-1",
+        owner_id="owner-2",
+        required_verdicts=[],
+    )
+    assert outcome == "updated"
+    task = store.get_task("room-1")
+    assert task.required_verdicts == []  # empty snapshot is [] — not None
+    assert task.owner_id == "owner-2"
+
+
 def test_get_missing_task_returns_none(store: StateStore) -> None:
     assert store.get_task("nope") is None
 

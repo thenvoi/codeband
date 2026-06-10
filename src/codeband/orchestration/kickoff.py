@@ -98,6 +98,7 @@ async def send_task(config: CodebandConfig, project_dir: Path, description: str)
         room_id=room_id,
         description=description,
         owner_id=owner_id,
+        agents=config.agents,
         owner_handle=owner_handle,
         project_dir=project_dir,
         store=store,

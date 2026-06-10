@@ -543,6 +543,7 @@ def register_task_cmd(
             room_id=room_id,
             description=description,
             owner_id=owner_id,
+            agents=config.agents,
             owner_handle=owner_handle,
             project_dir=project,
             store=store,

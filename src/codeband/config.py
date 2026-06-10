@@ -237,6 +237,22 @@ class AgentsConfig(_StrictModel):
     # ``review_pending``. ``None`` skips the verify gate.
     handoff_verify_command: str | None = None
 
+    # Verdict legs a subtask must clear before its PR may merge (Stage-2).
+    # Resolved and validated at task-registration time by
+    # ``state/registration.py`` — the single writer of "a task exists" — and
+    # snapshotted onto the tasks row, so a mid-task config edit cannot change
+    # what an in-flight task requires. ``None`` (key absent) resolves to the
+    # default ``["verify", "review"]``; an explicit ``[]`` is a loud error
+    # unless ``allow_ungated_merge`` is also set. Known verdicts: ``verify``
+    # (requires ``handoff_verify_command``) and ``review``. Nothing consumes
+    # the snapshot yet — the merge leg lands in the next chunk.
+    required_verdicts: list[str] | None = None
+
+    # Escape hatch for ``required_verdicts: []`` — the name is deliberately
+    # ugly so "every PR merges with zero verdicts" can never be configured by
+    # accident or typo. Without it, an empty list fails registration.
+    allow_ungated_merge: bool = False
+
     # Per-subtask review-round cap (RFC two-level model). Once a subtask has
     # entered ``review_failed`` this many times, the FSM refuses to send it back
     # to ``in_progress`` for another rework cycle — the only legal move is

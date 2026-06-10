@@ -18,8 +18,20 @@ import pytest
 from click.testing import CliRunner
 
 from codeband.cli import cli as cb_cli
+from codeband.config import AgentsConfig
 from codeband.state import StateStore
 from codeband.state.registration import register_task
+
+
+def _gated_agents(**overrides) -> AgentsConfig:
+    """An AgentsConfig whose default verdict list is executable.
+
+    The default ``required_verdicts`` resolution includes ``verify``, which
+    requires ``handoff_verify_command`` — fresh-install registration now fails
+    loudly without one (that change is the point). Tests that just exercise
+    the registration mechanics use this config so they pass the verdict gate.
+    """
+    return AgentsConfig(handoff_verify_command="true", **overrides)
 
 
 @pytest.fixture
@@ -54,6 +66,7 @@ class TestRegisterTask:
             description="do the thing",
             owner_id="owner-7",
             owner_handle="yoni/claude-abc",
+            agents=_gated_agents(),
             project_dir=tmp_path,
             store=store,
         )
@@ -77,6 +90,7 @@ class TestRegisterTask:
                 room_id="room-1",
                 description="do the thing",
                 owner_id=bad_owner,
+                agents=_gated_agents(),
                 project_dir=tmp_path,
                 store=store,
             )
@@ -93,6 +107,7 @@ class TestRegisterTask:
             description="original description",
             owner_id="owner-a",
             owner_handle="handle-a",
+            agents=_gated_agents(),
             project_dir=tmp_path,
             store=store,
         )
@@ -101,6 +116,7 @@ class TestRegisterTask:
             description="DIFFERENT description must be ignored",
             owner_id="owner-b",
             owner_handle="handle-b",
+            agents=_gated_agents(),
             project_dir=tmp_path,
             store=store,
         )
@@ -123,6 +139,7 @@ class TestRegisterTask:
             room_id="room-old",
             description="old task",
             owner_id="owner-a",
+            agents=_gated_agents(),
             project_dir=tmp_path,
             store=store,
         )
@@ -130,6 +147,7 @@ class TestRegisterTask:
             room_id="room-new",
             description="new task",
             owner_id="owner-b",
+            agents=_gated_agents(),
             project_dir=tmp_path,
             store=store,
         )
@@ -152,6 +170,7 @@ class TestRegisterTask:
             room_id="room-1",
             description="real task",
             owner_id="owner-7",
+            agents=_gated_agents(),
             project_dir=tmp_path,
             store=store,
         )
@@ -171,6 +190,7 @@ class TestRegisterTask:
             room_id="room-1",
             description="task",
             owner_id="owner-a",
+            agents=_gated_agents(),
             project_dir=tmp_path,
             store=store,
         )
@@ -180,6 +200,7 @@ class TestRegisterTask:
             room_id="room-1",
             description="task",
             owner_id="owner-b",
+            agents=_gated_agents(),
             project_dir=tmp_path,
             store=store,
         )
@@ -190,6 +211,117 @@ class TestRegisterTask:
         assert task is not None
         assert task.owner_id == "owner-b"
         assert _task_row_count(store.db_path) == 1
+
+
+# ---------------------------------------------------------------------------
+# required_verdicts — resolution, fail-loud validation, snapshot (Stage-2)
+# ---------------------------------------------------------------------------
+
+class TestRequiredVerdicts:
+    def _register(self, tmp_path: Path, store: StateStore, agents, room: str = "room-1"):
+        return register_task(
+            room_id=room,
+            description="task",
+            owner_id="owner-1",
+            agents=agents,
+            project_dir=tmp_path,
+            store=store,
+        )
+
+    def test_absent_key_snapshots_default_list(
+        self, tmp_path: Path, store: StateStore
+    ) -> None:
+        # required_verdicts not set (None) → resolves to the full default.
+        self._register(tmp_path, store, _gated_agents())
+        task = store.get_task("room-1")
+        assert task is not None
+        assert task.required_verdicts == ["verify", "review"]
+
+    def test_explicit_list_snapshotted_verbatim(
+        self, tmp_path: Path, store: StateStore
+    ) -> None:
+        agents = _gated_agents(required_verdicts=["review", "verify"])
+        self._register(tmp_path, store, agents)
+        task = store.get_task("room-1")
+        assert task is not None
+        assert task.required_verdicts == ["review", "verify"]  # order preserved
+
+    def test_empty_list_without_flag_fails_and_writes_nothing(
+        self, tmp_path: Path, store: StateStore
+    ) -> None:
+        agents = _gated_agents(required_verdicts=[])
+        with pytest.raises(ValueError, match="allow_ungated_merge"):
+            self._register(tmp_path, store, agents)
+        assert store.get_task("room-1") is None
+        assert _task_row_count(store.db_path) == 0
+        assert not _pointer(tmp_path).exists()
+
+    def test_empty_list_with_ugly_flag_snapshots_empty(
+        self, tmp_path: Path, store: StateStore
+    ) -> None:
+        agents = _gated_agents(required_verdicts=[], allow_ungated_merge=True)
+        result = self._register(tmp_path, store, agents)
+        assert result.outcome == "registered"
+        task = store.get_task("room-1")
+        assert task is not None
+        assert task.required_verdicts == []
+
+    def test_verify_without_command_fails_at_seed(
+        self, tmp_path: Path, store: StateStore
+    ) -> None:
+        # Fresh-install shape: default list (includes 'verify'), no command.
+        # Was a silent verify-skip at run time; now a loud fail at seed time.
+        agents = AgentsConfig()  # handoff_verify_command unset
+        with pytest.raises(ValueError, match="handoff_verify_command"):
+            self._register(tmp_path, store, agents)
+        assert _task_row_count(store.db_path) == 0
+        assert not _pointer(tmp_path).exists()
+
+    def test_unknown_verdict_fails_naming_the_entry(
+        self, tmp_path: Path, store: StateStore
+    ) -> None:
+        agents = _gated_agents(required_verdicts=["verify", "vibes"])
+        with pytest.raises(ValueError, match="'vibes'"):
+            self._register(tmp_path, store, agents)
+        assert _task_row_count(store.db_path) == 0
+        assert not _pointer(tmp_path).exists()
+
+    def test_reregister_refreshes_snapshot_from_current_config(
+        self, tmp_path: Path, store: StateStore
+    ) -> None:
+        self._register(tmp_path, store, _gated_agents())
+        assert store.get_task("room-1").required_verdicts == ["verify", "review"]
+
+        # Config changed between registrations — a re-register of the same
+        # room re-resolves and overwrites the snapshot (consistent with
+        # re-register-updates-owner).
+        result = self._register(
+            tmp_path, store, _gated_agents(required_verdicts=["review"])
+        )
+        assert result.outcome == "re-registered"
+        task = store.get_task("room-1")
+        assert task.required_verdicts == ["review"]
+        # Description/status remain untouched by re-registration.
+        assert task.status == "active"
+
+    def test_superseding_room_gets_its_own_fresh_snapshot(
+        self, tmp_path: Path, store: StateStore
+    ) -> None:
+        self._register(tmp_path, store, _gated_agents(), room="room-old")
+        result = self._register(
+            tmp_path,
+            store,
+            _gated_agents(required_verdicts=["review"]),
+            room="room-new",
+        )
+        assert result.outcome == "superseded"
+        old = store.get_task("room-old")
+        new = store.get_task("room-new")
+        # The superseded row keeps its original snapshot; the new row carries
+        # the list resolved from current config.
+        assert old.status == "superseded"
+        assert old.required_verdicts == ["verify", "review"]
+        assert new.required_verdicts == ["review"]
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +418,9 @@ class TestSendTaskRegistration:
     async def test_registration_ordered_before_message_post(
         self, sample_config, sample_agent_config, tmp_path: Path, monkeypatch
     ) -> None:
+        # Registration resolves the default verdict list (includes 'verify'),
+        # so the config must carry an executable verify command.
+        sample_config.agents.handoff_verify_command = "true"
         sample_agent_config.to_yaml(tmp_path / "agent_config.yaml")
         human_client = _make_human_client("room-123")
 
@@ -328,6 +463,9 @@ class TestSendTaskRegistration:
 
 class TestRegisterTaskCli:
     def test_success_exits_zero_and_registers(self, sample_config, tmp_path: Path) -> None:
+        # Registration resolves the default verdict list (includes 'verify'),
+        # so the config must carry an executable verify command.
+        sample_config.agents.handoff_verify_command = "true"
         sample_config.to_yaml(tmp_path / "codeband.yaml")
 
         runner = CliRunner()

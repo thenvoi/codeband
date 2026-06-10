@@ -210,6 +210,25 @@ def _uncommitted_files(worktree: Path) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
+def _git_head(worktree: Path) -> str | None:
+    """Return ``git rev-parse HEAD`` of ``worktree``, or ``None`` if unknown.
+
+    Captured at record-write time so the verify and review outcome records pin
+    the exact commit the verdict was rendered against. Best-effort by design:
+    a failure yields ``None`` (stored as ``NULL``, same as legacy rows) rather
+    than blocking the transition — SHA pinning is additive/shadow in this
+    chunk; nothing reads it yet.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def _current_branch(worktree: Path) -> str | None:
     """Return the current branch name in ``worktree`` (or ``None`` if unknown).
 
@@ -542,6 +561,9 @@ def _cmd_verify(args: argparse.Namespace) -> int:
             caller_role="coder",
             reason="cb-phase verify",
             store=store,
+            # Pin the verify outcome to the exact commit the gates ran against
+            # (the tree is clean, so HEAD is precisely what was verified).
+            head_sha=_git_head(worktree),
         )
     except InvalidTransitionError as exc:
         print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
@@ -626,6 +648,9 @@ def _cmd_review(args: argparse.Namespace) -> int:
             caller_role="reviewer",
             reason="cb-phase review --approve" if args.approve else "cb-phase review --reject",
             store=store,
+            # Pin the verdict to the commit it was rendered against — HEAD of
+            # the reviewer's worktree (``--worktree``, default cwd).
+            head_sha=_git_head(Path(args.worktree).resolve()),
         )
     except InvalidTransitionError as exc:
         print(f"cb-phase: review verdict rejected — {exc}", file=sys.stderr)
@@ -708,6 +733,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     verdict.add_argument(
         "--reject", action="store_true", help="Fail review → review_failed.",
+    )
+    review.add_argument(
+        "--worktree",
+        default=".",
+        help="Path to the reviewed checkout — its HEAD is pinned onto the "
+        "verdict record (default: cwd).",
     )
     review.add_argument(
         "--project-dir",

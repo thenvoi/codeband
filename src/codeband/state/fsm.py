@@ -106,6 +106,7 @@ def transition(
     *,
     store: StateStore,
     max_review_rounds: int = MAX_REVIEW_ROUNDS,
+    head_sha: str | None = None,
 ) -> None:
     """Atomically advance a subtask to ``new_state``.
 
@@ -132,6 +133,13 @@ def transition(
     signature matches the RFC while still letting callers (and tests) inject the
     concrete store and override the cap (e.g. from
     ``config.AgentsConfig.max_review_rounds``).
+
+    ``head_sha`` (keyword-only, default ``None``) pins the transition to the
+    exact commit it was recorded against — ``cb-phase`` passes the worktree's
+    ``git rev-parse HEAD`` on the verify and review outcome transitions, so a
+    verdict can later be checked against what the PR actually merges. Stored
+    verbatim in the ``transition_log`` row; ``NULL`` for every other caller
+    and for legacy rows. Nothing reads it yet.
     """
     store.ensure_subtask(subtask_id, task_id)
 
@@ -193,11 +201,11 @@ def transition(
             conn.execute(
                 "INSERT INTO transition_log "
                 "(subtask_id, task_id, from_state, to_state, caller_role, "
-                "timestamp, reason) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "timestamp, reason, head_sha) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     subtask_id, task_id, current_state, new_state,
-                    caller_role, now, reason,
+                    caller_role, now, reason, head_sha,
                 ),
             )
             conn.execute("COMMIT")
