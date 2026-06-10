@@ -90,6 +90,19 @@ def _is_terminal_protocol_message(content: Any) -> bool:
     return isinstance(content, str) and bool(_TERMINAL_PROTOCOL_RE.search(content))
 
 
+# Subtask states the mechanical-progress patrol watches (RFC WS4 + Stage-2).
+# ``in_progress`` / ``verify_pending`` are the coder's working states;
+# ``merge_pending`` is the merge queue — a subtask resting there with no
+# progress (e.g. an approval request nobody acted on) goes stale like any
+# other and escalates through the standard stall path. The watchdog never
+# queries GitHub to *reconcile* a merge — that is ``cb-phase merge``'s
+# idempotent reconcile step; only the existing PR-activity progress signal
+# applies here, as it does to every patrolled state.
+_PATROLLED_SUBTASK_STATES: frozenset[str] = frozenset(
+    {"in_progress", "verify_pending", "merge_pending"}
+)
+
+
 @dataclasses.dataclass
 class AgentHealthState:
     """In-memory health tracking for a single agent."""
@@ -631,7 +644,7 @@ class WatchdogDaemon:
     async def _check_subtask_progress(self, now: datetime) -> None:
         """Detect stalled subtasks via mechanical signals and escalate (RFC WS4).
 
-        For each in-flight subtask in ``in_progress``/``verify_pending`` we read
+        For each in-flight subtask in :data:`_PATROLLED_SUBTASK_STATES` we read
         three deterministic signals — the git HEAD of its branch, its PR's
         ``updatedAt`` and the most recent ``transition_log`` timestamp. A change
         in any of them since the last patrol counts as progress and resets the
@@ -660,7 +673,7 @@ class WatchdogDaemon:
             # the watchdog. None (read failure) degrades to no filtering.
             if active_task_ids is not None and sub.task_id not in active_task_ids:
                 continue
-            if sub.state not in {"in_progress", "verify_pending"}:
+            if sub.state not in _PATROLLED_SUBTASK_STATES:
                 continue
             try:
                 await self._check_one_subtask(sub, now)

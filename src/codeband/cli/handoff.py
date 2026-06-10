@@ -55,6 +55,11 @@ next step, and each failure mode exits with a distinct code.
 The tags (``dirty_tree`` / ``no_pr`` / ``verify_failed`` / ``cap_reached``) are
 part of the contract — they feed the verify-gate activation's telemetry later —
 so keep them stable.
+
+The ``cb-phase merge`` subcommand (the gated merge-execution leg) lives in
+``cli/merge.py`` — it talks to Band for the approval request, which this
+module deliberately never does — and is registered onto this parser in
+:func:`_build_parser`.
 """
 
 from __future__ import annotations
@@ -746,6 +751,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Project directory containing codeband.yaml (default: cwd).",
     )
     review.set_defaults(func=_cmd_review)
+
+    # The merge leg lives in its own module (``cli/merge.py``): it talks to
+    # Band for the approval request, which this module deliberately never
+    # does. Imported here (not at module top) because merge.py imports this
+    # module's task/store resolvers.
+    from codeband.cli.merge import add_merge_subparser
+
+    add_merge_subparser(sub)
     return parser
 
 

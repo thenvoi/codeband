@@ -47,6 +47,11 @@ ROOM_POINTER_NAME = ".codeband_room"
 # a misspelled verdict must never silently become an ungated merge.
 KNOWN_VERDICTS: frozenset[str] = frozenset({"verify", "review"})
 
+# What an absent / default ``agents.merge_approval`` resolves to: the task
+# owner approves every merge. Snapshotted onto the tasks row like
+# ``required_verdicts``.
+DEFAULT_MERGE_APPROVAL = "owner"
+
 # What an absent ``agents.required_verdicts`` key resolves to: both legs.
 DEFAULT_REQUIRED_VERDICTS: tuple[str, ...] = ("verify", "review")
 
@@ -123,6 +128,47 @@ def resolve_required_verdicts(agents: AgentsConfig) -> list[str]:
     return resolved
 
 
+def resolve_merge_approval(agents: AgentsConfig) -> str:
+    """Resolve and validate ``agents.merge_approval`` for registration.
+
+    Like :func:`resolve_required_verdicts`, resolution happens at
+    *registration* time and the result is snapshotted onto the tasks row, so a
+    mid-task config edit cannot change an in-flight task's approver:
+
+    * ``"owner"`` (the default) — the task owner approves every merge
+    * ``"human:<handle>"`` — the named human approves (the handle must be
+      non-empty)
+    * ``"none"`` — reserved: rejected with a message saying unapproved merges
+      are not supported in V1
+    * anything else fails registration loudly (typo protection — a mistyped
+      approver must never silently become a different routing)
+
+    Raises :class:`ValueError` with an actionable message; returns the
+    validated value on success.
+    """
+    value = agents.merge_approval
+    if value == "owner":
+        return value
+    if value == "none":
+        raise ValueError(
+            "register_task: agents.merge_approval is 'none' — unapproved "
+            "merges are not supported in V1. Use 'owner' (default) or "
+            "'human:<handle>'."
+        )
+    if value.startswith("human:"):
+        handle = value[len("human:"):]
+        if not handle:
+            raise ValueError(
+                "register_task: agents.merge_approval 'human:' names no "
+                "handle — use 'human:<handle>' (e.g. human:yoni)."
+            )
+        return value
+    raise ValueError(
+        f"register_task: unknown merge_approval {value!r} — expected 'owner' "
+        "(default) or 'human:<handle>'. Fix the typo."
+    )
+
+
 def _read_pointer(project_dir: Path) -> str | None:
     """Return the current pointer's room id, or ``None`` if absent/empty."""
     pointer = project_dir / ROOM_POINTER_NAME
@@ -177,9 +223,11 @@ def register_task(
     if not room_id:
         raise ValueError("register_task: room_id is required and must be non-empty.")
 
-    # Resolve + validate the verdict legs before anything is written — a bad
-    # list (typo, unexecutable verify, accidental []) must fail at seed time.
+    # Resolve + validate the verdict legs and the merge approver before
+    # anything is written — a bad list (typo, unexecutable verify, accidental
+    # []) or a bad approver must fail at seed time.
     required_verdicts = resolve_required_verdicts(agents)
+    merge_approval = resolve_merge_approval(agents)
 
     pointer_room = _read_pointer(project_dir)
 
@@ -199,6 +247,7 @@ def register_task(
         owner_id=owner_id,
         owner_handle=owner_handle,
         required_verdicts=required_verdicts,
+        merge_approval=merge_approval,
         supersede_task_id=supersede_task_id,
     )
 

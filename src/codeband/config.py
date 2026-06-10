@@ -253,6 +253,16 @@ class AgentsConfig(_StrictModel):
     # accident or typo. Without it, an empty list fails registration.
     allow_ungated_merge: bool = False
 
+    # Who must approve a ``cb-phase merge`` before it executes (Stage-2).
+    # ``"owner"`` (default) routes the approval request to the task owner;
+    # ``"human:<handle>"`` routes it to the named human. Resolved and
+    # validated at task-registration time by ``state/registration.py`` —
+    # exactly like ``required_verdicts`` — and snapshotted onto the tasks row,
+    # so a mid-task config edit cannot change an in-flight task's approver.
+    # ``"none"`` is reserved and rejected (unapproved merges are not supported
+    # in V1); any other value fails registration loudly.
+    merge_approval: str = "owner"
+
     # Per-subtask review-round cap (RFC two-level model). Once a subtask has
     # entered ``review_failed`` this many times, the FSM refuses to send it back
     # to ``in_progress`` for another rework cycle — the only legal move is

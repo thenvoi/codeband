@@ -177,6 +177,76 @@ def test_required_verdicts_and_head_sha_migrated_onto_legacy_schema(
     assert store.get_task("new-1").required_verdicts == ["review"]
 
 
+def test_merge_approval_columns_migrated_onto_legacy_schema(
+    tmp_path: Path,
+) -> None:
+    """Pre-existing tasks / subtask_states tables gain the merge-leg columns.
+
+    The guarded ALTERs must add ``tasks.merge_approval`` and the subtask grant
+    columns (``merge_approved_by`` / ``merge_approved_sha`` /
+    ``merge_approval_requested_sha``); legacy rows read back with all NULL and
+    the new writers persist through the migrated tables.
+    """
+    db_path = tmp_path / "state" / "orchestration.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE tasks ("
+        "task_id TEXT PRIMARY KEY, description TEXT NOT NULL, "
+        "room_id TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'active', "
+        "owner_id TEXT, owner_handle TEXT, required_verdicts TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (task_id, description, room_id, created_at, status) "
+        "VALUES ('old-1', 'legacy', 'old-1', '2020-01-01T00:00:00+00:00', 'active')"
+    )
+    conn.execute(
+        "CREATE TABLE subtask_states ("
+        "subtask_id TEXT NOT NULL, "
+        "task_id TEXT NOT NULL REFERENCES tasks(task_id), "
+        "state TEXT NOT NULL DEFAULT 'planned', assigned_worker TEXT, "
+        "pr_number INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+        "metadata TEXT, review_round INTEGER NOT NULL DEFAULT 0, "
+        "verify_attempts INTEGER NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (task_id, subtask_id))"
+    )
+    conn.execute(
+        "INSERT INTO subtask_states "
+        "(subtask_id, task_id, state, created_at, updated_at) "
+        "VALUES ('st-1', 'old-1', 'planned', "
+        "'2020-01-01T00:00:00+00:00', '2020-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    store = StateStore(db_path)  # runs the guarded migrations
+
+    assert store.get_task("old-1").merge_approval is None  # legacy NULL
+    legacy_sub = store.get_subtask("st-1", "old-1")
+    assert legacy_sub.merge_approved_by is None
+    assert legacy_sub.merge_approved_sha is None
+    assert legacy_sub.merge_approval_requested_sha is None
+
+    # New writes persist through the migrated tables.
+    store.set_pr_number("st-1", "old-1", 42)
+    store.record_merge_approval(
+        "st-1", "old-1", approved_by="owner", approved_sha="sha-1",
+    )
+    store.mark_merge_approval_requested("st-1", "old-1", "sha-1")
+    sub = store.get_subtask("st-1", "old-1")
+    assert sub.pr_number == 42
+    assert sub.merge_approved_by == "owner"
+    assert sub.merge_approved_sha == "sha-1"
+    assert sub.merge_approval_requested_sha == "sha-1"
+
+    store.register_task_atomic(
+        task_id="new-1", description="t", room_id="new-1", owner_id="owner-9",
+        required_verdicts=["review"], merge_approval="human:yoni",
+    )
+    assert store.get_task("new-1").merge_approval == "human:yoni"
+
+
 def test_register_task_atomic_snapshot_roundtrip(store: StateStore) -> None:
     # Insert persists the resolved list; an update (re-register) overwrites it.
     store.register_task_atomic(

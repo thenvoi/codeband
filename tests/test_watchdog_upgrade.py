@@ -138,6 +138,30 @@ async def test_cycle_cap_marks_blocked_after_no_progress(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_merge_pending_subtask_is_patrolled(tmp_path, monkeypatch):
+    """A stale ``merge_pending`` subtask escalates like any patrolled state.
+
+    Stage-2 chunk 2b adds ``merge_pending`` to the patrolled set: a subtask
+    resting in the merge queue with no mechanical progress (e.g. an approval
+    request nobody acted on) crosses the standard stall cap and is blocked +
+    escalated once. The watchdog performs no merge reconciliation — that is
+    ``cb-phase merge``'s job.
+    """
+    store = _seed_store(tmp_path, state="merge_pending")
+    signals = {"head": "abc123", "pr_updated": BASELINE_PR_TS}
+    monkeypatch.setattr(subprocess, "run", _make_run(signals))
+
+    rest = _mock_rest()
+    daemon = _daemon(store, config=WatchdogConfig(max_phase_visits=2), rest=rest)
+    now = datetime.now(UTC)
+    for _ in range(5):
+        await daemon._check_subtask_progress(now)
+
+    rest.agent_api_messages.create_agent_chat_message.assert_awaited_once()
+    assert store.get_subtask(SUBTASK_ID, TASK_ID).state == "blocked"
+
+
+@pytest.mark.asyncio
 async def test_git_head_change_resets_counter(tmp_path, monkeypatch):
     """A git-HEAD change resets patrol_visits_without_progress to 0."""
     store = _seed_store(tmp_path)

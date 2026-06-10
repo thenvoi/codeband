@@ -81,10 +81,16 @@ class TaskRow:
     # Verdict legs this task requires before merge, resolved from config at
     # registration time and snapshotted here (JSON list in the DB) so a
     # mid-task config edit cannot change an in-flight task's requirements.
-    # Nullable — predates the column on older DBs; nothing reads it yet (the
-    # merge leg lands in the next chunk). ``register_task`` writes it on every
-    # registration, including re-registration (snapshot refresh).
+    # Nullable — predates the column on older DBs. ``register_task`` writes it
+    # on every registration, including re-registration (snapshot refresh); the
+    # merge-eligibility gate (state/fsm.py) reads it.
     required_verdicts: list[str] | None = None
+    # Who approves a ``cb-phase merge`` for this task — ``"owner"`` or
+    # ``"human:<handle>"``, resolved and validated from config at registration
+    # time and snapshotted here exactly like ``required_verdicts``. Nullable —
+    # predates the column on older DBs; the merge leg treats ``NULL`` as the
+    # default ``"owner"`` (approval is never silently skipped).
+    merge_approval: str | None = None
 
 
 @dataclass
@@ -113,6 +119,21 @@ class SubtaskRow:
     # the coder commits real code each attempt, so git HEAD keeps advancing.
     # Distinct from both ``review_round`` and the watchdog's stall counter.
     verify_attempts: int = 0
+    # ── Merge-approval grant (Stage-2 merge leg) ─────────────────────────────
+    # The durable record ``cb-phase merge`` queries before executing a merge.
+    # ``cb approve`` writes the grant, SHA-pinned to the PR head it approved
+    # (``merge_approved_sha``); the merge leg proceeds only when the grant's
+    # SHA equals the SHA recorded on the ``merge_pending`` transition, so a
+    # grant from a pre-rebase round can never authorize a different commit.
+    # ``merge_approved_by`` records on whose authority the grant stands (the
+    # task's snapshotted approver spec, e.g. ``owner`` / ``human:<handle>``).
+    merge_approved_by: str | None = None
+    merge_approved_sha: str | None = None
+    # SHA the most recent approval *request* was sent for — the send-once
+    # marker, burned only after a successful send (marker-after-send, same
+    # policy as the watchdog escalations). SHA-scoped so a needs_rebase round
+    # trip (new merge_pending SHA) naturally re-requests approval.
+    merge_approval_requested_sha: str | None = None
 
 
 _SCHEMA = """
@@ -124,7 +145,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     status            TEXT NOT NULL DEFAULT 'active',
     owner_id          TEXT,
     owner_handle      TEXT,
-    required_verdicts TEXT
+    required_verdicts TEXT,
+    merge_approval    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS subtask_states (
@@ -138,6 +160,9 @@ CREATE TABLE IF NOT EXISTS subtask_states (
     metadata        TEXT,
     review_round    INTEGER NOT NULL DEFAULT 0,
     verify_attempts INTEGER NOT NULL DEFAULT 0,
+    merge_approved_by             TEXT,
+    merge_approved_sha            TEXT,
+    merge_approval_requested_sha  TEXT,
     PRIMARY KEY (task_id, subtask_id)
 );
 
@@ -231,6 +256,19 @@ class StateStore:
                 "ALTER TABLE subtask_states "
                 "ADD COLUMN verify_attempts INTEGER NOT NULL DEFAULT 0"
             )
+        if "merge_approved_by" not in cols:
+            conn.execute(
+                "ALTER TABLE subtask_states ADD COLUMN merge_approved_by TEXT"
+            )
+        if "merge_approved_sha" not in cols:
+            conn.execute(
+                "ALTER TABLE subtask_states ADD COLUMN merge_approved_sha TEXT"
+            )
+        if "merge_approval_requested_sha" not in cols:
+            conn.execute(
+                "ALTER TABLE subtask_states "
+                "ADD COLUMN merge_approval_requested_sha TEXT"
+            )
         task_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
         }
@@ -240,6 +278,8 @@ class StateStore:
             conn.execute("ALTER TABLE tasks ADD COLUMN owner_handle TEXT")
         if "required_verdicts" not in task_cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN required_verdicts TEXT")
+        if "merge_approval" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN merge_approval TEXT")
         log_cols = {
             row[1]
             for row in conn.execute("PRAGMA table_info(transition_log)").fetchall()
@@ -289,6 +329,7 @@ class StateStore:
         room_id: str,
         owner_id: str,
         required_verdicts: list[str],
+        merge_approval: str = "owner",
         owner_handle: str | None = None,
         supersede_task_id: str | None = None,
     ) -> str:
@@ -302,14 +343,15 @@ class StateStore:
         * If ``supersede_task_id`` is given, that row's status is set to
           ``'superseded'`` (idempotent UPDATE; a missing row is a no-op).
         * If a row for ``task_id`` already exists, only ``owner_id`` /
-          ``owner_handle`` / ``required_verdicts`` are updated — description,
-          status and created_at are deliberately left untouched
-          (re-registration changes ownership and refreshes the verdict
-          snapshot from *current* config, not history).
+          ``owner_handle`` / ``required_verdicts`` / ``merge_approval`` are
+          updated — description, status and created_at are deliberately left
+          untouched (re-registration changes ownership and refreshes the
+          verdict + approver snapshots from *current* config, not history).
         * Otherwise a fresh ``'active'`` row is inserted.
 
-        ``required_verdicts`` is the list already resolved and validated by
-        ``register_task`` — this method only persists it (JSON-encoded).
+        ``required_verdicts`` and ``merge_approval`` are already resolved and
+        validated by ``register_task`` — this method only persists them
+        (the verdict list JSON-encoded, the approver spec verbatim).
 
         Returns ``"inserted"`` or ``"updated"`` so the caller can report the
         outcome without a second read.
@@ -327,15 +369,17 @@ class StateStore:
             if existing is not None:
                 conn.execute(
                     "UPDATE tasks SET owner_id = ?, owner_handle = ?, "
-                    "required_verdicts = ? WHERE task_id = ?",
-                    (owner_id, owner_handle, verdicts_json, task_id),
+                    "required_verdicts = ?, merge_approval = ? "
+                    "WHERE task_id = ?",
+                    (owner_id, owner_handle, verdicts_json, merge_approval,
+                     task_id),
                 )
                 return "updated"
             conn.execute(
                 "INSERT INTO tasks "
                 "(task_id, description, room_id, created_at, status, "
-                "owner_id, owner_handle, required_verdicts) "
-                "VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+                "owner_id, owner_handle, required_verdicts, merge_approval) "
+                "VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)",
                 (
                     task_id,
                     description,
@@ -344,6 +388,7 @@ class StateStore:
                     owner_id,
                     owner_handle,
                     verdicts_json,
+                    merge_approval,
                 ),
             )
             return "inserted"
@@ -432,6 +477,81 @@ class StateStore:
             ).fetchone()
         return row["verify_attempts"] if row is not None else 0
 
+    def set_pr_number(self, subtask_id: str, task_id: str, pr_number: int) -> None:
+        """Persist the subtask's PR number (idempotent UPDATE).
+
+        Written by ``cb-phase merge`` on its first invocation (the only leg
+        that needs the binding durably): the crash-reconcile path re-invokes
+        with no arguments and reads this back to query the PR's state. Also
+        feeds the watchdog's existing PR-activity progress signal.
+        """
+        with self._transaction() as conn:
+            conn.execute(
+                "UPDATE subtask_states SET pr_number = ?, updated_at = ? "
+                "WHERE task_id = ? AND subtask_id = ?",
+                (pr_number, _now_iso(), task_id, subtask_id),
+            )
+
+    def record_merge_approval(
+        self,
+        subtask_id: str,
+        task_id: str,
+        *,
+        approved_by: str,
+        approved_sha: str,
+    ) -> None:
+        """Durably record a merge-approval grant, SHA-pinned.
+
+        Written by ``cb approve`` (the single human-facing approval entry
+        point). ``approved_sha`` is the PR head SHA at approval time;
+        ``cb-phase merge`` executes only when it equals the SHA recorded on
+        the ``merge_pending`` transition, so a push after approval (or a grant
+        from a pre-rebase round) can never authorize a different commit.
+        Re-approval overwrites the previous grant (latest grant wins).
+        """
+        with self._transaction() as conn:
+            conn.execute(
+                "UPDATE subtask_states "
+                "SET merge_approved_by = ?, merge_approved_sha = ?, "
+                "updated_at = ? WHERE task_id = ? AND subtask_id = ?",
+                (approved_by, approved_sha, _now_iso(), task_id, subtask_id),
+            )
+
+    def mark_merge_approval_requested(
+        self, subtask_id: str, task_id: str, requested_sha: str,
+    ) -> None:
+        """Burn the send-once marker for an approval request at ``requested_sha``.
+
+        Called by ``cb-phase merge`` strictly *after* a successful request
+        send (marker-after-send — a failed send retries on the next
+        invocation). SHA-scoped: a later ``merge_pending`` round at a new SHA
+        compares unequal and re-requests.
+        """
+        with self._transaction() as conn:
+            conn.execute(
+                "UPDATE subtask_states "
+                "SET merge_approval_requested_sha = ?, updated_at = ? "
+                "WHERE task_id = ? AND subtask_id = ?",
+                (requested_sha, _now_iso(), task_id, subtask_id),
+            )
+
+    def find_subtasks_by_pr(self, task_id: str, pr_number: int) -> list[SubtaskRow]:
+        """Return this task's subtasks bound to ``pr_number``, oldest first.
+
+        Used by ``cb approve <pr>`` to resolve which subtask a PR-keyed grant
+        lands on. Only finds subtasks whose ``pr_number`` was persisted (i.e.
+        ones that have entered the ``cb-phase merge`` leg) — legacy chat-only
+        flows match nothing and record no grant.
+        """
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM subtask_states "
+                "WHERE task_id = ? AND pr_number = ? "
+                "ORDER BY created_at ASC, subtask_id ASC",
+                (task_id, pr_number),
+            ).fetchall()
+        return [_subtask_from_row(row) for row in rows]
+
     def list_active_subtasks(self, task_id: str | None = None) -> list[SubtaskRow]:
         """Return non-terminal subtasks, newest first.
 
@@ -465,6 +585,7 @@ def _task_from_row(row: sqlite3.Row) -> TaskRow:
         owner_id=row["owner_id"] if "owner_id" in keys else None,
         owner_handle=row["owner_handle"] if "owner_handle" in keys else None,
         required_verdicts=json.loads(raw_verdicts) if raw_verdicts else None,
+        merge_approval=row["merge_approval"] if "merge_approval" in keys else None,
     )
 
 
@@ -481,4 +602,7 @@ def _subtask_from_row(row: sqlite3.Row) -> SubtaskRow:
         metadata=json.loads(raw_metadata) if raw_metadata else None,
         review_round=row["review_round"],
         verify_attempts=row["verify_attempts"],
+        merge_approved_by=row["merge_approved_by"],
+        merge_approved_sha=row["merge_approved_sha"],
+        merge_approval_requested_sha=row["merge_approval_requested_sha"],
     )

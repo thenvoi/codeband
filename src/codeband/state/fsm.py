@@ -10,6 +10,10 @@ through a fixed lifecycle:
                             ↘ blocked
                             ↘ abandoned
 
+    (``merge_pending`` may also exit to ``needs_rebase`` — execution-time SHA
+    drift or a conflicted PR — or to ``blocked`` on a residual merge failure;
+    both are driven by ``cb-phase merge``, the sole sanctioned merge path.)
+
 :data:`VALID_TRANSITIONS` encodes every legal edge keyed by
 ``(current_state, caller_role)`` — exactly the RFC table plus the Stage-2
 merge edge (``review_passed → needs_rebase → in_progress``, the Mergemaster's
@@ -264,7 +268,16 @@ VALID_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     # eligibility check in :func:`transition`) or sends it back because the
     # branch is stale against the integration target (``needs_rebase``).
     ("review_passed", "mergemaster"): frozenset({"merge_pending", "needs_rebase"}),
-    ("merge_pending", "mergemaster"): frozenset({"merged"}),
+    # From the merge queue the Mergemaster (via ``cb-phase merge``, the sole
+    # sanctioned merge executor) either lands the PR (``merged``), discovers
+    # the branch moved/conflicted at execution time and sends it back
+    # (``needs_rebase`` — the execution-time SHA re-check and the mergeability
+    # pre-check), or records a residual execution failure (``blocked`` —
+    # permissions, API error, required status check; the watchdog's
+    # blocked-subtask patrol escalates it to the owner).
+    ("merge_pending", "mergemaster"): frozenset(
+        {"merged", "needs_rebase", "blocked"}
+    ),
     # Rebase rework returns to ``in_progress`` — the same state the
     # review-fail feedback loop targets — so the rebased commit must re-earn
     # both verdicts (verify gate + re-review) at its new SHA before the

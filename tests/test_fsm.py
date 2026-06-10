@@ -49,7 +49,12 @@ def test_valid_transitions_matches_rfc_table():
         # Stage-2 merge edge: queue for integration (gated at runtime by the
         # SHA-pinned eligibility check) or send back for a rebase.
         ("review_passed", "mergemaster"): frozenset({"merge_pending", "needs_rebase"}),
-        ("merge_pending", "mergemaster"): frozenset({"merged"}),
+        # Stage-2 merge execution (cb-phase merge): land the PR, send it back
+        # on execution-time SHA drift / conflict, or record a residual merge
+        # failure (blocked → owner escalation via the watchdog).
+        ("merge_pending", "mergemaster"): frozenset(
+            {"merged", "needs_rebase", "blocked"}
+        ),
         ("needs_rebase", "coder"): frozenset({"in_progress"}),
     }
 

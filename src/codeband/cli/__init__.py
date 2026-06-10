@@ -1004,6 +1004,15 @@ def approve(number: int, project_dir: str, command_style: str = "cli") -> None:
     slug = repo_slug(config.repo.url)
     link = pr_url(slug, number)
 
+    # Durable half first: record the SHA-pinned merge-approval grant the
+    # ``cb-phase merge`` leg queries. Recorded before the chat message so a
+    # failure here is loud and re-runnable, never masked by a sent chat. A PR
+    # with no bound subtask (the legacy chat-only flow) records nothing.
+    from codeband.cli.merge import record_approval_grant
+
+    for line in record_approval_grant(project, number):
+        click.echo(line)
+
     message = (
         f"APPROVED: Please merge PR #{number}. {link}\n"
         f"Human has reviewed and approved this PR for merge."
