@@ -26,7 +26,9 @@ Design notes:
 Only the Workstream-1 surface lives here: ``create_task``,
 ``ensure_subtask``, ``get_task``, ``get_subtask`` and ``list_active_subtasks``.
 The ``transition_log`` table is created but written by the FSM
-(``state/fsm.py``, Workstream 2); this module never enforces transitions.
+(``state/fsm.py``, Workstream 2), which also promotes ``tasks.status`` to
+``'completed'`` when a task's last subtask merges; this module never enforces
+transitions.
 """
 
 from __future__ import annotations
@@ -62,6 +64,9 @@ class TaskRow:
     description: str
     room_id: str
     created_at: str
+    # 'active' on registration; 'superseded' when a different task replaces it
+    # (state/registration.py); 'completed' when the FSM merges the task's last
+    # subtask (state/fsm.py — same single-writer transaction as the subtask).
     status: str = "active"
     # Band participant id of the task initiator (whoever held BAND_API_KEY at
     # kickoff, or whoever seeded the room via ``cb register-task``). Nullable —

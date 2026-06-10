@@ -5,15 +5,27 @@ through a fixed lifecycle:
 
     planned → assigned → in_progress → verify_pending → review_pending
             → review_passed → merge_pending → merged
+                            ↘ needs_rebase → in_progress (rebase rework)
                             ↘ review_failed → in_progress
                             ↘ blocked
                             ↘ abandoned
 
 :data:`VALID_TRANSITIONS` encodes every legal edge keyed by
-``(current_state, caller_role)`` — exactly the RFC table. Two cross-cutting
-wildcards are enforced in :func:`_is_allowed` rather than enumerated per state:
-the Conductor may *abandon*, and the Watchdog may *block*, any non-terminal
-subtask regardless of its current state.
+``(current_state, caller_role)`` — exactly the RFC table plus the Stage-2
+merge edge (``review_passed → needs_rebase → in_progress``, the Mergemaster's
+stale-branch send-back). Two cross-cutting wildcards are enforced in
+:func:`_is_allowed` rather than enumerated per state: the Conductor may
+*abandon*, and the Watchdog may *block*, any non-terminal subtask regardless
+of its current state.
+
+The ``review_passed → merge_pending`` edge is additionally gated (Stage-2):
+inside the transition's exclusive transaction, :func:`check_merge_eligibility`
+must pass for the exact ``head_sha`` being merged — every verdict leg in the
+task's ``required_verdicts`` snapshot needs a passing record pinned to that
+SHA (see :data:`_VERDICT_PASS_STATES`). An ineligible attempt raises
+:class:`MergeNotEligibleError` and writes nothing. The FSM also owns task
+completion: the transition that merges a task's *last* subtask promotes
+``tasks.status`` to ``'completed'`` in the same transaction.
 
 :func:`transition` is the only mutation path. It auto-creates the subtask row
 (via :meth:`StateStore.ensure_subtask`), then — inside a single
@@ -25,10 +37,16 @@ role raises :class:`InvalidTransitionError` and writes nothing.
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 from contextlib import closing
+from dataclasses import dataclass
 
+from codeband.state.registration import DEFAULT_REQUIRED_VERDICTS
 from codeband.state.store import StateStore, TERMINAL_STATES, _now_iso
+
+logger = logging.getLogger(__name__)
 
 # Per-subtask review-round cap (RFC two-level model). A subtask may cycle
 # ``review_failed → in_progress → … → review_pending → review_failed`` at most
@@ -51,6 +69,171 @@ class InvalidTransitionError(Exception):
     :data:`VALID_TRANSITIONS`, or it does but ``new_state`` is not among the
     allowed targets. The store is left unchanged when this is raised.
     """
+
+
+class MergeNotEligibleError(InvalidTransitionError):
+    """Raised when ``review_passed → merge_pending`` fails the eligibility gate.
+
+    The edge itself is legal for the Mergemaster, but the task's verdict
+    snapshot was not satisfied at the ``head_sha`` being merged — see
+    :func:`check_merge_eligibility`. Subclasses
+    :class:`InvalidTransitionError` so existing callers that catch the broad
+    rejection keep working; the message (and the ``reasons`` on the attached
+    :class:`MergeEligibility`) names every missing/stale/unpinned leg. The
+    store is left unchanged when this is raised.
+    """
+
+    def __init__(self, message: str, eligibility: MergeEligibility) -> None:
+        super().__init__(message)
+        self.eligibility = eligibility
+
+
+# Maps each verdict leg name (as snapshotted in ``tasks.required_verdicts``)
+# to the ``transition_log.to_state`` that records its *pass*: the verify gate
+# is the only edge into ``review_pending`` (``cb-phase verify``, coder) and an
+# approving review verdict is the only edge into ``review_passed`` (``cb-phase
+# review --approve``, reviewer) — so a log row with that ``to_state`` and a
+# matching ``head_sha`` IS the SHA-pinned passing record for the leg.
+_VERDICT_PASS_STATES: dict[str, str] = {
+    "verify": "review_pending",
+    "review": "review_passed",
+}
+
+
+@dataclass
+class MergeEligibility:
+    """Outcome of one merge-eligibility evaluation.
+
+    ``reasons`` is machine-readable: each entry starts with a stable tag
+    (``missing_verdict`` / ``stale_verdict`` / ``unpinned_verdict`` /
+    ``unknown_verdict`` / ``unknown_task`` / ``no_head_sha`` /
+    ``ungated_merge``) followed by the leg it names — the same
+    greppable-tag contract as the ``cb-phase`` rejection lines. An eligible
+    *gated* result has no reasons; the vacuously eligible ungated opt-out
+    carries an explicit ``ungated_merge`` reason so a log reader can never
+    mistake it for a checked pass.
+    """
+
+    eligible: bool
+    reasons: list[str]
+
+
+def _evaluate_merge_eligibility(
+    conn: sqlite3.Connection,
+    task_id: str,
+    subtask_id: str,
+    head_sha: str | None,
+) -> MergeEligibility:
+    """Evaluate merge eligibility on an already-open connection.
+
+    Shared by the public :func:`check_merge_eligibility` and the gate inside
+    :func:`transition` (which must evaluate on its own ``BEGIN EXCLUSIVE``
+    connection so the decision is race-safe against concurrent verdict
+    writes). Read-only; every rule fails closed:
+
+    * a missing tasks row is ineligible (``unknown_task``);
+    * a ``NULL`` ``required_verdicts`` snapshot (pre-snapshot task) resolves
+      to the default pair — never to ungated;
+    * an empty-list snapshot (the ``allow_ungated_merge`` opt-out) is
+      vacuously eligible, stated explicitly (``ungated_merge``);
+    * with verdicts required, a missing ``head_sha`` is ineligible
+      (``no_head_sha``) — there is nothing to pin against;
+    * per leg, a passing record must exist whose ``head_sha`` exactly equals
+      the one being merged: a record pinned to a different SHA is stale, a
+      record with ``NULL`` ``head_sha`` matches nothing.
+    """
+    row = conn.execute(
+        "SELECT required_verdicts FROM tasks WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return MergeEligibility(
+            False, [f"unknown_task {task_id}: no tasks row (fail-closed)"]
+        )
+
+    raw = row["required_verdicts"]
+    # NULL snapshot (task registered before verdict snapshots existed) → the
+    # default pair. NEVER ungated: only an *explicit* [] opts out.
+    required = list(DEFAULT_REQUIRED_VERDICTS) if raw is None else json.loads(raw)
+    if not required:
+        return MergeEligibility(
+            True,
+            [
+                "ungated_merge: required_verdicts snapshot is [] "
+                "(allow_ungated_merge opt-out) — no verdicts checked"
+            ],
+        )
+
+    if not head_sha:
+        return MergeEligibility(
+            False,
+            [
+                "no_head_sha: merge eligibility requires the head SHA being "
+                "merged; nothing to pin verdicts against (fail-closed)"
+            ],
+        )
+
+    reasons: list[str] = []
+    for leg in required:
+        pass_state = _VERDICT_PASS_STATES.get(leg)
+        if pass_state is None:
+            # Registration validates legs against KNOWN_VERDICTS, so this only
+            # fires on a hand-edited row — still fail closed, never skip.
+            reasons.append(
+                f"unknown_verdict {leg}: no passing record can satisfy it "
+                "(fail-closed)"
+            )
+            continue
+        shas = [
+            r["head_sha"]
+            for r in conn.execute(
+                "SELECT head_sha FROM transition_log "
+                "WHERE task_id = ? AND subtask_id = ? AND to_state = ?",
+                (task_id, subtask_id, pass_state),
+            ).fetchall()
+        ]
+        if head_sha in shas:
+            continue  # a passing record pinned to exactly this SHA exists
+        pinned = sorted({s for s in shas if s is not None})
+        if pinned:
+            reasons.append(
+                f"stale_verdict {leg}: pinned to {', '.join(pinned)}, "
+                f"not {head_sha}"
+            )
+        elif shas:
+            reasons.append(
+                f"unpinned_verdict {leg}: passing record has NULL head_sha "
+                "(fail-closed)"
+            )
+        else:
+            reasons.append(
+                f"missing_verdict {leg}: no passing {leg} record for this subtask"
+            )
+    return MergeEligibility(not reasons, reasons)
+
+
+def check_merge_eligibility(
+    task_id: str,
+    subtask_id: str,
+    head_sha: str | None,
+    *,
+    store: StateStore,
+) -> MergeEligibility:
+    """Return whether ``(task_id, subtask_id)`` may merge at ``head_sha``.
+
+    The SHA-pinned merge-eligibility check (Stage-2): every verdict leg in the
+    task's ``required_verdicts`` snapshot must have a passing record pinned to
+    exactly ``head_sha`` — see :func:`_evaluate_merge_eligibility` for the
+    fail-closed rules. This public form is read-only and advisory (a caller
+    may use it to *report* eligibility); the enforcing copy of the same
+    evaluation runs inside :func:`transition` on the
+    ``review_passed → merge_pending`` edge, so there is no mutation path into
+    ``merge_pending`` that skips it.
+    """
+    conn = sqlite3.connect(store.db_path, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    with closing(conn):
+        return _evaluate_merge_eligibility(conn, task_id, subtask_id, head_sha)
 
 
 # Static transition table, keyed by ``(current_state, caller_role)`` → the set
@@ -76,8 +259,17 @@ VALID_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     # ``in_progress`` edge is additionally guarded at runtime by the round cap
     # in :func:`transition`; ``blocked`` is always available as the escape.
     ("review_failed", "coder"): frozenset({"in_progress", "blocked"}),
-    ("review_passed", "mergemaster"): frozenset({"merge_pending"}),
+    # The Mergemaster either queues an approved subtask for integration
+    # (``merge_pending`` — additionally gated at runtime by the SHA-pinned
+    # eligibility check in :func:`transition`) or sends it back because the
+    # branch is stale against the integration target (``needs_rebase``).
+    ("review_passed", "mergemaster"): frozenset({"merge_pending", "needs_rebase"}),
     ("merge_pending", "mergemaster"): frozenset({"merged"}),
+    # Rebase rework returns to ``in_progress`` — the same state the
+    # review-fail feedback loop targets — so the rebased commit must re-earn
+    # both verdicts (verify gate + re-review) at its new SHA before the
+    # eligibility check can pass again.
+    ("needs_rebase", "coder"): frozenset({"in_progress"}),
 }
 
 
@@ -117,7 +309,7 @@ def transition(
     :class:`InvalidTransitionError` (writing nothing) on an illegal edge or a
     wrong caller role.
 
-    Two effects are intrinsic to the FSM (not the caller's responsibility):
+    Four effects are intrinsic to the FSM (not the caller's responsibility):
 
     * **Review-round counting.** Entering ``review_failed`` increments the
       subtask's durable ``review_round`` in the same transaction — one failed
@@ -128,6 +320,22 @@ def transition(
       committed count inside the exclusive transaction, so it is race-safe and
       survives a crash/reopen (the count is durable). This bounds a productive
       loop that the watchdog's stall cap never catches.
+    * **The merge-eligibility gate (Stage-2).** Entering ``merge_pending``
+      additionally requires :func:`check_merge_eligibility` to pass for the
+      ``head_sha`` argument — every verdict leg in the task's
+      ``required_verdicts`` snapshot must have a passing record pinned to
+      exactly that SHA. The evaluation runs on this transaction's exclusive
+      connection (race-safe against concurrent verdict writes); an ineligible
+      attempt raises :class:`MergeNotEligibleError`, is logged with its
+      machine-readable reasons, and writes nothing. Because
+      :func:`transition` is the only mutation path, there is no way into
+      ``merge_pending`` that skips the check.
+    * **Task completion (Stage-2).** The transition that moves a task's *last*
+      subtask to ``merged`` promotes the task itself to
+      ``tasks.status = 'completed'`` in the same transaction — strictly
+      *every* subtask row must be ``merged`` (an ``abandoned`` sibling blocks
+      promotion), and only an ``'active'`` task is promoted (``'superseded'``
+      keeps its status).
 
     ``store`` and ``max_review_rounds`` are keyword-only so the positional
     signature matches the RFC while still letting callers (and tests) inject the
@@ -139,7 +347,9 @@ def transition(
     ``git rev-parse HEAD`` on the verify and review outcome transitions, so a
     verdict can later be checked against what the PR actually merges. Stored
     verbatim in the ``transition_log`` row; ``NULL`` for every other caller
-    and for legacy rows. Nothing reads it yet.
+    and for legacy rows. The merge-eligibility gate reads it: a transition to
+    ``merge_pending`` must pass the SHA it is merging at (``None`` fails
+    closed unless the task's snapshot is the explicit ungated opt-out).
     """
     store.ensure_subtask(subtask_id, task_id)
 
@@ -181,6 +391,29 @@ def transition(
                     "this subtask to 'blocked'."
                 )
 
+            # Merge-eligibility gate: the only edge into ``merge_pending``
+            # additionally requires every required verdict to be pinned to
+            # exactly the SHA being merged. Evaluated on THIS exclusive
+            # connection so the decision cannot race a concurrent verdict
+            # write; an ineligible attempt raises before anything is written.
+            if new_state == "merge_pending":
+                eligibility = _evaluate_merge_eligibility(
+                    conn, task_id, subtask_id, head_sha
+                )
+                if not eligibility.eligible:
+                    detail = "; ".join(eligibility.reasons)
+                    logger.warning(
+                        "merge-eligibility gate rejected subtask %r (task %r) "
+                        "at head_sha %r: %s",
+                        subtask_id, task_id, head_sha, detail,
+                    )
+                    raise MergeNotEligibleError(
+                        f"Merge-ineligible transition for subtask "
+                        f"{subtask_id!r}: ({current_state!r} → 'merge_pending') "
+                        f"at head_sha {head_sha!r} — {detail}",
+                        eligibility,
+                    )
+
             now = _now_iso()
             # One failed review = one round. Increment on *entry* to
             # review_failed so the cap reflects how many times this subtask has
@@ -208,6 +441,26 @@ def transition(
                     caller_role, now, reason, head_sha,
                 ),
             )
+            # Task completion: merging the LAST subtask promotes the task to
+            # 'completed' in the same transaction (single-writer path). The
+            # rule is strict — every subtask row must be 'merged'; an
+            # 'abandoned' sibling blocks promotion. Only an 'active' task is
+            # promoted, so 'superseded' keeps its status untouched.
+            if new_state == "merged":
+                remaining = conn.execute(
+                    "SELECT COUNT(*) AS n FROM subtask_states "
+                    "WHERE task_id = ? AND state != 'merged'",
+                    (task_id,),
+                ).fetchone()["n"]
+                if remaining == 0:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'completed' "
+                        "WHERE task_id = ? AND status = 'active'",
+                        (task_id,),
+                    )
+                    logger.info(
+                        "task %r completed: all subtasks merged", task_id
+                    )
             conn.execute("COMMIT")
         except BaseException:
             conn.execute("ROLLBACK")

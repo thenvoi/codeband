@@ -46,8 +46,11 @@ def test_valid_transitions_matches_rfc_table():
         # ``blocked`` is the coder's escalation escape once the review-round cap
         # is hit (the ``in_progress`` rework is then gated at runtime).
         ("review_failed", "coder"): frozenset({"in_progress", "blocked"}),
-        ("review_passed", "mergemaster"): frozenset({"merge_pending"}),
+        # Stage-2 merge edge: queue for integration (gated at runtime by the
+        # SHA-pinned eligibility check) or send back for a rebase.
+        ("review_passed", "mergemaster"): frozenset({"merge_pending", "needs_rebase"}),
         ("merge_pending", "mergemaster"): frozenset({"merged"}),
+        ("needs_rebase", "coder"): frozenset({"in_progress"}),
     }
 
 
@@ -89,17 +92,20 @@ def test_wrong_caller_role_is_rejected(store):
 
 
 def test_full_happy_path(store):
+    # The verify and review outcomes pin head_sha (as cb-phase does); the
+    # merge_pending step must then pass the eligibility gate at the same SHA.
     steps = [
-        ("assigned", "conductor"),
-        ("in_progress", "coder"),
-        ("verify_pending", "coder"),
-        ("review_pending", "coder"),
-        ("review_passed", "reviewer"),
-        ("merge_pending", "mergemaster"),
-        ("merged", "mergemaster"),
+        ("assigned", "conductor", None),
+        ("in_progress", "coder", None),
+        ("verify_pending", "coder", None),
+        ("review_pending", "coder", "sha-1"),
+        ("review_passed", "reviewer", "sha-1"),
+        ("merge_pending", "mergemaster", "sha-1"),
+        ("merged", "mergemaster", None),
     ]
-    for new_state, role in steps:
-        transition("st-1", "room-1", new_state, caller_role=role, store=store)
+    for new_state, role, sha in steps:
+        transition("st-1", "room-1", new_state, caller_role=role, store=store,
+                   head_sha=sha)
 
     assert store.get_subtask("st-1", "room-1").state == "merged"
     assert len(_log_rows(store, "st-1")) == len(steps)
@@ -126,16 +132,17 @@ def test_conductor_can_abandon_any_non_terminal_state(store):
 
 
 def test_no_transition_out_of_terminal_state(store):
-    for new_state, role in [
-        ("assigned", "conductor"),
-        ("in_progress", "coder"),
-        ("verify_pending", "coder"),
-        ("review_pending", "coder"),
-        ("review_passed", "reviewer"),
-        ("merge_pending", "mergemaster"),
-        ("merged", "mergemaster"),
+    for new_state, role, sha in [
+        ("assigned", "conductor", None),
+        ("in_progress", "coder", None),
+        ("verify_pending", "coder", None),
+        ("review_pending", "coder", "sha-1"),
+        ("review_passed", "reviewer", "sha-1"),
+        ("merge_pending", "mergemaster", "sha-1"),
+        ("merged", "mergemaster", None),
     ]:
-        transition("st-1", "room-1", new_state, caller_role=role, store=store)
+        transition("st-1", "room-1", new_state, caller_role=role, store=store,
+                   head_sha=sha)
 
     # merged is terminal — even the conductor cannot abandon it.
     with pytest.raises(InvalidTransitionError):

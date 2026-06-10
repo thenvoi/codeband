@@ -172,19 +172,21 @@ class TestHappyPath:
         store = _new_store(tmp_path)
         store.create_task("room-1", "ship the feature", "room-1")
 
+        # The verify and review outcomes pin head_sha (as cb-phase does); the
+        # merge_pending step then passes the eligibility gate at the same SHA.
         steps = [
-            ("assigned", "conductor"),
-            ("in_progress", "coder"),
-            ("verify_pending", "coder"),
-            ("review_pending", "coder"),
-            ("review_passed", "reviewer"),
-            ("merge_pending", "mergemaster"),
-            ("merged", "mergemaster"),
+            ("assigned", "conductor", None),
+            ("in_progress", "coder", None),
+            ("verify_pending", "coder", None),
+            ("review_pending", "coder", "sha-1"),
+            ("review_passed", "reviewer", "sha-1"),
+            ("merge_pending", "mergemaster", "sha-1"),
+            ("merged", "mergemaster", None),
         ]
         prev_state = "planned"
-        for i, (new_state, role) in enumerate(steps, start=1):
+        for i, (new_state, role, sha) in enumerate(steps, start=1):
             transition("st-1", "room-1", new_state, caller_role=role,
-                       reason=f"step-{i}", store=store)
+                       reason=f"step-{i}", store=store, head_sha=sha)
 
             row = store.get_subtask("st-1", "room-1")
             assert row is not None
@@ -408,8 +410,13 @@ class TestCbPhaseReviewVerdict:
         return project_dir, store
 
     def _seed(self, store, sid, chain):
-        for new_state, role in chain:
-            transition(sid, "room-1", new_state, caller_role=role, store=store)
+        # Steps are (state, role) or (state, role, head_sha) — the sha form is
+        # needed on the verify/review outcomes so the merge-eligibility gate
+        # passes when a chain walks through merge_pending.
+        for step in chain:
+            new_state, role, *rest = step
+            transition(sid, "room-1", new_state, caller_role=role, store=store,
+                       head_sha=rest[0] if rest else None)
 
     def _run(self, project_dir, sid, verdict):
         return handoff.main([
@@ -470,9 +477,9 @@ class TestCbPhaseReviewVerdict:
                 ("assigned", "conductor"),
                 ("in_progress", "coder"),
                 ("verify_pending", "coder"),
-                ("review_pending", "coder"),
-                ("review_passed", "reviewer"),
-                ("merge_pending", "mergemaster"),
+                ("review_pending", "coder", "sha-1"),
+                ("review_passed", "reviewer", "sha-1"),
+                ("merge_pending", "mergemaster", "sha-1"),
                 ("merged", "mergemaster"),
             ]),
         ],
@@ -577,16 +584,17 @@ class TestFanoutInvariants:
     """The genuinely new risk surface vs. band-of-devs' single track."""
 
     def _drive_to_merged(self, store, sid):
-        for new_state, role in [
-            ("assigned", "conductor"),
-            ("in_progress", "coder"),
-            ("verify_pending", "coder"),
-            ("review_pending", "coder"),
-            ("review_passed", "reviewer"),
-            ("merge_pending", "mergemaster"),
-            ("merged", "mergemaster"),
+        for new_state, role, sha in [
+            ("assigned", "conductor", None),
+            ("in_progress", "coder", None),
+            ("verify_pending", "coder", None),
+            ("review_pending", "coder", f"sha-{sid}"),
+            ("review_passed", "reviewer", f"sha-{sid}"),
+            ("merge_pending", "mergemaster", f"sha-{sid}"),
+            ("merged", "mergemaster", None),
         ]:
-            transition(sid, "room-1", new_state, caller_role=role, store=store)
+            transition(sid, "room-1", new_state, caller_role=role, store=store,
+                       head_sha=sha)
 
     def test_no_double_merge_across_set(self, tmp_path):
         store = _new_store(tmp_path)
