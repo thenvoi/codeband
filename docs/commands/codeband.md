@@ -96,16 +96,17 @@ if [ -n "$REPO_URL" ]; then
   fi
 fi
 
-# A stable slug for this repo, used for the jam team + bridge inbox path
+# A stable slug for this repo, used only when onboarding a NEW jam bridge in Step 3.
+# Do NOT derive the inbox path from it: a pre-existing bridge keeps its ORIGINAL
+# team name, so the real path comes from the session JSON's team_name (Step 6).
 SLUG="$(basename "$REPO_URL" .git 2>/dev/null | tr -c 'A-Za-z0-9._-' '-' | sed -E 's/-+/-/g;s/^-|-$//g')"
 [ -z "$SLUG" ] && SLUG="$(basename "$TARGET_DIR")"
 TEAM="codeband-$SLUG"
-INBOX="$HOME/.claude/teams/$TEAM/inboxes/team-lead.json"
 echo "TARGET: $(grep -m1 -E '^  url:' "$CB_HOME/codeband.yaml" | sed -E 's/^  url:[[:space:]]*//') @ $(grep -m1 -E '^  branch:' "$CB_HOME/codeband.yaml" | sed -E 's/^  branch:[[:space:]]*//')"
-echo "CB_HOME=$CB_HOME"; echo "TARGET_DIR=$TARGET_DIR"; echo "TEAM=$TEAM"; echo "INBOX=$INBOX"
+echo "CB_HOME=$CB_HOME"; echo "TARGET_DIR=$TARGET_DIR"; echo "TEAM=$TEAM"
 ```
 
-Remember `CB_HOME`, `TARGET_DIR`, `TEAM`, and `INBOX` from the output — later steps need them.
+Remember `CB_HOME`, `TARGET_DIR`, and `TEAM` from the output — later steps need them. (`INBOX` is derived in Step 6 from the bridge's actual team.)
 
 ### Step 3 — come online as a Band peer (your own identity)
 
@@ -150,7 +151,7 @@ target_dir, cb_home = sys.argv[1], sys.argv[2]
 task = os.environ.get("GR_TASK", "").strip() or "(no task text provided)"
 
 # Find this session's jam state (CC's own agent key + id) by matching cwd
-cc_key = cc_id = handle = None
+cc_key = cc_id = handle = team_name = None
 for p in glob.glob(os.path.expanduser("~/.config/jam/sessions/*/*.json")):
     try:
         d = json.load(open(p))
@@ -158,6 +159,7 @@ for p in glob.glob(os.path.expanduser("~/.config/jam/sessions/*/*.json")):
         continue
     if d.get("cwd") == target_dir and d.get("agent_api_key") and d.get("agent_id"):
         cc_key, cc_id, handle = d["agent_api_key"], d["agent_id"], d.get("handle")
+        team_name = d.get("team_name")
         break
 if not cc_key:
     print("ERROR: could not find CC's jam agent key/id for cwd", target_dir); sys.exit(1)
@@ -194,15 +196,21 @@ async def main():
     print("ROOM", rid)
     print("HANDLE", handle)
     print("CONDUCTOR", cond_name)
+    # The inbox path comes from the bridge's ACTUAL team (a pre-existing bridge
+    # keeps its original team name), never from a computed codeband-<repo> guess.
+    if team_name:
+        print("INBOX", os.path.expanduser(f"~/.claude/teams/{team_name}/inboxes/team-lead.json"))
+    else:
+        print("INBOX_UNKNOWN: session JSON has no team_name — the jam inbox path cannot be derived. Do NOT arm the inbox Monitor on a guessed path; tell the user.")
 asyncio.run(main())
 PYEOF
 ```
 
-If this prints `ROOM <id>` you've seeded the task as room owner. Remember `ROOM` (the room id) — you need it for approvals. If it errors, show the user and stop.
+If this prints `ROOM <id>` you've seeded the task as room owner. Remember `ROOM` (the room id) — you need it for approvals — and `INBOX` (the inbox path for Step 7). If it errors, show the user and stop.
 
 ### Step 7 — arm the inbox Monitor (this is your "push")
 
-Call the **Monitor** tool (persistent) so each new Band message auto-wakes you. Use the `INBOX` path from Step 1+2 and substitute it literally into the command:
+Call the **Monitor** tool (persistent) so each new Band message auto-wakes you. Use the `INBOX` path printed by Step 6 and substitute it literally into the command. If Step 6 printed `INBOX_UNKNOWN` instead, do NOT arm this Monitor — watching a guessed path fails silently. Tell the user the inbox path could not be derived (no `team_name` in the jam session JSON) and that swarm messages will not auto-wake you, then continue with Steps 7b/7c.
 
 > Monitor tool call — `persistent: true`, description `"codeband: new Band messages"`, command:
 > ```
