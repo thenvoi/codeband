@@ -342,11 +342,19 @@ class StateStore:
 
         * If ``supersede_task_id`` is given, that row's status is set to
           ``'superseded'`` (idempotent UPDATE; a missing row is a no-op).
-        * If a row for ``task_id`` already exists, only ``owner_id`` /
+        * If a row for ``task_id`` already exists, ``owner_id`` /
           ``owner_handle`` / ``required_verdicts`` / ``merge_approval`` are
-          updated — description, status and created_at are deliberately left
-          untouched (re-registration changes ownership and refreshes the
-          verdict + approver snapshots from *current* config, not history).
+          updated AND ``status`` is restored to ``'active'`` — description and
+          created_at are deliberately left untouched (re-registration changes
+          ownership and refreshes the verdict + approver snapshots from
+          *current* config, not history). Restoring ``'active'`` is what makes
+          re-registering a previously ``'superseded'`` room (the sanctioned
+          identity-rotation path) leave exactly one active task — without it
+          the system ends with ZERO active tasks: the watchdog patrols
+          nothing and completion promotion never fires while ``cb-phase``
+          keeps advancing subtasks. Re-registering a ``'completed'`` task's
+          room reactivates it too — intended continue-work semantics: the
+          owner is deliberately pointing new work at the finished task's room.
         * Otherwise a fresh ``'active'`` row is inserted.
 
         ``required_verdicts`` and ``merge_approval`` are already resolved and
@@ -369,7 +377,8 @@ class StateStore:
             if existing is not None:
                 conn.execute(
                     "UPDATE tasks SET owner_id = ?, owner_handle = ?, "
-                    "required_verdicts = ?, merge_approval = ? "
+                    "required_verdicts = ?, merge_approval = ?, "
+                    "status = 'active' "
                     "WHERE task_id = ?",
                     (owner_id, owner_handle, verdicts_json, merge_approval,
                      task_id),

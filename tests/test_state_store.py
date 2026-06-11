@@ -271,6 +271,68 @@ def test_register_task_atomic_snapshot_roundtrip(store: StateStore) -> None:
     assert task.owner_id == "owner-2"
 
 
+def _active_task_ids(store: StateStore) -> list[str]:
+    conn = sqlite3.connect(store.db_path)
+    try:
+        rows = conn.execute(
+            "SELECT task_id FROM tasks WHERE status = 'active' ORDER BY task_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [task_id for (task_id,) in rows]
+
+
+def _register(store: StateStore, task_id: str, *, supersede: str | None = None) -> str:
+    return store.register_task_atomic(
+        task_id=task_id,
+        description="t",
+        room_id=task_id,
+        owner_id="owner-1",
+        required_verdicts=["verify", "review"],
+        supersede_task_id=supersede,
+    )
+
+
+def test_reregistration_restores_superseded_task_to_active(store: StateStore) -> None:
+    """Re-registering a previously superseded room (the sanctioned
+    identity-rotation path) must restore status='active' — without it the
+    system is left with ZERO active tasks: the watchdog patrols nothing and
+    completion promotion never fires, while cb-phase keeps advancing subtasks.
+    """
+    _register(store, "room-a")
+    _register(store, "room-b", supersede="room-a")
+    assert store.get_task("room-a").status == "superseded"
+    assert _active_task_ids(store) == ["room-b"]
+
+    # Rotate back to room A: the existing-row UPDATE must reactivate it.
+    outcome = _register(store, "room-a", supersede="room-b")
+    assert outcome == "updated"
+    assert store.get_task("room-a").status == "active"
+    assert store.get_task("room-b").status == "superseded"
+    assert _active_task_ids(store) == ["room-a"]  # exactly one active task
+
+
+def test_reregistration_reactivates_completed_task(store: StateStore) -> None:
+    """Re-registering a 'completed' task's room reactivates it — intended
+    continue-work semantics: the owner is deliberately pointing new work at
+    the finished task's room (see register_task_atomic's docstring)."""
+    _register(store, "room-a")
+    conn = sqlite3.connect(store.db_path)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'completed' WHERE task_id = ?",
+                ("room-a",),
+            )
+    finally:
+        conn.close()
+    assert store.get_task("room-a").status == "completed"
+
+    assert _register(store, "room-a") == "updated"
+    assert store.get_task("room-a").status == "active"
+    assert _active_task_ids(store) == ["room-a"]
+
+
 def test_get_missing_task_returns_none(store: StateStore) -> None:
     assert store.get_task("nope") is None
 
