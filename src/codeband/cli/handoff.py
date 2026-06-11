@@ -32,7 +32,13 @@ Gate sequence:
 2. ``gh pr view <n> --json state`` must report ``OPEN``.
 3. If ``agents.handoff_verify_command`` is configured, run it in the worktree;
    exit 0 is required.
-4. On success, ``fsm.transition(..., "review_pending", caller_role="coder")``.
+4. The worktree HEAD must equal the PR head (resolved via ``gh`` with
+   ``--repo`` from config, cwd-independent). Either side unresolvable →
+   ``REJECTED [head_unresolved]`` and nothing recorded; a mismatch →
+   ``REJECTED [head_mismatch]`` (push your commits) — so a recorded verify
+   outcome always pins the exact commit the PR delivers, never ``NULL``.
+5. On success, ``fsm.transition(..., "review_pending", caller_role="coder")``
+   with ``head_sha`` pinned to that commit.
 
 Any failed gate increments the subtask's durable ``verify_attempts`` count,
 prints a clear message and exits non-zero; a *success* never increments. The
@@ -105,6 +111,18 @@ EXIT_CAP_REACHED = 5
 # written — the caller cannot proceed because the authoritative task_id (the FK
 # target of every subtask row) is unknown.
 EXIT_NO_ACTIVE_TASK = 6
+# (7–12 are taken by the merge leg in ``cli/merge.py``.)
+# The SHA a verdict must pin could not be resolved — the PR head query failed
+# (gh auth/network), or verify's worktree HEAD is unreadable. The verdict /
+# verify outcome is NOT recorded: a verdict that pins nothing must never
+# report success (it would make every gated merge reject ``not_eligible``
+# with no visible cause). Like ``EXIT_NO_ACTIVE_TASK``, nothing was attempted
+# and nothing written — an infra failure, not a coder error, so it does not
+# burn a verify attempt.
+EXIT_HEAD_UNRESOLVED = 13
+# Verify's worktree HEAD differs from the PR head — the coder forgot to push.
+# A legitimate coder error: counts as one rejected verify attempt.
+EXIT_HEAD_MISMATCH = 14
 
 # How many trailing lines of a failing verify command's output to surface in
 # the ``REJECTED [verify_failed]`` message — enough to see the failure without
@@ -232,6 +250,41 @@ def _git_head(worktree: Path) -> str | None:
     if result.returncode != 0:
         return None
     return result.stdout.strip() or None
+
+
+def _pr_head_sha(project_dir: Path, pr_number: int) -> str | None:
+    """Resolve a PR's head SHA via ``gh``, cwd-independent by construction.
+
+    ``gh pr view <n> --json headRefOid --repo <slug>`` with the slug derived
+    from the loaded config's ``repo.url`` — so it works from anywhere,
+    including the Code Reviewer's repo-less scratch directory (where a
+    cwd-based ``git rev-parse HEAD`` can only ever yield ``NULL``, the
+    structural cause of every gated merge rejecting ``not_eligible``).
+    Returns ``None`` on any failure (bad URL, gh error, unparseable/empty
+    output) — callers must fail LOUD and record nothing.
+    """
+    from codeband.github.prs import repo_slug
+
+    try:
+        slug = repo_slug(load_config(project_dir).repo.url)
+    except ValueError:
+        return None
+    result = subprocess.run(
+        ["gh", "pr", "view", str(pr_number),
+         "--json", "headRefOid", "--repo", slug],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.debug(
+            "gh pr view %s --repo %s failed: %s", pr_number, slug, result.stderr,
+        )
+        return None
+    try:
+        head = json.loads(result.stdout).get("headRefOid")
+    except (ValueError, AttributeError):
+        return None
+    return head or None
 
 
 def _current_branch(worktree: Path) -> str | None:
@@ -587,6 +640,38 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                 EXIT_VERIFY_FAILED,
             )
 
+    # Pin the verify outcome to the exact commit the gates ran against — and
+    # prove that commit is what the PR actually contains. Both ends must
+    # resolve, loudly: a verify outcome that pins nothing (NULL) silently
+    # poisons the merge gate (every gated merge rejects ``not_eligible``).
+    pr_head = _pr_head_sha(project_dir, args.pr)
+    if pr_head is None:
+        print(
+            f"REJECTED [head_unresolved]: cannot resolve PR #{args.pr} head — "
+            "verify outcome NOT recorded. Check gh auth/network and re-run.",
+            file=sys.stderr,
+        )
+        return EXIT_HEAD_UNRESOLVED
+    worktree_head = _git_head(worktree)
+    if worktree_head is None:
+        print(
+            f"REJECTED [head_unresolved]: cannot resolve the worktree HEAD at "
+            f"{worktree} — verify outcome NOT recorded. Check the worktree "
+            "and re-run.",
+            file=sys.stderr,
+        )
+        return EXIT_HEAD_UNRESOLVED
+    if worktree_head != pr_head:
+        return _reject(
+            store,
+            args.subtask_id,
+            task_id,
+            f"REJECTED [head_mismatch]: worktree is at {worktree_head} but "
+            f"PR #{args.pr} head is {pr_head} — push your commits, then "
+            "re-run.",
+            EXIT_HEAD_MISMATCH,
+        )
+
     try:
         transition(
             args.subtask_id,
@@ -595,9 +680,9 @@ def _cmd_verify(args: argparse.Namespace) -> int:
             caller_role="coder",
             reason="cb-phase verify",
             store=store,
-            # Pin the verify outcome to the exact commit the gates ran against
-            # (the tree is clean, so HEAD is precisely what was verified).
-            head_sha=_git_head(worktree),
+            # The tree is clean and HEAD equals the PR head, so this SHA is
+            # precisely what was verified AND what the PR delivers.
+            head_sha=worktree_head,
         )
     except InvalidTransitionError as exc:
         print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
@@ -658,6 +743,15 @@ def _cmd_review(args: argparse.Namespace) -> int:
     round). The verdict is *only* legal from ``review_pending`` — from any other
     state the FSM raises :class:`InvalidTransitionError` and writes nothing.
 
+    The verdict's ``head_sha`` is the **PR head** (``--pr``, resolved via
+    ``gh`` with ``--repo`` from config — cwd-independent), never the invoker's
+    cwd HEAD: the shipped Code Reviewer works from a repo-less scratch
+    directory, where a cwd-based ``git rev-parse HEAD`` can only ever record
+    ``NULL`` — which silently voided every review verdict at the merge gate
+    (the structural cause of the 2026-06-10 Scenario A incident). An
+    unresolvable head is a LOUD failure that records nothing: a verdict that
+    pins nothing must never report success.
+
     This is the structural bind behind the non-bypassable verify gate:
     ``review_passed`` is reachable only from ``review_pending``, which in turn is
     reachable only via the ``cb-phase verify`` gate (``verify_pending →
@@ -672,6 +766,15 @@ def _cmd_review(args: argparse.Namespace) -> int:
     if error_code is not None:
         return error_code
 
+    head_sha = _pr_head_sha(project_dir, args.pr)
+    if head_sha is None:
+        print(
+            f"REJECTED [head_unresolved]: cannot resolve PR #{args.pr} head — "
+            "verdict NOT recorded. Check gh auth/network and re-run.",
+            file=sys.stderr,
+        )
+        return EXIT_HEAD_UNRESOLVED
+
     new_state = "review_passed" if args.approve else "review_failed"
 
     try:
@@ -682,9 +785,9 @@ def _cmd_review(args: argparse.Namespace) -> int:
             caller_role="reviewer",
             reason="cb-phase review --approve" if args.approve else "cb-phase review --reject",
             store=store,
-            # Pin the verdict to the commit it was rendered against — HEAD of
-            # the reviewer's worktree (``--worktree``, default cwd).
-            head_sha=_git_head(Path(args.worktree).resolve()),
+            # Pin the verdict to the commit it was rendered against — the
+            # head of the reviewed PR.
+            head_sha=head_sha,
         )
     except InvalidTransitionError as exc:
         print(f"cb-phase: review verdict rejected — {exc}", file=sys.stderr)
@@ -761,6 +864,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Task label (non-authoritative; active room resolved from "
         ".codeband_room).",
     )
+    review.add_argument(
+        "--pr",
+        type=int,
+        required=True,
+        help="Pull request number under review — its head SHA is what the "
+        "verdict pins (resolved via gh, cwd-independent).",
+    )
     verdict = review.add_mutually_exclusive_group(required=True)
     verdict.add_argument(
         "--approve", action="store_true", help="Pass review → review_passed.",
@@ -771,8 +881,8 @@ def _build_parser() -> argparse.ArgumentParser:
     review.add_argument(
         "--worktree",
         default=".",
-        help="Path to the reviewed checkout — its HEAD is pinned onto the "
-        "verdict record (default: cwd).",
+        help="Accepted for compatibility; ignored — the verdict SHA is the "
+        "PR head, never a local checkout's HEAD.",
     )
     review.add_argument(
         "--project-dir",

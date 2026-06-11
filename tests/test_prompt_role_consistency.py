@@ -376,6 +376,32 @@ def test_coder_rebase_rework_reenters_verify_walk():
     assert "post-rebase re-review" in coder
 
 
+def test_code_reviewer_verdict_commands_pin_the_pr():
+    """Both ``cb-phase review`` verdict lines must carry ``--pr`` — the
+    verdict head SHA is resolved from the PR head (cwd-independent), never
+    from the reviewer's repo-less scratch directory, where a cwd-based HEAD
+    could only ever record NULL and silently void every verdict at the merge
+    gate (the 2026-06-10 Scenario A incident). This drift class shipped
+    undetected precisely because no test pinned the reviewer's gate commands.
+    """
+    reviewer = Path("src/codeband/prompts/code_reviewer.md").read_text(
+        encoding="utf-8",
+    )
+
+    assert (
+        "cb-phase review <subtask_id> --task <task_id> --pr <pr-number> --reject"
+        in reviewer
+    )
+    assert (
+        "cb-phase review <subtask_id> --task <task_id> --pr <pr-number> --approve"
+        in reviewer
+    )
+    # No verdict line may remain without the PR pin.
+    for line in reviewer.splitlines():
+        if "cb-phase review" in line and ("--approve" in line or "--reject" in line):
+            assert "--pr" in line, f"unpinned verdict command: {line!r}"
+
+
 def test_codeband_command_doc_grants_approval_instead_of_prohibiting():
     """As of the merge-execution leg, ``cb approve`` writes the SHA-pinned
     approval grant and the invoking agent is the task owner/approver — the old

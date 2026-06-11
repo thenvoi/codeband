@@ -115,6 +115,10 @@ def test_task2_repro_through_cb_phase_main(store, monkeypatch):
     monkeypatch.setattr(handoff, "_max_review_rounds", lambda project_dir: 3)
     monkeypatch.setattr(handoff, "_uncommitted_files", lambda worktree: [])
     monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+    # PR-pinned verify outcomes: the PR head must match the worktree HEAD
+    # for the gate to record (both seams stubbed to the same SHA here).
+    monkeypatch.setattr(handoff, "_git_head", lambda worktree: "cafe1234")
+    monkeypatch.setattr(handoff, "_pr_head_sha", lambda project_dir, pr: "cafe1234")
 
     assert handoff.main(["verify", "st-1", "--pr", "42"]) == 0
     assert store.get_subtask("st-1", TASK_B).state == "review_pending"

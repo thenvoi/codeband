@@ -38,6 +38,8 @@ def patch_gates(monkeypatch, store):
     monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
     monkeypatch.setattr(handoff, "_run_verify_command", lambda cmd, cwd: (0, ""))
     monkeypatch.setattr(handoff, "_git_head", lambda worktree: "cafe1234")
+    # The PR head matches the worktree HEAD (the coder pushed) by default.
+    monkeypatch.setattr(handoff, "_pr_head_sha", lambda project_dir, pr: "cafe1234")
     return store
 
 
@@ -182,9 +184,13 @@ def test_each_failure_mode_has_a_distinct_exit_code():
         handoff.EXIT_VERIFY_FAILED,
         handoff.EXIT_CAP_REACHED,
         handoff.EXIT_NO_ACTIVE_TASK,
+        handoff.EXIT_HEAD_UNRESOLVED,
+        handoff.EXIT_HEAD_MISMATCH,
     }
-    assert len(codes) == 5  # all distinct
+    assert len(codes) == 7  # all distinct
     assert 0 not in codes  # never collide with success
+    # 7–12 belong to the merge leg (cli/merge.py) — never reuse them here.
+    assert codes.isdisjoint(range(7, 13))
 
 
 def test_uncommitted_files_reads_porcelain(monkeypatch, tmp_path):
@@ -303,8 +309,11 @@ def _review(monkeypatch, store, verdict: str):
         handoff, "_resolve_task_id",
         lambda project_dir, s, task_arg: ("room-1", None),
     )
-    monkeypatch.setattr(handoff, "_git_head", lambda worktree: "beef5678")
-    return handoff.main(["review", "st-1", "--task", "room-1", verdict])
+    # The verdict SHA comes from the PR head — never the invoker's cwd HEAD
+    # (the shipped reviewer runs in a repo-less scratch dir).
+    monkeypatch.setattr(handoff, "_pr_head_sha", lambda project_dir, pr: "beef5678")
+    monkeypatch.setattr(handoff, "_git_head", lambda worktree: "cwd-head-must-not-be-used")
+    return handoff.main(["review", "st-1", "--task", "room-1", "--pr", "42", verdict])
 
 
 def test_review_approve_advances_to_review_passed(store, monkeypatch):
@@ -401,3 +410,191 @@ def test_git_head_parses_rev_parse_output(monkeypatch, tmp_path):
 
     monkeypatch.setattr(handoff.subprocess, "run", lambda cmd, **kw: _Result())
     assert handoff._git_head(tmp_path) == "a3f9c2e8b1d4567890abcdef12345678deadbeef"
+
+
+# ── verdict SHA from the PR head — fail loud on unresolvable, never NULL ──────
+#
+# Root cause pinned here: the verdict head_sha used to be `git rev-parse HEAD`
+# of the invoker's cwd. The shipped Code Reviewer has NO git repo (scratch
+# dir), so the prompted review flow could only ever record NULL — and every
+# gated merge rejected not_eligible (the 2026-06-10 Scenario A incident).
+
+
+def _count_transition_rows(store) -> int:
+    import sqlite3
+
+    conn = sqlite3.connect(store.db_path)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM transition_log").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_review_pr_argument_is_required(store, monkeypatch):
+    monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
+    with pytest.raises(SystemExit):
+        handoff.main(["review", "st-1", "--task", "room-1", "--approve"])
+
+
+def test_review_verdict_pins_pr_head_not_cwd_head(store, monkeypatch):
+    """The recorded SHA is the PR head from gh — the invoker's cwd HEAD (which
+    the repo-less reviewer cannot even produce) must play no part."""
+    transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
+    assert _review(monkeypatch, store, "--approve") == 0
+    row = _last_transition_row(store, "review_passed")
+    assert row["head_sha"] == "beef5678"  # the PR head…
+    assert row["head_sha"] != "cwd-head-must-not-be-used"  # …not the cwd HEAD
+
+
+def test_review_head_unresolved_records_nothing_and_fails_loud(
+    store, monkeypatch, capsys,
+):
+    """A verdict that pins nothing must never report success: gh failure →
+    loud rejection, non-zero exit, NO transition row (today's silent NULL
+    poisoned the merge gate invisibly)."""
+    transition("st-1", "room-1", "review_pending", caller_role="coder", store=store)
+    monkeypatch.setattr(handoff, "_resolve_store", lambda project_dir: store)
+    monkeypatch.setattr(
+        handoff, "_resolve_task_id",
+        lambda project_dir, s, task_arg: ("room-1", None),
+    )
+    monkeypatch.setattr(handoff, "_pr_head_sha", lambda project_dir, pr: None)
+    rows_before = _count_transition_rows(store)
+
+    code = handoff.main(["review", "st-1", "--task", "room-1", "--pr", "42", "--approve"])
+
+    assert code == handoff.EXIT_HEAD_UNRESOLVED
+    err = capsys.readouterr().err
+    assert "REJECTED [head_unresolved]" in err
+    assert "verdict NOT recorded" in err
+    assert _count_transition_rows(store) == rows_before  # nothing written
+    assert store.get_subtask("st-1", "room-1").state == "review_pending"
+
+
+def test_verify_head_mismatch_burns_attempt_and_records_nothing(
+    patch_gates, monkeypatch, capsys,
+):
+    """Worktree HEAD ≠ PR head: the coder forgot to push — a legitimate coder
+    error that counts as one verify attempt and writes no review_pending row."""
+    store = patch_gates
+    monkeypatch.setattr(handoff, "_pr_head_sha", lambda project_dir, pr: "feed0042")
+    attempts_before = store.get_subtask("st-1", "room-1").verify_attempts
+
+    assert _run() == handoff.EXIT_HEAD_MISMATCH
+    err = capsys.readouterr().err
+    assert "REJECTED [head_mismatch]" in err
+    assert "cafe1234" in err and "feed0042" in err  # names both SHAs
+    assert "push your commits" in err
+    sub = store.get_subtask("st-1", "room-1")
+    assert sub.state == "verify_pending"  # no review_pending row
+    assert sub.verify_attempts == attempts_before + 1  # one attempt burned
+
+
+def test_verify_pr_head_unresolved_fails_loud_without_burning_attempt(
+    patch_gates, monkeypatch, capsys,
+):
+    store = patch_gates
+    monkeypatch.setattr(handoff, "_pr_head_sha", lambda project_dir, pr: None)
+    attempts_before = store.get_subtask("st-1", "room-1").verify_attempts
+
+    assert _run() == handoff.EXIT_HEAD_UNRESOLVED
+    err = capsys.readouterr().err
+    assert "REJECTED [head_unresolved]" in err
+    assert "verify outcome NOT recorded" in err
+    sub = store.get_subtask("st-1", "room-1")
+    assert sub.state == "verify_pending"
+    # Infra failure, not a coder error — the attempt budget is untouched.
+    assert sub.verify_attempts == attempts_before
+
+
+def test_verify_worktree_head_unresolved_fails_loud_instead_of_null(
+    patch_gates, monkeypatch, capsys,
+):
+    """Previously an unresolvable worktree HEAD silently recorded NULL — now
+    it is a loud head_unresolved rejection that records nothing."""
+    store = patch_gates
+    monkeypatch.setattr(handoff, "_git_head", lambda worktree: None)
+
+    assert _run() == handoff.EXIT_HEAD_UNRESOLVED
+    assert "REJECTED [head_unresolved]" in capsys.readouterr().err
+    assert store.get_subtask("st-1", "room-1").state == "verify_pending"
+
+
+def test_pr_head_sha_queries_gh_with_repo_slug(monkeypatch, tmp_path):
+    """cwd-independent by construction: --repo comes from config's repo.url."""
+    from types import SimpleNamespace
+
+    calls = {}
+
+    class _Result:
+        returncode = 0
+        stdout = '{"headRefOid": "a3f9c2e8"}'
+        stderr = ""
+
+    def _fake_run(cmd, **kwargs):
+        calls["cmd"] = cmd
+        return _Result()
+
+    monkeypatch.setattr(
+        handoff, "load_config",
+        lambda project_dir: SimpleNamespace(
+            repo=SimpleNamespace(url="https://github.com/acme/widgets.git"),
+        ),
+    )
+    monkeypatch.setattr(handoff.subprocess, "run", _fake_run)
+    assert handoff._pr_head_sha(tmp_path, 42) == "a3f9c2e8"
+    assert calls["cmd"] == [
+        "gh", "pr", "view", "42", "--json", "headRefOid", "--repo", "acme/widgets",
+    ]
+
+
+def test_pr_head_sha_returns_none_on_failure(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        handoff, "load_config",
+        lambda project_dir: SimpleNamespace(
+            repo=SimpleNamespace(url="https://github.com/acme/widgets.git"),
+        ),
+    )
+
+    class _Fail:
+        returncode = 1
+        stdout = ""
+        stderr = "no such PR"
+
+    monkeypatch.setattr(handoff.subprocess, "run", lambda cmd, **kw: _Fail())
+    assert handoff._pr_head_sha(tmp_path, 42) is None
+
+    class _Empty:
+        returncode = 0
+        stdout = '{"headRefOid": ""}'
+        stderr = ""
+
+    monkeypatch.setattr(handoff.subprocess, "run", lambda cmd, **kw: _Empty())
+    assert handoff._pr_head_sha(tmp_path, 42) is None
+
+    class _Garbage:
+        returncode = 0
+        stdout = "not json"
+        stderr = ""
+
+    monkeypatch.setattr(handoff.subprocess, "run", lambda cmd, **kw: _Garbage())
+    assert handoff._pr_head_sha(tmp_path, 42) is None
+
+
+def test_pr_head_sha_returns_none_on_non_github_url(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        handoff, "load_config",
+        lambda project_dir: SimpleNamespace(
+            repo=SimpleNamespace(url="https://gitlab.example.com/g/p.git"),
+        ),
+    )
+
+    def _boom(cmd, **kw):  # pragma: no cover - must not be called
+        raise AssertionError("gh must not run without a resolvable slug")
+
+    monkeypatch.setattr(handoff.subprocess, "run", _boom)
+    assert handoff._pr_head_sha(tmp_path, 42) is None

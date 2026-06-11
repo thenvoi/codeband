@@ -96,6 +96,18 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
+def _match_pr_head(monkeypatch, repo: Path) -> None:
+    """Stub the PR-head seam (gh) to track the repo's real HEAD.
+
+    PR-pinned verify outcomes require worktree HEAD == PR head; these tests
+    exercise the real git side, so the gh side is made to agree.
+    """
+    monkeypatch.setattr(
+        handoff, "_pr_head_sha",
+        lambda project_dir, pr: _git(repo, "rev-parse", "HEAD"),
+    )
+
+
 def _init_repo(path: Path) -> Path:
     """Initialise a real git repo at ``path`` with one commit on ``main``."""
     path.mkdir(parents=True, exist_ok=True)
@@ -358,6 +370,7 @@ class TestCbPhaseGate:
         project_dir, store = self._project(tmp_path, verify_command="exit 0")
         repo = _init_repo(tmp_path / "repo")
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _match_pr_head(monkeypatch, repo)
         before = _log_count(store, "st-1")
 
         assert self._run(project_dir, repo) == 0
@@ -418,9 +431,15 @@ class TestCbPhaseReviewVerdict:
             transition(sid, "room-1", new_state, caller_role=role, store=store,
                        head_sha=rest[0] if rest else None)
 
-    def _run(self, project_dir, sid, verdict):
+    def _run(self, project_dir, sid, verdict, monkeypatch=None):
+        if monkeypatch is not None:
+            # PR-pinned verdicts: the head SHA comes from the PR (gh seam),
+            # never the invoker's cwd.
+            monkeypatch.setattr(
+                handoff, "_pr_head_sha", lambda project_dir, pr: "sha-pr-head",
+            )
         return handoff.main([
-            "review", sid, "--task", "room-1", verdict,
+            "review", sid, "--task", "room-1", "--pr", "42", verdict,
             "--project-dir", str(project_dir),
         ])
 
@@ -431,12 +450,12 @@ class TestCbPhaseReviewVerdict:
         ("review_pending", "coder"),
     ]
 
-    def test_approve_from_review_pending_passes(self, tmp_path):
+    def test_approve_from_review_pending_passes(self, tmp_path, monkeypatch):
         project_dir, store = self._project(tmp_path)
         self._seed(store, "st-1", self._TO_REVIEW_PENDING)
         before = _log_count(store, "st-1")
 
-        assert self._run(project_dir, "st-1", "--approve") == 0
+        assert self._run(project_dir, "st-1", "--approve", monkeypatch) == 0
         assert store.get_subtask("st-1", "room-1").state == "review_passed"
         assert _log_count(store, "st-1") == before + 1
         last = _log_rows(store, "st-1")[-1]
@@ -445,11 +464,11 @@ class TestCbPhaseReviewVerdict:
         )
         assert last["caller_role"] == "reviewer"
 
-    def test_reject_from_review_pending_fails_review(self, tmp_path):
+    def test_reject_from_review_pending_fails_review(self, tmp_path, monkeypatch):
         project_dir, store = self._project(tmp_path)
         self._seed(store, "st-1", self._TO_REVIEW_PENDING)
 
-        assert self._run(project_dir, "st-1", "--reject") == 0
+        assert self._run(project_dir, "st-1", "--reject", monkeypatch) == 0
         sub = store.get_subtask("st-1", "room-1")
         assert sub.state == "review_failed"
         assert sub.review_round == 1  # a reject counts as one failed review round
@@ -485,7 +504,7 @@ class TestCbPhaseReviewVerdict:
         ],
     )
     def test_verdict_illegal_outside_review_pending_writes_nothing(
-        self, tmp_path, label, chain,
+        self, tmp_path, monkeypatch, label, chain,
     ):
         project_dir, store = self._project(tmp_path)
         self._seed(store, "st-1", chain)
@@ -493,8 +512,8 @@ class TestCbPhaseReviewVerdict:
         before = _log_count(store, "st-1")
 
         # The CLI surfaces the FSM rejection as a non-zero exit…
-        assert self._run(project_dir, "st-1", "--approve") != 0
-        assert self._run(project_dir, "st-1", "--reject") != 0
+        assert self._run(project_dir, "st-1", "--approve", monkeypatch) != 0
+        assert self._run(project_dir, "st-1", "--reject", monkeypatch) != 0
         # …and nothing was written for either attempt.
         assert store.get_subtask("st-1", "room-1").state == state_before
         assert _log_count(store, "st-1") == before
@@ -1247,6 +1266,7 @@ class TestVerifyAttemptCap:
         can approach one cap without affecting the other."""
         repo = _init_repo(tmp_path / "repo")
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _match_pr_head(monkeypatch, repo)
         # Cap high enough that nothing blocks during this test.
         project_dir, store = self._project(
             tmp_path, verify_command="exit 1", max_verify_attempts=20,
@@ -1352,6 +1372,7 @@ class TestActiveRoomResolution:
         project_dir, store = self._project(tmp_path, verify_command="exit 0")
         repo = _init_repo(tmp_path / "repo")
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _match_pr_head(monkeypatch, repo)
 
         rc = handoff.main([
             "verify", "st-1", "--task", self.BOGUS, "--pr", "42",
