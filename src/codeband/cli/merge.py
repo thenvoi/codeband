@@ -10,13 +10,17 @@ SHA-pinned approval grant. The Mergemaster never runs ``gh pr merge`` itself.
 ``--pr`` is required on the first invocation and is persisted onto the
 subtask row (``subtask_states.pr_number``), so every later invocation —
 including the argument-less crash-reconcile re-run — derives the PR number
-from durable state. ``--worktree`` is the directory ``gh`` runs in (repo
-resolution), defaulting to the cwd like the sibling legs.
+from durable state. A ``--pr`` that disagrees with the persisted binding is
+**rejected**: rebinding a queued subtask to a different (possibly
+already-merged) PR would let the reconcile path record a phantom ``merged``.
+``--worktree`` is the directory ``gh`` runs in (repo resolution), defaulting
+to the cwd like the sibling legs.
 
 Invocation flow (each step fail-closed):
 
 a. Resolve the task (active-room pointer, same as verify/review), the
-   subtask, the PR number, and one PR snapshot (state / mergeable / head SHA).
+   subtask, the PR number, and one PR snapshot (state / mergeable / head SHA /
+   head branch name).
 b. **Reconcile first** (idempotency): a subtask already at ``merge_pending``
    whose PR is already ``MERGED`` records the ``merged`` transition and exits
    0 — the crash-recovery path, working with no arguments.
@@ -24,7 +28,15 @@ c. From ``review_passed``: attempt the gated
    ``review_passed → merge_pending`` transition at the PR head SHA. The 2a
    eligibility check runs *inside* the transition; a rejection exits non-zero
    echoing every machine-readable reason. This leg never duplicates the check.
-d. **Approval**: the task's snapshotted ``merge_approval`` approver must have
+d. **Execution-time SHA re-check** — BEFORE any approval logic. The PR head
+   must still equal the SHA on the ``merge_pending`` transition. A push while
+   waiting → ``needs_rebase``, non-zero, naming old and new SHA — before any
+   grant evaluation or approval-request send, so a head-moved subtask is
+   never left permanently un-approvable (the grant could never equal the
+   stale ``pending_sha``, and the request marker would already be burned).
+   Only applies when a queued SHA exists (NULL-pending legacy rows keep their
+   previous behavior).
+e. **Approval**: the task's snapshotted ``merge_approval`` approver must have
    granted a SHA-pinned approval (written by ``cb approve`` onto the subtask
    row) matching the SHA recorded on the ``merge_pending`` transition. If not
    yet granted, the approval request is sent to the resolved approver (task
@@ -32,18 +44,28 @@ d. **Approval**: the task's snapshotted ``merge_approval`` approver must have
    subtask RESTS at ``merge_pending``; re-invocation after approval proceeds.
    The request is sent once per ``merge_pending`` SHA (marker-after-send: the
    ``merge_approval_requested_sha`` marker burns only on a successful send).
-e. **Execution-time SHA re-check**: the PR head must still equal the SHA on
-   the ``merge_pending`` transition. A push while waiting → ``needs_rebase``,
-   non-zero, naming old and new SHA. No execution.
 f. **Mergeability pre-check**: a ``CONFLICTING`` PR → ``needs_rebase``.
-g. **Execute** ``gh pr merge <n> --merge --delete-branch``. Success records
-   the ``merged`` transition (the 2a task-level ``completed`` promotion fires
-   on its own inside the FSM).
-h. Residual failure (permissions, API error, required status check — anything
-   not classified as a conflict) → ``blocked`` with the reason recorded. The
-   watchdog's existing blocked-subtask patrol (escalate-once,
-   marker-after-send — PR #24) delivers the owner escalation; this leg sends
-   nothing itself, so a re-failure can never double-escalate.
+g. **Execute** ``gh pr merge <n> --merge``, pinned to the approved commit
+   via ``--match-head-commit <pending_sha>`` so a push between snapshot and
+   execution can never merge unverified code. Success records the ``merged``
+   transition (the 2a task-level ``completed`` promotion fires on its own
+   inside the FSM). After a merge is *recorded* merged, the remote branch is
+   deleted best-effort (``git push origin --delete <headRefName>``) — never
+   ``--delete-branch``, which would also delete the *local* branch out from
+   under a coder worktree; a delete failure is a warning only.
+h. **Failure classification — verify effects first.** On a non-zero ``gh``
+   exit the PR is re-snapshotted before classifying: an actually-``MERGED``
+   PR records ``merged`` and exits 0 (the merge landed; only the report
+   failed); a moved head → ``needs_rebase`` (covers ``--match-head-commit``
+   rejections); a ``CONFLICTING`` mergeable field (preferred over the
+   ``_CONFLICT_RE`` text fallback) → ``needs_rebase``. Anything else
+   (permissions, API error, required status check) → ``blocked`` with the
+   reason recorded. An unavailable re-snapshot classifies nothing — the
+   subtask rests at ``merge_pending`` for the next reconcile rather than
+   risking a phantom ``blocked`` over a merged PR. The watchdog's existing
+   blocked-subtask patrol (escalate-once, marker-after-send — PR #24)
+   delivers the owner escalation; this leg sends nothing itself, so a
+   re-failure can never double-escalate.
 
 Like the sibling legs, rejections are structured: a stable machine-greppable
 tag plus a distinct exit code per failure mode. All ``gh`` and Band
@@ -81,6 +103,10 @@ EXIT_PR_QUERY_FAILED = 8
 EXIT_NOT_ELIGIBLE = 9
 EXIT_NEEDS_REBASE = 10
 EXIT_MERGE_FAILED = 11
+# ``--pr`` disagrees with the subtask's persisted PR binding. Rebinding is
+# refused outright: pointing a queued subtask at a different (possibly
+# already-merged) PR would let the reconcile path record a phantom ``merged``.
+EXIT_PR_REBIND = 12
 
 # Entry states this leg accepts. ``review_passed`` is the normal first
 # invocation; ``merge_pending`` is the resting/awaiting-approval state and the
@@ -96,16 +122,17 @@ _CONFLICT_RE = re.compile(r"conflict|not mergeable", re.IGNORECASE)
 
 
 def _pr_snapshot(pr_number: int, cwd: Path) -> dict | None:
-    """Return one ``gh pr view`` snapshot: state, mergeable, head SHA.
+    """Return one ``gh pr view`` snapshot: state, mergeable, head SHA + branch.
 
     A single query per invocation supplies every PR-derived decision input
-    (reconcile state, mergeability, execution-time SHA), so the leg cannot
-    contradict itself mid-run. Returns ``None`` when ``gh`` fails or returns
-    unparseable output — callers fail closed.
+    (reconcile state, mergeability, execution-time SHA, the head branch name
+    for the post-merge remote cleanup), so the leg cannot contradict itself
+    mid-run. Returns ``None`` when ``gh`` fails or returns unparseable
+    output — callers fail closed.
     """
     result = subprocess.run(
         ["gh", "pr", "view", str(pr_number),
-         "--json", "state,mergeable,headRefOid"],
+         "--json", "state,mergeable,headRefOid,headRefName"],
         capture_output=True, text=True, cwd=str(cwd),
     )
     if result.returncode != 0:
@@ -118,16 +145,65 @@ def _pr_snapshot(pr_number: int, cwd: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _gh_merge(pr_number: int, cwd: Path) -> tuple[int, str]:
-    """Execute the merge: ``gh pr merge <n> --merge --delete-branch``.
+def _gh_merge(
+    pr_number: int, cwd: Path, pending_sha: str | None,
+) -> tuple[int, str]:
+    """Execute the merge: ``gh pr merge <n> --merge``, pinned to ``pending_sha``.
 
-    Returns ``(exit_code, combined_output)`` for failure classification.
+    ``--match-head-commit <pending_sha>`` (whenever a queued SHA exists) makes
+    GitHub itself refuse the merge if the head moved between our snapshot and
+    the execution — the last unguarded window. No ``--delete-branch``: that
+    flag also deletes the *local* branch, which belongs to a coder worktree;
+    remote cleanup is :func:`_delete_remote_branch`'s job, after the merge is
+    recorded. Returns ``(exit_code, combined_output)`` for failure
+    classification.
     """
+    cmd = ["gh", "pr", "merge", str(pr_number), "--merge"]
+    if pending_sha is not None:
+        cmd += ["--match-head-commit", pending_sha]
     result = subprocess.run(
-        ["gh", "pr", "merge", str(pr_number), "--merge", "--delete-branch"],
-        capture_output=True, text=True, cwd=str(cwd),
+        cmd, capture_output=True, text=True, cwd=str(cwd),
     )
     return result.returncode, (result.stdout or "") + (result.stderr or "")
+
+
+def _delete_remote_branch(pr: dict | None, cwd: Path) -> None:
+    """Best-effort REMOTE-only delete of a merged PR's head branch.
+
+    ``git push origin --delete <headRefName>`` (branch name from the PR
+    snapshot) — never a local delete: local branches belong to coder
+    worktrees. Called only *after* a merge is recorded ``merged``; any
+    failure (missing branch name, git error, already deleted by GitHub's
+    auto-delete) is a printed warning and never affects classification or
+    the exit code.
+    """
+    branch = (pr or {}).get("headRefName") or None
+    if branch is None:
+        print(
+            "cb-phase: warning — no head branch name in the PR snapshot; "
+            "skipping remote branch cleanup.",
+            file=sys.stderr,
+        )
+        return
+    try:
+        result = subprocess.run(
+            ["git", "push", "origin", "--delete", branch],
+            capture_output=True, text=True, cwd=str(cwd),
+        )
+    except OSError as exc:
+        print(
+            f"cb-phase: warning — remote branch delete failed for "
+            f"{branch!r}: {exc}",
+            file=sys.stderr,
+        )
+        return
+    if result.returncode != 0:
+        print(
+            f"cb-phase: warning — could not delete remote branch {branch!r} "
+            f"(exit {result.returncode}): "
+            f"{_output_tail((result.stdout or '') + (result.stderr or ''))}",
+            file=sys.stderr,
+        )
 
 
 def _merge_pending_sha(store: StateStore, subtask_id: str, task_id: str) -> str | None:
@@ -251,9 +327,13 @@ def _cmd_merge(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # PR number: an explicit --pr wins and is persisted (the durable binding
-    # the argument-less reconcile path reads back); otherwise the persisted
-    # value. Neither → nothing to merge against, fail closed.
+    # PR number: the persisted binding is authoritative once set. An explicit
+    # --pr binds on first use (and is persisted — the durable binding the
+    # argument-less reconcile path reads back), is an idempotent no-op when it
+    # matches, and is REJECTED when it disagrees: rebinding a queued subtask
+    # to a different (possibly already-merged) PR would let the reconcile
+    # path record a phantom ``merged``. Neither given nor persisted → nothing
+    # to merge against, fail closed.
     pr_number = args.pr if args.pr is not None else subtask.pr_number
     if pr_number is None:
         print(
@@ -262,7 +342,15 @@ def _cmd_merge(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return EXIT_NO_PR_NUMBER
-    if args.pr is not None and subtask.pr_number != args.pr:
+    if args.pr is not None and subtask.pr_number is not None and subtask.pr_number != args.pr:
+        print(
+            f"REJECTED [pr_rebind]: subtask {args.subtask_id} is already "
+            f"bound to PR #{subtask.pr_number}; refusing to rebind to "
+            f"#{args.pr}.",
+            file=sys.stderr,
+        )
+        return EXIT_PR_REBIND
+    if args.pr is not None and subtask.pr_number is None:
         store.set_pr_number(args.subtask_id, task_id, args.pr)
 
     # One PR snapshot drives every PR-derived decision this invocation.
@@ -294,6 +382,7 @@ def _cmd_merge(args: argparse.Namespace) -> int:
                 f"cb-phase: reconciled — PR #{pr_number} was already merged; "
                 f"subtask {args.subtask_id} → merged (task {task_id})."
             )
+            _delete_remote_branch(pr, worktree)
             return 0
     else:
         # (c) The gated review_passed → merge_pending transition, at the PR
@@ -323,6 +412,30 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     # execution-time re-check.
     pending_sha = _merge_pending_sha(store, args.subtask_id, task_id)
 
+    # (d) Execution-time SHA re-check — BEFORE any approval logic. A push
+    # while queued invalidates the queue entry: fail-closed, no execution,
+    # and crucially no grant evaluation and no approval-request send — a
+    # grant can never equal the stale pending_sha, and burning the request
+    # marker for a SHA that will never merge would strand the subtask
+    # permanently un-approvable. Guarded on a recorded queue SHA: NULL-pending
+    # legacy rows keep their previous behavior.
+    if pending_sha is not None and head_sha != pending_sha:
+        code = _transition_or_fail(
+            args.subtask_id, task_id, "needs_rebase",
+            f"cb-phase merge: head moved while queued "
+            f"({pending_sha} → {head_sha})",
+            store=store,
+        )
+        if code is not None:
+            return code
+        print(
+            f"REJECTED [sha_moved]: PR #{pr_number} head moved while queued — "
+            f"merge_pending was recorded at {pending_sha}, head is now "
+            f"{head_sha}. Subtask → needs_rebase; rework and re-earn verdicts.",
+            file=sys.stderr,
+        )
+        return EXIT_NEEDS_REBASE
+
     # A PR that can never merge (closed without merging) is a residual
     # failure: block before bothering the approver about it.
     if pr_state != "OPEN":
@@ -340,8 +453,11 @@ def _cmd_merge(args: argparse.Namespace) -> int:
         )
         return EXIT_MERGE_FAILED
 
-    # (d) Approval — required for every task in V1 ('none' is rejected at
+    # (e) Approval — required for every task in V1 ('none' is rejected at
     # registration; a NULL snapshot defaults to 'owner', never to skipped).
+    # Runs strictly AFTER the SHA re-check above, so a request is only ever
+    # sent (and its send-once marker only ever burned) for a SHA that can
+    # still merge.
     task = store.get_task(task_id)
     approver_spec = (task.merge_approval if task is not None else None) or "owner"
     subtask = store.get_subtask(args.subtask_id, task_id)
@@ -392,26 +508,6 @@ def _cmd_merge(args: argparse.Namespace) -> int:
         )
         return 0
 
-    # (e) Execution-time SHA re-check: the PR head must still be exactly the
-    # queued SHA. A push while waiting invalidates the queue entry —
-    # fail-closed, no execution; the rebased commit re-earns its verdicts.
-    if head_sha is None or head_sha != pending_sha:
-        code = _transition_or_fail(
-            args.subtask_id, task_id, "needs_rebase",
-            f"cb-phase merge: head moved while queued "
-            f"({pending_sha} → {head_sha})",
-            store=store,
-        )
-        if code is not None:
-            return code
-        print(
-            f"REJECTED [sha_moved]: PR #{pr_number} head moved while queued — "
-            f"merge_pending was recorded at {pending_sha}, head is now "
-            f"{head_sha}. Subtask → needs_rebase; rework and re-earn verdicts.",
-            file=sys.stderr,
-        )
-        return EXIT_NEEDS_REBASE
-
     # (f) Mergeability pre-check: a conflicted PR can never land — send it
     # back for rebase without attempting the merge.
     if pr.get("mergeable") == "CONFLICTING":
@@ -429,8 +525,9 @@ def _cmd_merge(args: argparse.Namespace) -> int:
         )
         return EXIT_NEEDS_REBASE
 
-    # (g) Execute.
-    merge_code, output = _gh_merge(pr_number, worktree)
+    # (g) Execute, pinned to the approved commit. GitHub itself rejects the
+    # merge if the head moved between our snapshot and the execution.
+    merge_code, output = _gh_merge(pr_number, worktree, pending_sha)
     if merge_code == 0:
         code = _transition_or_fail(
             args.subtask_id, task_id, "merged",
@@ -443,14 +540,75 @@ def _cmd_merge(args: argparse.Namespace) -> int:
             f"cb-phase: PR #{pr_number} merged; subtask {args.subtask_id} "
             f"→ merged (task {task_id})."
         )
+        _delete_remote_branch(pr, worktree)
         return 0
 
-    # (h) Failure classification. A conflict discovered only at execution
-    # time is still a rebase problem; everything else (permissions, API
-    # error, required status checks, …) is blocked with the reason recorded —
-    # the watchdog's blocked-subtask patrol escalates to the owner once.
+    # (h) Failure classification — verify effects first. ``gh`` exiting
+    # non-zero does NOT mean the merge did not happen (a timeout after the
+    # merge API call landed produced exactly this misclassification), so the
+    # PR is re-snapshotted before anything is recorded:
+    #
+    #   MERGED              → record merged, exit 0 (only the report failed)
+    #   head ≠ pending_sha  → needs_rebase (covers --match-head-commit
+    #                         rejections)
+    #   CONFLICTING         → needs_rebase (structured field preferred; the
+    #                         _CONFLICT_RE text match is the fallback only)
+    #   otherwise           → blocked, reason recorded — the watchdog's
+    #                         blocked-subtask patrol escalates to the owner
+    #                         once.
+    #
+    # An unavailable re-snapshot classifies nothing: the subtask rests at
+    # ``merge_pending`` (re-invocation reconciles) rather than risking a
+    # phantom ``blocked`` over a PR that actually merged.
     tail = _output_tail(output)
-    if _CONFLICT_RE.search(output):
+    resnap = _pr_snapshot(pr_number, worktree)
+    if resnap is None:
+        print(
+            f"REJECTED [pr_query_failed]: gh pr merge #{pr_number} failed "
+            f"(exit {merge_code}): {tail} — and the post-failure PR snapshot "
+            "is unavailable, so the outcome cannot be classified. Subtask "
+            "rests at merge_pending; re-run to reconcile.",
+            file=sys.stderr,
+        )
+        return EXIT_PR_QUERY_FAILED
+
+    if resnap.get("state") == "MERGED":
+        code = _transition_or_fail(
+            args.subtask_id, task_id, "merged",
+            f"cb-phase merge: post-failure reconcile: gh exited "
+            f"{merge_code} but PR #{pr_number} is MERGED",
+            store=store, head_sha=resnap.get("headRefOid") or None,
+        )
+        if code is not None:
+            return code
+        print(
+            f"cb-phase: PR #{pr_number} merged (gh exited {merge_code} but "
+            f"the merge landed); subtask {args.subtask_id} → merged "
+            f"(task {task_id})."
+        )
+        _delete_remote_branch(resnap, worktree)
+        return 0
+
+    resnap_head = resnap.get("headRefOid") or None
+    if pending_sha is not None and resnap_head != pending_sha:
+        code = _transition_or_fail(
+            args.subtask_id, task_id, "needs_rebase",
+            f"cb-phase merge: head moved during execution "
+            f"({pending_sha} → {resnap_head}); gh exited {merge_code}: {tail}",
+            store=store,
+        )
+        if code is not None:
+            return code
+        print(
+            f"REJECTED [sha_moved]: PR #{pr_number} head moved during "
+            f"execution — merge was pinned to {pending_sha}, head is now "
+            f"{resnap_head}. Subtask → needs_rebase; rework and re-earn "
+            "verdicts.",
+            file=sys.stderr,
+        )
+        return EXIT_NEEDS_REBASE
+
+    if resnap.get("mergeable") == "CONFLICTING" or _CONFLICT_RE.search(output):
         code = _transition_or_fail(
             args.subtask_id, task_id, "needs_rebase",
             f"cb-phase merge: gh reported a conflict merging PR "
