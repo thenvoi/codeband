@@ -383,6 +383,29 @@ class AgentConfigFile(_StrictModel):
         return self.agents[key]
 
 
+def resolve_workspace_path(config: CodebandConfig, project_dir: Path) -> Path:
+    """Resolve ``workspace.path`` to an absolute path — the ONE shared rule.
+
+    A relative ``workspace.path`` resolves against ``$WORKSPACE`` when that
+    env var is set (the Docker images set it to ``/workspace``, the shared
+    volume every container mounts), otherwise against ``project_dir``. An
+    absolute path is returned as-is. The runner, ``cb-phase``/``cb approve``
+    (via ``cli/handoff.py:_resolve_store``), task registration
+    (``state/registration.py:resolve_state_dir``) and ``cb doctor`` all route
+    through this helper: two implementations of this rule is how containers
+    ended up with the runner reading ``/workspace/state/`` while ``cb-phase``
+    looked in ``/app/config/.codeband/state/``.
+    """
+    import os
+
+    ws_path = Path(config.workspace.path)
+    if ws_path.is_absolute():
+        return ws_path
+    workspace_env = os.environ.get("WORKSPACE")
+    base = Path(workspace_env) if workspace_env else project_dir
+    return base / ws_path
+
+
 def load_config(project_dir: Path | None = None) -> CodebandConfig:
     """Load codeband.yaml from project directory (defaults to cwd)."""
     project_dir = project_dir or Path.cwd()

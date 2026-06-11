@@ -144,11 +144,12 @@ def _pr_snapshot(pr_number: int, cwd: Path, repo: str | None = None) -> dict | N
     (reconcile state, mergeability, execution-time SHA, the head branch name
     for the post-merge remote cleanup), so the leg cannot contradict itself
     mid-run. ``repo`` (an ``owner/repo`` slug) pins the query with
-    ``--repo``, dropping the cwd dependence for repo identity — used by
-    ``cb approve``'s grant half, which may run from any cwd; the merge leg
-    itself runs in a real worktree and keeps cwd resolution. Returns
-    ``None`` when ``gh`` fails or returns unparseable output — callers fail
-    closed.
+    ``--repo``, dropping the cwd dependence for repo identity — both ``cb
+    approve``'s grant half (which may run from any cwd) and the merge leg
+    pass the config-derived slug, so a same-numbered PR in whatever repo the
+    cwd happens to be in can never be snapshotted/reconciled. ``cwd`` is kept
+    for git-context purposes only. Returns ``None`` when ``gh`` fails or
+    returns unparseable output — callers fail closed.
     """
     cmd = ["gh", "pr", "view", str(pr_number),
            "--json", "state,mergeable,headRefOid,headRefName"]
@@ -168,21 +169,26 @@ def _pr_snapshot(pr_number: int, cwd: Path, repo: str | None = None) -> dict | N
 
 
 def _gh_merge(
-    pr_number: int, cwd: Path, pending_sha: str | None,
+    pr_number: int, cwd: Path, pending_sha: str | None, repo: str | None = None,
 ) -> tuple[int, str]:
     """Execute the merge: ``gh pr merge <n> --merge``, pinned to ``pending_sha``.
 
     ``--match-head-commit <pending_sha>`` (whenever a queued SHA exists) makes
     GitHub itself refuse the merge if the head moved between our snapshot and
-    the execution — the last unguarded window. No ``--delete-branch``: that
-    flag also deletes the *local* branch, which belongs to a coder worktree;
-    remote cleanup is :func:`_delete_remote_branch`'s job, after the merge is
-    recorded. Returns ``(exit_code, combined_output)`` for failure
-    classification.
+    the execution — the last unguarded window. ``repo`` (an ``owner/repo``
+    slug from config) pins the repo identity with ``--repo`` — same pattern
+    as :func:`_pr_snapshot` — so the merge can never target a same-numbered
+    PR in whatever repo ``cwd`` happens to be in. No ``--delete-branch``:
+    that flag also deletes the *local* branch, which belongs to a coder
+    worktree; remote cleanup is :func:`_delete_remote_branch`'s job, after
+    the merge is recorded. Returns ``(exit_code, combined_output)`` for
+    failure classification.
     """
     cmd = ["gh", "pr", "merge", str(pr_number), "--merge"]
     if pending_sha is not None:
         cmd += ["--match-head-commit", pending_sha]
+    if repo is not None:
+        cmd += ["--repo", repo]
     result = subprocess.run(
         cmd, capture_output=True, text=True, cwd=str(cwd),
     )
@@ -375,8 +381,26 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     if args.pr is not None and subtask.pr_number is None:
         store.set_pr_number(args.subtask_id, task_id, args.pr)
 
+    # Repo identity comes from config (--repo <slug>), never from whatever
+    # repo the worktree cwd happens to be in — same pattern as verify and
+    # the grant half. Without it, a same-numbered PR in another repo could
+    # be reconciled/merged. Underivable slug → an infra failure, exactly
+    # like a failed snapshot: fail closed, nothing written.
+    from codeband.github.prs import repo_slug
+
+    try:
+        slug = repo_slug(load_config(project_dir).repo.url)
+    except ValueError as exc:
+        print(
+            f"REJECTED [pr_query_failed]: cannot derive the GitHub repo slug "
+            f"from config repo.url ({exc}). Fix repo.url in codeband.yaml, "
+            "then re-run.",
+            file=sys.stderr,
+        )
+        return EXIT_PR_QUERY_FAILED
+
     # One PR snapshot drives every PR-derived decision this invocation.
-    pr = _pr_snapshot(pr_number, worktree)
+    pr = _pr_snapshot(pr_number, worktree, repo=slug)
     if pr is None:
         print(
             f"REJECTED [pr_query_failed]: could not query PR #{pr_number} "
@@ -549,7 +573,7 @@ def _cmd_merge(args: argparse.Namespace) -> int:
 
     # (g) Execute, pinned to the approved commit. GitHub itself rejects the
     # merge if the head moved between our snapshot and the execution.
-    merge_code, output = _gh_merge(pr_number, worktree, pending_sha)
+    merge_code, output = _gh_merge(pr_number, worktree, pending_sha, repo=slug)
     if merge_code == 0:
         code = _transition_or_fail(
             args.subtask_id, task_id, "merged",
@@ -583,7 +607,7 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     # ``merge_pending`` (re-invocation reconciles) rather than risking a
     # phantom ``blocked`` over a PR that actually merged.
     tail = _output_tail(output)
-    resnap = _pr_snapshot(pr_number, worktree)
+    resnap = _pr_snapshot(pr_number, worktree, repo=slug)
     if resnap is None:
         print(
             f"REJECTED [pr_query_failed]: gh pr merge #{pr_number} failed "

@@ -502,15 +502,20 @@ async def check_active_room_membership(ctx: Context) -> CheckResult:
     A fresh task room contains only the Conductor; everyone else appears as the
     workflow recruits them. This check makes that visible while debugging.
     """
-    room_file = ctx.project_dir / ".codeband_room"
-    if not room_file.exists():
-        return CheckResult(Status.SKIP, "No active task room (.codeband_room not found)")
-    try:
-        room_id = room_file.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        return CheckResult(Status.WARN, f"Could not read .codeband_room: {exc}")
+    # Same dual-location read as cb-phase: canonical {workspace}/state/
+    # pointer first, legacy <project_dir>/ fallback — a fresh post-relocation
+    # registration writes only the canonical location, and this check must
+    # not SKIP on it. Without a loaded config the workspace (and canonical
+    # pointer) cannot be resolved, so only the legacy location is readable.
+    from codeband.state.registration import read_room_pointer, resolve_state_dir
+
+    if ctx.config is not None:
+        state_dir = resolve_state_dir(ctx.config, ctx.project_dir)
+    else:
+        state_dir = ctx.project_dir
+    room_id = read_room_pointer(ctx.project_dir, state_dir, warn_legacy=False)
     if not room_id:
-        return CheckResult(Status.SKIP, ".codeband_room is empty")
+        return CheckResult(Status.SKIP, "No active task room (.codeband_room not found)")
 
     client = _conductor_rest_client(ctx)
     if isinstance(client, CheckResult):

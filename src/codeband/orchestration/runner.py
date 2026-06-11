@@ -429,19 +429,19 @@ def _export_project_dir_env(project_dir: Path) -> None:
 
 
 def _resolve_workspace_config(config: CodebandConfig, project_dir: Path) -> CodebandConfig:
-    """Resolve workspace path relative to project_dir, returning updated config."""
-    import os
+    """Resolve workspace path relative to project_dir, returning updated config.
+
+    Delegates to ``config.resolve_workspace_path`` — the one shared
+    ``$WORKSPACE``-aware rule, also used by ``cb-phase``/``cb approve``,
+    task registration and ``cb doctor`` — so every consumer agrees on where
+    the workspace (and its ``state/`` dir) lives.
+    """
+    from codeband.config import resolve_workspace_path
 
     ws_path = Path(config.workspace.path)
-    if not ws_path.is_absolute():
-        workspace_env = os.environ.get("WORKSPACE")
-        base = Path(workspace_env) if workspace_env else project_dir
-        resolved = str(base / ws_path)
-    elif not ws_path.exists():
-        resolved = str(ws_path)
+    resolved = str(resolve_workspace_path(config, project_dir))
+    if ws_path.is_absolute() and not ws_path.exists():
         logger.info("Creating workspace directory at %s", resolved)
-    else:
-        resolved = str(ws_path)
     return config.model_copy(
         update={"workspace": config.workspace.model_copy(update={"path": resolved})}
     )

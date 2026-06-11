@@ -105,9 +105,12 @@ def env(monkeypatch, store):
         ),
     )
 
-    def _fake_merge(pr_number, cwd, pending_sha):
+    gh_merge_repos: list[str | None] = []
+
+    def _fake_merge(pr_number, cwd, pending_sha, repo=None):
         gh_merges.append(pr_number)
         gh_merge_pins.append(pending_sha)
+        gh_merge_repos.append(repo)
         return 0, "merged ok"
 
     monkeypatch.setattr(merge, "_gh_merge", _fake_merge)
@@ -123,8 +126,8 @@ def env(monkeypatch, store):
     monkeypatch.setattr(merge, "_delete_remote_branch", _fake_delete)
     return SimpleNamespace(
         store=store, pr=pr, gh_merges=gh_merges, gh_merge_pins=gh_merge_pins,
-        sends=sends, branch_deletes=branch_deletes,
-        snapshot_repos=snapshot_repos,
+        gh_merge_repos=gh_merge_repos, sends=sends,
+        branch_deletes=branch_deletes, snapshot_repos=snapshot_repos,
     )
 
 
@@ -158,6 +161,54 @@ def test_happy_path_preapproved_merges_and_completes_task(env):
     assert [r["head_sha"] for r in _log_rows(env.store, "st-1", "merged")] == [SHA]
     # Last subtask merged → the 2a task-level promotion fires on its own.
     assert env.store.get_task(TASK).status == "completed"
+
+
+def test_merge_leg_snapshot_and_merge_are_repo_pinned(env):
+    """Every gh PR query in the merge leg carries --repo <slug> from config
+    repo.url [S9-7] — completing the gate family's repo pinning (verify and
+    the grant half already do this). Without it, a same-numbered PR in
+    whatever repo the worktree cwd happens to be in could be
+    reconciled/merged."""
+    _grant(env.store)
+    assert _run() == 0
+    assert env.snapshot_repos == ["acme/widgets"]
+    assert env.gh_merge_repos == ["acme/widgets"]
+
+
+def test_gh_merge_argv_carries_repo_flag(monkeypatch):
+    """The real _gh_merge passes --repo <slug> (and keeps --match-head-commit)."""
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(merge.subprocess, "run", fake_run)
+    code, _ = merge._gh_merge(42, Path("."), "sha-1", repo="acme/widgets")
+
+    assert code == 0
+    cmd = captured["cmd"]
+    assert cmd[:5] == ["gh", "pr", "merge", "42", "--merge"]
+    assert cmd[cmd.index("--match-head-commit") + 1] == "sha-1"
+    assert cmd[cmd.index("--repo") + 1] == "acme/widgets"
+
+
+def test_unresolvable_slug_rejects_pr_query_failed(env, monkeypatch, capsys):
+    """An underivable repo slug is an infra failure like a failed snapshot:
+    fail closed before any PR query, no transition recorded."""
+    _grant(env.store)
+    monkeypatch.setattr(
+        merge, "load_config",
+        lambda project_dir: SimpleNamespace(
+            repo=SimpleNamespace(url="https://gitlab.example.com/g/p.git"),
+        ),
+    )
+
+    assert _run() == merge.EXIT_PR_QUERY_FAILED
+    assert "[pr_query_failed]" in capsys.readouterr().err
+    assert env.store.get_subtask("st-1", TASK).state == "review_passed"
+    assert env.snapshot_repos == []
+    assert env.gh_merges == []
 
 
 def test_approval_pending_rests_requests_once_then_executes(env):
@@ -278,7 +329,7 @@ def test_residual_merge_failure_blocks_once_with_reason(env, monkeypatch, capsys
     _grant(env.store)
     attempts: list[int] = []
 
-    def _failing_merge(pr_number, cwd, pending_sha):
+    def _failing_merge(pr_number, cwd, pending_sha, repo=None):
         attempts.append(pr_number)
         return 1, "GraphQL: 2 of 3 required status checks are expected"
 
@@ -305,7 +356,7 @@ def test_execution_time_conflict_classified_as_needs_rebase(env, monkeypatch):
     _grant(env.store)
     monkeypatch.setattr(
         merge, "_gh_merge",
-        lambda pr_number, cwd, pending_sha: (
+        lambda pr_number, cwd, pending_sha, repo=None: (
             1, "Pull request #42 is not mergeable: the merge commit cannot "
                "be cleanly created",
         ),
@@ -326,7 +377,7 @@ def _snapshot_sequence(monkeypatch, *snaps):
     remaining = list(snaps)
     monkeypatch.setattr(
         merge, "_pr_snapshot",
-        lambda pr_number, cwd: dict(remaining.pop(0)) if remaining else None,
+        lambda pr_number, cwd, repo=None: dict(remaining.pop(0)) if remaining else None,
     )
 
 
@@ -337,7 +388,7 @@ def test_gh_failure_with_pr_actually_merged_records_merged(env, monkeypatch, cap
     _grant(env.store)
     monkeypatch.setattr(
         merge, "_gh_merge",
-        lambda pr, cwd, sha: (1, "Post https://api.github.com: i/o timeout"),
+        lambda pr, cwd, sha, repo=None: (1, "Post https://api.github.com: i/o timeout"),
     )
     _snapshot_sequence(monkeypatch, env.pr, {**env.pr, "state": "MERGED"})
 
@@ -359,7 +410,7 @@ def test_gh_failure_with_moved_head_goes_needs_rebase(env, monkeypatch):
     _grant(env.store)
     monkeypatch.setattr(
         merge, "_gh_merge",
-        lambda pr, cwd, sha: (1, "head commit does not match expected SHA"),
+        lambda pr, cwd, sha, repo=None: (1, "head commit does not match expected SHA"),
     )
     _snapshot_sequence(monkeypatch, env.pr, {**env.pr, "headRefOid": "sha-2"})
 
@@ -376,7 +427,7 @@ def test_gh_failure_with_structured_conflicting_field_goes_needs_rebase(
     _grant(env.store)
     monkeypatch.setattr(
         merge, "_gh_merge",
-        lambda pr, cwd, sha: (1, "GraphQL: something opaque went wrong"),
+        lambda pr, cwd, sha, repo=None: (1, "GraphQL: something opaque went wrong"),
     )
     _snapshot_sequence(monkeypatch, env.pr, {**env.pr, "mergeable": "CONFLICTING"})
 
@@ -393,7 +444,7 @@ def test_gh_failure_with_unavailable_resnapshot_classifies_nothing(
     over a PR that actually merged."""
     _grant(env.store)
     monkeypatch.setattr(
-        merge, "_gh_merge", lambda pr, cwd, sha: (1, "network is down"),
+        merge, "_gh_merge", lambda pr, cwd, sha, repo=None: (1, "network is down"),
     )
     _snapshot_sequence(monkeypatch, env.pr)  # second call → None
 
@@ -519,10 +570,20 @@ def test_ungated_task_merges_vacuously_but_approval_still_applies(
         merge, "_resolve_task_id",
         lambda project_dir, store, task_arg: (TASK, None),
     )
-    monkeypatch.setattr(merge, "_pr_snapshot", lambda pr_number, cwd: dict(pr))
+    monkeypatch.setattr(
+        merge, "_pr_snapshot", lambda pr_number, cwd, repo=None: dict(pr),
+    )
     monkeypatch.setattr(
         merge, "_gh_merge",
-        lambda pr_number, cwd, sha: (gh_merges.append(pr_number), (0, "ok"))[1],
+        lambda pr_number, cwd, sha, repo=None: (
+            gh_merges.append(pr_number), (0, "ok"),
+        )[1],
+    )
+    monkeypatch.setattr(
+        merge, "load_config",
+        lambda project_dir: SimpleNamespace(
+            repo=SimpleNamespace(url="https://github.com/acme/widgets.git"),
+        ),
     )
     monkeypatch.setattr(
         merge, "_send_approval_request", lambda *a: sends.append(a),
@@ -809,7 +870,9 @@ def test_exit_codes_distinct_across_both_legs():
 
 
 def test_pr_query_failure_is_fail_closed(env, monkeypatch, capsys):
-    monkeypatch.setattr(merge, "_pr_snapshot", lambda pr_number, cwd: None)
+    monkeypatch.setattr(
+        merge, "_pr_snapshot", lambda pr_number, cwd, repo=None: None,
+    )
 
     assert _run() == merge.EXIT_PR_QUERY_FAILED
     assert "REJECTED [pr_query_failed]" in capsys.readouterr().err

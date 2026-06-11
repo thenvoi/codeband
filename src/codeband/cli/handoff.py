@@ -207,13 +207,16 @@ def resolve_project_dir(flag_value: str | Path = ".") -> Path:
 def _resolve_store(project_dir: Path) -> StateStore:
     """Build the StateStore from the project's codeband.yaml workspace path.
 
-    Mirrors ``kickoff.py`` / ``runner.py``: the DB lives at
-    ``{workspace_path}/state/orchestration.db``.
+    The DB lives at ``{workspace_path}/state/orchestration.db``, with the
+    workspace resolved through ``config.resolve_workspace_path`` — the SAME
+    ``$WORKSPACE``-aware rule the runner uses, so in containers ``cb-phase``
+    reads the shared ``/workspace/state/`` volume instead of looking for the
+    DB/pointer under the project dir.
     """
+    from codeband.config import resolve_workspace_path
+
     config = load_config(project_dir)
-    workspace_path = Path(config.workspace.path)
-    if not workspace_path.is_absolute():
-        workspace_path = project_dir / workspace_path
+    workspace_path = resolve_workspace_path(config, project_dir)
     store = StateStore(workspace_path / "state" / "orchestration.db")
     return store
 

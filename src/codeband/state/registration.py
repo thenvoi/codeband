@@ -179,15 +179,14 @@ def resolve_merge_approval(agents: AgentsConfig) -> str:
 def resolve_state_dir(config: CodebandConfig, project_dir: Path) -> Path:
     """Resolve the workspace ``state/`` dir — same resolution the store uses.
 
-    Mirrors ``cli/handoff.py:_resolve_store`` / ``kickoff.send_task``: the
-    config's ``workspace.path``, made absolute against ``project_dir`` when
-    relative, plus ``state/`` — the directory holding ``orchestration.db``,
-    ``memories.jsonl`` and (now) the active-room pointer.
+    Delegates to :func:`codeband.config.resolve_workspace_path` (the one
+    shared workspace rule, ``$WORKSPACE``-aware — same semantics as the
+    runner), plus ``state/`` — the directory holding ``orchestration.db``,
+    ``memories.jsonl`` and the active-room pointer.
     """
-    workspace = Path(config.workspace.path)
-    if not workspace.is_absolute():
-        workspace = project_dir / workspace
-    return workspace / "state"
+    from codeband.config import resolve_workspace_path
+
+    return resolve_workspace_path(config, project_dir) / "state"
 
 
 def state_pointer_path(state_dir: Path) -> Path:

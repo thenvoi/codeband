@@ -374,6 +374,41 @@ class TestActiveRoomMembership:
         assert result.status == Status.SKIP
         assert ".codeband_room not found" in result.message
 
+    async def test_reads_canonical_state_dir_pointer(self, tmp_path):
+        """Post-relocation registrations write only {workspace}/state/
+        .codeband_room — the check must read it via the same dual-location
+        helper as cb-phase, not SKIP. (The sibling tests below write the
+        legacy <project_dir>/ location and exercise the fallback.)"""
+        cfg = _make_config(tmp_path)
+        acfg = AgentConfigFile(
+            agents={"conductor": AgentCredentials(agent_id="cond-id", api_key="k")}
+        )
+        state_dir = Path(cfg.workspace.path) / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / ".codeband_room").write_text(
+            "deadbeef-1234-5678-9abc-def012345678", encoding="utf-8",
+        )
+        ctx = Context(project_dir=tmp_path, config=cfg, agent_config=acfg)
+
+        fake_participant = type("P", (), {"id": "cond-id"})()
+        fake_resp = type("R", (), {"data": [fake_participant]})()
+
+        async def fake_list(chat_id):
+            assert chat_id == "deadbeef-1234-5678-9abc-def012345678"
+            return fake_resp
+
+        def fake_client(**_):
+            c = type("C", (), {})()
+            c.agent_api_participants = type("A", (), {})()
+            c.agent_api_participants.list_agent_chat_participants = fake_list
+            return c
+
+        with patch("thenvoi_rest.AsyncRestClient", side_effect=fake_client):
+            result = await check_active_room_membership(ctx)
+
+        assert result.status == Status.INFO
+        assert "conductor" in result.message
+
     async def test_reports_present_and_pending_agents(self, tmp_path):
         """Conductor present, others pending — the expected fresh-room state."""
         cfg = _make_config(tmp_path)
