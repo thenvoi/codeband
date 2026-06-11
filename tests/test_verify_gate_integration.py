@@ -67,6 +67,18 @@ def _project(tmp_path, *, verify_command=None):
     return project_dir, store
 
 
+def _match_pr_head(monkeypatch, repo: Path) -> None:
+    """Stub the PR-head seam (gh) to track the repo's real HEAD.
+
+    PR-pinned verify outcomes require worktree HEAD == PR head; these tests
+    exercise the real git side, so the gh side is made to agree.
+    """
+    monkeypatch.setattr(
+        handoff, "_pr_head_sha",
+        lambda project_dir, pr: _git(repo, "rev-parse", "HEAD"),
+    )
+
+
 def _run_verify(project_dir: Path, worktree: Path) -> int:
     return handoff.main([
         "verify", "st-1",
@@ -106,6 +118,7 @@ class TestVerifyFromInProgress:
         _seed_in_progress(store)
         repo = _init_repo(tmp_path / "repo")
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _match_pr_head(monkeypatch, repo)
 
         assert _run_verify(project_dir, repo) == 0
         assert store.get_subtask("st-1", "room-1").state == "review_pending"
@@ -146,6 +159,7 @@ class TestVerifyFromReviewFailed:
         _seed_review_failed(store)
         repo = _init_repo(tmp_path / "repo")
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _match_pr_head(monkeypatch, repo)
 
         assert _run_verify(project_dir, repo) == 0
         assert store.get_subtask("st-1", "room-1").state == "review_pending"
@@ -291,6 +305,7 @@ class TestStartSeedsLifecycle:
         project_dir, store = _project(tmp_path, verify_command="exit 0")
         repo = _init_repo(tmp_path / "repo")
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _match_pr_head(monkeypatch, repo)
 
         assert _run_start(project_dir, repo) == 0
         assert store.get_subtask("st-1", "room-1").state == "in_progress"
@@ -312,6 +327,7 @@ class TestVerifySelfSeedsFromMissingOrPlanned:
         project_dir, store = _project(tmp_path, verify_command="exit 0")
         repo = _init_repo(tmp_path / "repo")
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _match_pr_head(monkeypatch, repo)
         assert store.get_subtask("st-1", "room-1") is None  # nothing ran start
 
         assert _run_verify(project_dir, repo) == 0
@@ -335,6 +351,7 @@ class TestVerifySelfSeedsFromMissingOrPlanned:
         transition("st-1", "room-1", "assigned", caller_role="conductor", store=store)
         repo = _init_repo(tmp_path / "repo")
         monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _match_pr_head(monkeypatch, repo)
 
         assert _run_verify(project_dir, repo) == 0
         assert store.get_subtask("st-1", "room-1").state == "review_pending"

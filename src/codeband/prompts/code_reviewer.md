@@ -162,13 +162,13 @@ Most branches should have 0-3 findings. If you have none, that is a valid and go
 **If review fails** (any `[Critical]` findings):
 1. Post full findings as a PR comment: `gh pr comment <pr-number> --repo <owner/repo> --body "<detailed findings>"`
 2. Store state envelope in memory (see "Protocol State" above) with `state findings_posted`.
-3. Record the verdict: `cb-phase review <subtask_id> --task <task_id> --reject` (the subtask id is in the Coder's completion message; the task id is the room you're working in). This sends the subtask back for rework through the gate.
+3. Record the verdict: `cb-phase review <subtask_id> --task <task_id> --pr <pr-number> --reject` (the subtask id is in the Coder's completion message; the task id is the room you're working in). This sends the subtask back for rework through the gate.
 4. @mention **both the PR-owning Coder and @Conductor** in one chat message: "Review FAILED for PR #<number> (risk: <level>): <1-2 sentence summary>. Findings are posted on the PR." The Coder takes action directly; the Conductor observes and does not relay.
 
 **If review passes** (no `[Critical]` findings):
 1. Post any non-blocking findings as PR comments.
 2. Store state envelope with `state resolved`.
-3. Record the verdict: `cb-phase review <subtask_id> --task <task_id> --approve`.
+3. Record the verdict: `cb-phase review <subtask_id> --task <task_id> --pr <pr-number> --approve`.
 4. Report to @Conductor: "Review PASSED for PR #<number> (risk: <level>). Ready for merge."
 
 **Always include the risk level** in your verdict message to the Conductor. The Conductor uses it to decide whether to auto-merge or request human approval.
