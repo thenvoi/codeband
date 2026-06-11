@@ -90,16 +90,33 @@ def _is_terminal_protocol_message(content: Any) -> bool:
     return isinstance(content, str) and bool(_TERMINAL_PROTOCOL_RE.search(content))
 
 
-# Subtask states the mechanical-progress patrol watches (RFC WS4 + Stage-2).
-# ``in_progress`` / ``verify_pending`` are the coder's working states;
-# ``merge_pending`` is the merge queue — a subtask resting there with no
-# progress (e.g. an approval request nobody acted on) goes stale like any
+# Subtask states the mechanical-progress patrol watches (RFC WS4 + Stage-2 +
+# S2-1/F12). ``in_progress`` / ``verify_pending`` are the coder's working
+# states; ``merge_pending`` is the merge queue — a subtask resting there with
+# no progress (e.g. an approval request nobody acted on) goes stale like any
 # other and escalates through the standard stall path. The watchdog never
 # queries GitHub to *reconcile* a merge — that is ``cb-phase merge``'s
 # idempotent reconcile step; only the existing PR-activity progress signal
 # applies here, as it does to every patrolled state.
+#
+# ``review_pending`` / ``review_failed`` / ``review_passed`` / ``needs_rebase``
+# are the resting states where dispatched work can silently die: a reviewer
+# that never renders a verdict, a coder that never picks up the rework, a
+# Mergemaster that never queues the approved PR, a rebase nobody starts. The
+# mechanical signals are state-agnostic — transition recency applies to every
+# state (each of these is *entered* by a transition, so the row exists), and
+# the PR-activity signal applies wherever ``pr_number`` is set (it is, by the
+# verify leg, for everything at/past ``review_pending``).
 _PATROLLED_SUBTASK_STATES: frozenset[str] = frozenset(
-    {"in_progress", "verify_pending", "merge_pending"}
+    {
+        "in_progress",
+        "verify_pending",
+        "review_pending",
+        "review_failed",
+        "review_passed",
+        "merge_pending",
+        "needs_rebase",
+    }
 )
 
 
@@ -125,6 +142,12 @@ class AgentHealthState:
     # Most recent progress timestamp observed from the transition log or the
     # PR's updatedAt — whichever is newer.
     last_transition_timestamp: datetime | None = None
+    # Consecutive patrols where EVERY attempted mechanical signal read FAILED
+    # (git error, gh error, store error — as opposed to returned-but-unchanged).
+    # Such a patrol observed nothing and does not count toward the stall cap
+    # (S6-F6: observation vs absence); this counter makes a permanently
+    # degraded probe visible at debug level.
+    no_data_patrols: int = 0
 
 
 class WatchdogDaemon:
@@ -700,17 +723,31 @@ class WatchdogDaemon:
         import asyncio
 
         branch = (sub.metadata or {}).get("branch") if sub.metadata else None
-        git_head = (
-            await asyncio.to_thread(self._git_head, branch) if branch else None
-        )
-        pr_ts = (
-            await asyncio.to_thread(self._pr_updated_at, sub.pr_number)
-            if sub.pr_number is not None
-            else None
-        )
-        transition_ts = await asyncio.to_thread(
+        # Observation vs absence (S6-F6): count how many signal reads were
+        # *attempted* and how many FAILED to yield any data (git error, gh
+        # error, store error). "Returned but unchanged" is an observation —
+        # only a no-data read counts as failed.
+        reads_attempted = 0
+        reads_failed = 0
+
+        git_head = None
+        if branch:
+            reads_attempted += 1
+            git_head = await asyncio.to_thread(self._git_head, branch)
+            if git_head is None:
+                reads_failed += 1
+        pr_ts = None
+        if sub.pr_number is not None:
+            reads_attempted += 1
+            pr_ts = await asyncio.to_thread(self._pr_updated_at, sub.pr_number)
+            if pr_ts is None:
+                reads_failed += 1
+        reads_attempted += 1
+        transition_ok, transition_ts = await asyncio.to_thread(
             self._latest_transition, sub.subtask_id, sub.task_id,
         )
+        if not transition_ok:
+            reads_failed += 1
         # Newest of the two timestamped signals (PR update vs. transition log).
         latest_ts = max(
             (t for t in (pr_ts, transition_ts) if t is not None),
@@ -722,6 +759,21 @@ class WatchdogDaemon:
         if health is None:
             health = AgentHealthState(last_seen=now)
             self._subtask_state[key] = health
+
+        # A patrol where EVERY attempted read failed observed nothing — it is
+        # not evidence of a stall and must not advance the stall counter.
+        # Track it separately so a permanently degraded probe (broken git,
+        # expired gh auth) stays visible instead of silently freezing the cap.
+        if reads_failed == reads_attempted:
+            health.no_data_patrols += 1
+            logger.debug(
+                "Subtask %s: all %d mechanical signal reads failed "
+                "(%d consecutive no-data patrols) — not counted toward "
+                "the stall cap",
+                sub.subtask_id, reads_attempted, health.no_data_patrols,
+            )
+            return
+        health.no_data_patrols = 0
 
         progressed = False
         if git_head is not None and git_head != health.last_git_head:
@@ -750,8 +802,13 @@ class WatchdogDaemon:
             health.patrol_visits_without_progress >= self._config.max_phase_visits
             and not health.escalated
         ):
-            health.escalated = True
-            await self._send_blocked_escalation(sub)
+            # Marker-after-send (S6-F7n), matching the two sibling rungs: the
+            # escalate-once marker burns only when the escalation reports
+            # success (FSM transition applied or alert landed), so a transient
+            # failure retries next patrol. A double-send is acceptable; a
+            # silent permanent stall is not.
+            if await self._send_blocked_escalation(sub):
+                health.escalated = True
 
     def _git_head(self, branch: str) -> str | None:
         """Return the commit SHA at ``branch``, or ``None`` if it can't be read.
@@ -806,18 +863,24 @@ class WatchdogDaemon:
             return None
         return _parse_ts(data.get("updatedAt"))
 
-    def _latest_transition(self, subtask_id: str, task_id: str) -> datetime | None:
-        """Return ``MAX(timestamp)`` from the transition log for a subtask.
+    def _latest_transition(
+        self, subtask_id: str, task_id: str,
+    ) -> tuple[bool, datetime | None]:
+        """Return ``(ok, MAX(timestamp))`` from the transition log for a subtask.
 
         Reads the store's SQLite file directly (read-only) since the
         Workstream-1 store surface does not expose a transition-log query. The
-        table may be empty (e.g. before the FSM from Workstream 2 is wired up),
-        in which case this returns ``None``. The read is task-scoped — a same-id
-        subtask from another task must not count as progress here.
+        read is task-scoped — a same-id subtask from another task must not
+        count as progress here.
+
+        ``ok`` distinguishes observation from absence (S6-F6): ``(True, None)``
+        means the query succeeded and found no rows (e.g. before the FSM is
+        wired up) — an *observation*; ``(False, None)`` means the read itself
+        FAILED (no db path, sqlite error) and nothing was observed.
         """
         db_path = getattr(self._store, "db_path", None)
         if db_path is None:
-            return None
+            return False, None
         try:
             conn = sqlite3.connect(db_path, timeout=5.0)
             try:
@@ -830,17 +893,23 @@ class WatchdogDaemon:
                 conn.close()
         except sqlite3.Error:
             logger.debug("Could not read transition_log", exc_info=True)
-            return None
+            return False, None
         if not row or row[0] is None:
-            return None
-        return _parse_ts(row[0])
+            return True, None
+        return True, _parse_ts(row[0])
 
-    async def _send_blocked_escalation(self, sub: Any) -> None:
+    async def _send_blocked_escalation(self, sub: Any) -> bool:
         """Mark a stalled subtask blocked and notify the Conductor + human.
 
         The FSM owns the canonical ``blocked`` transition; we apply it via
         :meth:`_mark_blocked_via_fsm`. Either way (applied or not) the human and
         Conductor are alerted via a chat message in the task's room.
+
+        Returns ``True`` when the escalation took effect — the FSM transition
+        applied *or* the room alert landed — so the caller can burn its
+        escalate-once marker (marker-after-send, S6-F7n). ``False`` means
+        nothing happened (no transition, no alert): the caller retries on the
+        next patrol instead of silently never escalating again.
         """
         import asyncio
 
@@ -869,7 +938,7 @@ class WatchdogDaemon:
             logger.debug("Could not resolve room for blocked subtask", exc_info=True)
 
         if room_id is None:
-            return
+            return fsm_applied
 
         from thenvoi_rest.types import ChatMessageRequest
 
@@ -891,6 +960,8 @@ class WatchdogDaemon:
             logger.exception(
                 "Failed to post blocked-subtask alert for %s", sub.subtask_id,
             )
+            return fsm_applied
+        return True
 
     def _mark_blocked_via_fsm(self, sub: Any) -> bool:
         """Transition the subtask to ``blocked`` via the FSM.

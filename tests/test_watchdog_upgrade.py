@@ -810,3 +810,209 @@ class TestProbeRepoContext:
         daemon = self._daemon()
         assert daemon._pr_updated_at(42) is not None
         assert calls == [["gh", "pr", "view", "42", "--json", "state,updatedAt"]]
+
+# ── patrol coverage: resting states where dispatched work can die (S2-1/F12) ─
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    ["needs_rebase", "review_pending", "review_failed", "review_passed"],
+)
+async def test_resting_states_are_patrolled(tmp_path, monkeypatch, state):
+    """A stale subtask in any resting state crosses the stall cap and blocks.
+
+    These are the states where dispatched work can silently die (a reviewer
+    that never renders a verdict, a coder that never picks up rework, a
+    Mergemaster that never queues the approved PR, a rebase nobody starts).
+    The mechanical signals are state-agnostic: transition recency applies to
+    every state, and the PR signal applies because pr_number is set.
+    """
+    store = _seed_store(tmp_path, state=state)
+    signals = {"head": "abc123", "pr_updated": BASELINE_PR_TS}
+    monkeypatch.setattr(subprocess, "run", _make_run(signals))
+
+    rest = _mock_rest()
+    daemon = _daemon(store, config=WatchdogConfig(max_phase_visits=2), rest=rest)
+    now = datetime.now(UTC)
+    for _ in range(5):
+        await daemon._check_subtask_progress(now)
+
+    rest.agent_api_messages.create_agent_chat_message.assert_awaited_once()
+    assert store.get_subtask(SUBTASK_ID, TASK_ID).state == "blocked"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    ["needs_rebase", "review_pending", "review_failed", "review_passed"],
+)
+async def test_resting_state_progress_resets_counter(tmp_path, monkeypatch, state):
+    """The standard progress signals (here: PR activity) reset the counter for
+    the newly patrolled states, so an actively-progressing subtask never
+    escalates."""
+    store = _seed_store(tmp_path, state=state)
+    signals = {"head": "abc123", "pr_updated": BASELINE_PR_TS}
+    monkeypatch.setattr(subprocess, "run", _make_run(signals))
+
+    daemon = _daemon(store, config=WatchdogConfig(max_phase_visits=10))
+    now = datetime.now(UTC)
+    await daemon._check_subtask_progress(now)  # baseline
+    await daemon._check_subtask_progress(now)  # stale → 1
+    health = daemon._subtask_state[(TASK_ID, SUBTASK_ID)]
+    assert health.patrol_visits_without_progress == 1
+
+    signals["pr_updated"] = "2026-06-01T12:00:00+00:00"  # PR activity
+    await daemon._check_subtask_progress(now)
+    assert health.patrol_visits_without_progress == 0
+
+
+# ── observation vs absence (S6-F6) ───────────────────────────────────────────
+
+def _make_failing_run():
+    """Every git/gh shell-out fails — the probe is fully degraded."""
+    def _run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+
+    return _run
+
+
+@pytest.mark.asyncio
+async def test_all_signal_reads_failed_does_not_count(tmp_path, monkeypatch):
+    """A patrol where EVERY signal read failed observed nothing — it must not
+    advance the stall counter (and so can never escalate a subtask it cannot
+    see). The consecutive no-data counter tracks the degraded probe instead."""
+    store = _seed_store(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _make_failing_run())
+
+    rest = _mock_rest()
+    daemon = _daemon(store, config=WatchdogConfig(max_phase_visits=2), rest=rest)
+    # Sever the one remaining signal: the transition-log read itself fails.
+    monkeypatch.setattr(
+        daemon, "_latest_transition", lambda subtask_id, task_id: (False, None),
+    )
+
+    now = datetime.now(UTC)
+    for _ in range(5):
+        await daemon._check_subtask_progress(now)
+
+    health = daemon._subtask_state[(TASK_ID, SUBTASK_ID)]
+    assert health.patrol_visits_without_progress == 0
+    assert health.no_data_patrols == 5
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+    assert store.get_subtask(SUBTASK_ID, TASK_ID).state == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_returned_but_unchanged_still_counts(tmp_path, monkeypatch):
+    """Failed git/gh reads with a SUCCESSFUL transition-log read still count:
+    'queried fine, nothing new' is an observation of absence, not a failure —
+    the stall cap must keep working when only the shell-outs are degraded."""
+    store = _seed_store(tmp_path)
+    monkeypatch.setattr(subprocess, "run", _make_failing_run())
+    _insert_transition(store, timestamp="2026-05-31T00:00:00+00:00")
+
+    rest = _mock_rest()
+    daemon = _daemon(store, config=WatchdogConfig(max_phase_visits=2), rest=rest)
+    now = datetime.now(UTC)
+    for _ in range(4):
+        await daemon._check_subtask_progress(now)
+
+    health = daemon._subtask_state[(TASK_ID, SUBTASK_ID)]
+    assert health.no_data_patrols == 0
+    assert store.get_subtask(SUBTASK_ID, TASK_ID).state == "blocked"
+    rest.agent_api_messages.create_agent_chat_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_no_data_counter_resets_on_recovery(tmp_path, monkeypatch):
+    """Once any signal read succeeds again, the no-data counter resets."""
+    store = _seed_store(tmp_path)
+    failing = {"on": True}
+
+    def _run(cmd, *args, **kwargs):
+        if failing["on"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+        if cmd[0] == "git":
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123", stderr="")
+        payload = json.dumps({"state": "OPEN", "updatedAt": BASELINE_PR_TS})
+        return subprocess.CompletedProcess(cmd, 0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    daemon = _daemon(store, config=WatchdogConfig(max_phase_visits=10))
+    monkeypatch.setattr(
+        daemon, "_latest_transition", lambda subtask_id, task_id: (False, None),
+    )
+
+    now = datetime.now(UTC)
+    await daemon._check_subtask_progress(now)
+    health = daemon._subtask_state[(TASK_ID, SUBTASK_ID)]
+    assert health.no_data_patrols == 1
+
+    failing["on"] = False
+    await daemon._check_subtask_progress(now)
+    assert health.no_data_patrols == 0
+
+
+# ── rung-3 marker-after-send (S6-F7n) ────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_stall_escalation_marker_burns_only_on_success(tmp_path, monkeypatch):
+    """health.escalated burns only when the escalation took effect (FSM
+    transition or alert landed) — a patrol where both failed retries next
+    patrol instead of silently never escalating. A double-send is acceptable;
+    a silent permanent stall is not."""
+    store = _seed_store(tmp_path)
+    signals = {"head": "abc123", "pr_updated": BASELINE_PR_TS}
+    monkeypatch.setattr(subprocess, "run", _make_run(signals))
+
+    rest = _mock_rest()
+    send = rest.agent_api_messages.create_agent_chat_message
+    send.side_effect = RuntimeError("band is down")
+    daemon = _daemon(store, config=WatchdogConfig(max_phase_visits=2), rest=rest)
+    # Both halves fail: no FSM effect, no alert.
+    monkeypatch.setattr(daemon, "_mark_blocked_via_fsm", lambda sub: False)
+
+    now = datetime.now(UTC)
+    for _ in range(3):  # baseline + 2 stale → cap crossed, escalation fails
+        await daemon._check_subtask_progress(now)
+    health = daemon._subtask_state[(TASK_ID, SUBTASK_ID)]
+    assert health.escalated is False
+    assert send.await_count == 1
+
+    await daemon._check_subtask_progress(now)  # still failing → retried
+    assert send.await_count == 2
+    assert health.escalated is False
+
+    send.side_effect = None  # Band recovers — the alert lands
+    await daemon._check_subtask_progress(now)
+    assert send.await_count == 3
+    assert health.escalated is True
+
+    await daemon._check_subtask_progress(now)  # escalate-once: no further send
+    assert send.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_stall_escalation_fsm_success_burns_marker_despite_send_failure(
+    tmp_path, monkeypatch,
+):
+    """The FSM transition landing IS an effect: the marker burns even when the
+    room alert fails, because the durable blocked state already escalates via
+    the owner patrol."""
+    store = _seed_store(tmp_path)
+    signals = {"head": "abc123", "pr_updated": BASELINE_PR_TS}
+    monkeypatch.setattr(subprocess, "run", _make_run(signals))
+
+    rest = _mock_rest()
+    rest.agent_api_messages.create_agent_chat_message.side_effect = (
+        RuntimeError("band is down")
+    )
+    daemon = _daemon(store, config=WatchdogConfig(max_phase_visits=2), rest=rest)
+
+    now = datetime.now(UTC)
+    for _ in range(3):
+        await daemon._check_subtask_progress(now)
+
+    health = daemon._subtask_state[(TASK_ID, SUBTASK_ID)]
+    assert health.escalated is True
+    assert store.get_subtask(SUBTASK_ID, TASK_ID).state == "blocked"

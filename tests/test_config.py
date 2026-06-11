@@ -609,3 +609,18 @@ class TestEnvVarDocsCanary:
         assert var in doc.read_text(encoding="utf-8"), (
             f"{var} missing from docs/CONFIGURATION.md Environment Variables section"
         )
+
+
+class TestMaxRebaseRounds:
+    """agents.max_rebase_rounds — the S2-1 rebase-round cap knob."""
+
+    def test_default_matches_fsm(self):
+        from codeband.state.fsm import MAX_REBASE_ROUNDS
+
+        assert AgentsConfig().max_rebase_rounds == MAX_REBASE_ROUNDS == 3
+
+    def test_zero_rejected(self):
+        """A zero cap would block every subtask on its first send-back."""
+        with pytest.raises(ValueError) as excinfo:
+            AgentsConfig(max_rebase_rounds=0)
+        assert "max_rebase_rounds" in str(excinfo.value)

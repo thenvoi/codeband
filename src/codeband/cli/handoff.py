@@ -75,7 +75,9 @@ next step, and each failure mode exits with a distinct code.
     BLOCKED [cap_reached]: <n> verify attempts. Escalated to human; stop and await.
 
 The tags (``dirty_tree`` / ``pr_query_failed`` / ``no_pr`` / ``wrong_pr`` /
-``verify_failed`` / ``cap_reached``) are part of the contract — they feed the
+``verify_failed`` / ``cap_reached`` — plus ``review_cap_reached`` from the
+review-round cap below and ``rebase_cap_reached`` from the merge leg's
+rebase-round cap in ``cli/merge.py``) are part of the contract — they feed the
 verify-gate activation's telemetry later — so keep them stable. The machine-greppable contract extends to config/IO
 failures too: :func:`main` catches anything the legs raise and prints a
 single tagged line instead of a traceback —
@@ -552,7 +554,11 @@ def _walk_to_verify_pending(
       verify_pending``: the rebased commit re-enters the normal verify walk
       and re-earns every SHA-pinned verdict from scratch. This rework is NOT
       a review round — the review-round cap counts reviewer rejections, not
-      merge-gate send-backs; the watchdog's stall cap backstops a rebase loop.
+      merge-gate send-backs; the durable rebase-round cap
+      (``agents.max_rebase_rounds``, counted by the FSM on each entry to
+      ``needs_rebase`` and enforced at the merge leg's classification)
+      bounds a rebase loop — the watchdog's stall cap by construction cannot,
+      since each round writes fresh transition rows.
 
     Any other state prints a clear error and returns exit code 1.
     """

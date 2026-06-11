@@ -119,6 +119,14 @@ class SubtaskRow:
     # the coder commits real code each attempt, so git HEAD keeps advancing.
     # Distinct from both ``review_round`` and the watchdog's stall counter.
     verify_attempts: int = 0
+    # Count of merge-gate send-backs — incremented by the FSM each time the
+    # subtask *enters* ``needs_rebase`` (one send-back = one rebase round).
+    # Durable, like ``review_round``, so the per-subtask rebase-round cap
+    # survives a crash/reopen mid-loop. Bounds the rebase loop neither sibling
+    # cap can see: each round writes fresh transition rows (so the watchdog's
+    # stall cap by construction never fires) and never enters ``review_failed``
+    # (so the review-round cap never counts it).
+    rebase_rounds: int = 0
     # ── Merge-approval grant (Stage-2 merge leg) ─────────────────────────────
     # The durable record ``cb-phase merge`` queries before executing a merge.
     # ``cb approve`` writes the grant, SHA-pinned to the PR head it approved
@@ -160,6 +168,7 @@ CREATE TABLE IF NOT EXISTS subtask_states (
     metadata        TEXT,
     review_round    INTEGER NOT NULL DEFAULT 0,
     verify_attempts INTEGER NOT NULL DEFAULT 0,
+    rebase_rounds   INTEGER NOT NULL DEFAULT 0,
     merge_approved_by             TEXT,
     merge_approved_sha            TEXT,
     merge_approval_requested_sha  TEXT,
@@ -177,6 +186,14 @@ CREATE TABLE IF NOT EXISTS transition_log (
     reason      TEXT,
     head_sha    TEXT
 );
+
+-- Every hot transition_log query (merge-eligibility legs, the watchdog's
+-- recency/blocked-reason readers, the merge leg's pending-SHA anchor) filters
+-- on exactly (task_id, subtask_id). ``IF NOT EXISTS`` + running on every
+-- ``StateStore`` construction makes this both the fresh-DB path and the
+-- migration path for pre-index DBs.
+CREATE INDEX IF NOT EXISTS idx_transition_log_task_subtask
+    ON transition_log(task_id, subtask_id);
 """
 
 
@@ -255,6 +272,11 @@ class StateStore:
             conn.execute(
                 "ALTER TABLE subtask_states "
                 "ADD COLUMN verify_attempts INTEGER NOT NULL DEFAULT 0"
+            )
+        if "rebase_rounds" not in cols:
+            conn.execute(
+                "ALTER TABLE subtask_states "
+                "ADD COLUMN rebase_rounds INTEGER NOT NULL DEFAULT 0"
             )
         if "merge_approved_by" not in cols:
             conn.execute(
@@ -611,6 +633,7 @@ def _subtask_from_row(row: sqlite3.Row) -> SubtaskRow:
         metadata=json.loads(raw_metadata) if raw_metadata else None,
         review_round=row["review_round"],
         verify_attempts=row["verify_attempts"],
+        rebase_rounds=row["rebase_rounds"],
         merge_approved_by=row["merge_approved_by"],
         merge_approved_sha=row["merge_approved_sha"],
         merge_approval_requested_sha=row["merge_approval_requested_sha"],

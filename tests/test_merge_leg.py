@@ -102,6 +102,7 @@ def env(monkeypatch, store):
         merge, "load_config",
         lambda project_dir: SimpleNamespace(
             repo=SimpleNamespace(url="https://github.com/acme/widgets.git"),
+            agents=SimpleNamespace(max_rebase_rounds=3),
         ),
     )
 
@@ -583,6 +584,7 @@ def test_ungated_task_merges_vacuously_but_approval_still_applies(
         merge, "load_config",
         lambda project_dir: SimpleNamespace(
             repo=SimpleNamespace(url="https://github.com/acme/widgets.git"),
+            agents=SimpleNamespace(max_rebase_rounds=3),
         ),
     )
     monkeypatch.setattr(
@@ -878,3 +880,69 @@ def test_pr_query_failure_is_fail_closed(env, monkeypatch, capsys):
     assert "REJECTED [pr_query_failed]" in capsys.readouterr().err
     assert env.store.get_subtask("st-1", TASK).state == "review_passed"
     assert env.sends == [] and env.gh_merges == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rebase-round cap (S2-1)
+
+
+def _rework_to_review_passed(store, sid="st-1", sha=SHA):
+    """Walk a needs_rebase subtask back to review_passed (legal edges only)."""
+    for new_state, role, head in [
+        ("in_progress", "coder", None),
+        ("verify_pending", "coder", None),
+        ("review_pending", "coder", sha),
+        ("review_passed", "reviewer", sha),
+    ]:
+        transition(sid, TASK, new_state, caller_role=role, store=store,
+                   head_sha=head)
+
+
+def test_rebase_loop_hits_cap_and_blocks(env, capsys):
+    """An active rebase loop is bounded: the send-back past the cap escalates
+    to blocked with the BLOCKED [rebase_cap_reached] tag instead of another
+    needs_rebase round. The cap is the env-stubbed agents.max_rebase_rounds=3.
+    """
+    _grant(env.store)
+    env.pr["mergeable"] = "CONFLICTING"  # every attempt classifies needs_rebase
+
+    for expected_round in (1, 2, 3):
+        assert _run() == merge.EXIT_NEEDS_REBASE
+        sub = env.store.get_subtask("st-1", TASK)
+        assert sub.state == "needs_rebase"
+        assert sub.rebase_rounds == expected_round
+        _rework_to_review_passed(env.store)
+
+    # Round 4: at the cap — escalates instead of sending back again.
+    assert _run() == merge.EXIT_REBASE_CAP_REACHED
+    err = capsys.readouterr().err
+    assert "BLOCKED [rebase_cap_reached]" in err
+    sub = env.store.get_subtask("st-1", TASK)
+    assert sub.state == "blocked"
+    assert sub.rebase_rounds == 3  # the blocked escalation is not a round
+    blocked = _log_rows(env.store, "st-1", "blocked")
+    assert len(blocked) == 1
+    assert "rebase-round cap 3 reached" in blocked[0]["reason"]
+
+
+def test_rebase_round_counter_survives_restart(env):
+    """The cap holds across a crash/reopen: a fresh StateStore on the same DB
+    reads the committed rebase_rounds, so a restarted merge leg still blocks."""
+    _grant(env.store)
+    env.pr["mergeable"] = "CONFLICTING"
+
+    assert _run() == merge.EXIT_NEEDS_REBASE
+    reopened = StateStore(env.store.db_path)
+    assert reopened.get_subtask("st-1", TASK).rebase_rounds == 1
+
+
+def test_sha_moved_send_back_also_counts_toward_cap(env, capsys):
+    """The execution-queue SHA re-check routes through the same capped helper."""
+    _grant(env.store)
+
+    # Queue at SHA, then move the head: sha_moved → needs_rebase round 1.
+    transition("st-1", TASK, "merge_pending", caller_role="mergemaster",
+               store=env.store, head_sha=SHA)
+    env.pr["headRefOid"] = "sha-2"
+    assert _run() == merge.EXIT_NEEDS_REBASE
+    assert env.store.get_subtask("st-1", TASK).rebase_rounds == 1

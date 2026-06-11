@@ -67,6 +67,15 @@ h. **Failure classification — verify effects first.** On a non-zero ``gh``
    delivers the owner escalation; this leg sends nothing itself, so a
    re-failure can never double-escalate.
 
+Every ``needs_rebase`` classification above (d / f / h) is additionally
+bounded by the durable per-subtask rebase-round cap
+(``agents.max_rebase_rounds``, counted by the FSM on each entry to
+``needs_rebase``): at the cap the send-back escalates the subtask to
+``blocked`` with ``BLOCKED [rebase_cap_reached]`` instead — see
+:func:`_needs_rebase_or_blocked`. An active rebase loop writes fresh
+transition rows every cycle, so the watchdog's stall cap by construction
+never fires on it; this cap is what bounds it.
+
 Like the sibling legs, rejections are structured: a stable machine-greppable
 tag plus a distinct exit code per failure mode. All ``gh`` and Band
 interactions live behind thin module-level functions so tests monkeypatch
@@ -113,6 +122,11 @@ EXIT_MERGE_FAILED = 11
 # refused outright: pointing a queued subtask at a different (possibly
 # already-merged) PR would let the reconcile path record a phantom ``merged``.
 EXIT_PR_REBIND = 12
+# The rebase-round cap (S2-1): the subtask has already been sent back for
+# rebase ``agents.max_rebase_rounds`` times, so this send-back escalates it to
+# ``blocked`` instead — see :func:`_needs_rebase_or_blocked`. (13–16 are taken
+# by the verify leg back in ``cli/handoff.py``; the numbering continues here.)
+EXIT_REBASE_CAP_REACHED = 17
 
 # Entry states this leg accepts. ``review_passed`` is the normal first
 # invocation; ``merge_pending`` is the resting/awaiting-approval state and the
@@ -335,6 +349,66 @@ def _transition_or_fail(
     return None
 
 
+def _max_rebase_rounds(project_dir: Path) -> int:
+    """Return the configured per-subtask rebase-round cap (live-read)."""
+    return load_config(project_dir).agents.max_rebase_rounds
+
+
+def _needs_rebase_or_blocked(
+    subtask_id: str,
+    task_id: str,
+    reason: str,
+    *,
+    store: StateStore,
+    project_dir: Path,
+) -> int | None:
+    """Send a subtask back for rebase — or escalate at the rebase-round cap.
+
+    Every ``needs_rebase`` classification in this leg routes through here
+    (S2-1). An active rebase loop writes fresh transition rows every cycle, so
+    the watchdog's stall cap by construction never fires on it; the durable
+    ``rebase_rounds`` counter (incremented by the FSM on each entry to
+    ``needs_rebase``) is what bounds it. Below the cap, applies the
+    ``needs_rebase`` transition and returns ``None`` — the call site prints its
+    specific ``REJECTED [...]`` message and returns ``EXIT_NEEDS_REBASE``. At
+    the cap, escalates the subtask to ``blocked`` instead (mirroring the
+    review-round cap's mechanics in ``cli/handoff.py``), prints
+    ``BLOCKED [rebase_cap_reached]`` and returns ``EXIT_REBASE_CAP_REACHED``;
+    any rejected transition returns its failure code. The FSM enforces the
+    same cap inside :func:`~codeband.state.fsm.transition` (defense in depth);
+    this proactive check is what turns the rejection into the escalation.
+    """
+    from codeband.state.fsm import transition as fsm_transition
+
+    sub = store.get_subtask(subtask_id, task_id)
+    rounds = getattr(sub, "rebase_rounds", 0) if sub is not None else 0
+    cap = _max_rebase_rounds(project_dir)
+    if rounds >= cap:
+        code = _transition_or_fail(
+            subtask_id, task_id, "blocked",
+            f"rebase-round cap {cap} reached — {reason}",
+            store=store,
+        )
+        if code is not None:
+            return code
+        print(
+            f"BLOCKED [rebase_cap_reached]: {rounds} rebase rounds. "
+            "Escalated to human; stop and await.",
+            file=sys.stderr,
+        )
+        return EXIT_REBASE_CAP_REACHED
+    try:
+        fsm_transition(
+            subtask_id, task_id, "needs_rebase",
+            caller_role="mergemaster", reason=reason, store=store,
+            max_rebase_rounds=cap,
+        )
+    except InvalidTransitionError as exc:
+        print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
+        return 1
+    return None
+
+
 def _cmd_merge(args: argparse.Namespace) -> int:
     project_dir = resolve_project_dir(args.project_dir)
     worktree = Path(args.worktree).resolve()
@@ -466,11 +540,11 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     # permanently un-approvable. Guarded on a recorded queue SHA: NULL-pending
     # legacy rows keep their previous behavior.
     if pending_sha is not None and head_sha != pending_sha:
-        code = _transition_or_fail(
-            args.subtask_id, task_id, "needs_rebase",
+        code = _needs_rebase_or_blocked(
+            args.subtask_id, task_id,
             f"cb-phase merge: head moved while queued "
             f"({pending_sha} → {head_sha})",
-            store=store,
+            store=store, project_dir=project_dir,
         )
         if code is not None:
             return code
@@ -557,10 +631,10 @@ def _cmd_merge(args: argparse.Namespace) -> int:
     # (f) Mergeability pre-check: a conflicted PR can never land — send it
     # back for rebase without attempting the merge.
     if pr.get("mergeable") == "CONFLICTING":
-        code = _transition_or_fail(
-            args.subtask_id, task_id, "needs_rebase",
+        code = _needs_rebase_or_blocked(
+            args.subtask_id, task_id,
             f"cb-phase merge: PR #{pr_number} is conflicted against its base",
-            store=store,
+            store=store, project_dir=project_dir,
         )
         if code is not None:
             return code
@@ -637,11 +711,11 @@ def _cmd_merge(args: argparse.Namespace) -> int:
 
     resnap_head = resnap.get("headRefOid") or None
     if pending_sha is not None and resnap_head != pending_sha:
-        code = _transition_or_fail(
-            args.subtask_id, task_id, "needs_rebase",
+        code = _needs_rebase_or_blocked(
+            args.subtask_id, task_id,
             f"cb-phase merge: head moved during execution "
             f"({pending_sha} → {resnap_head}); gh exited {merge_code}: {tail}",
-            store=store,
+            store=store, project_dir=project_dir,
         )
         if code is not None:
             return code
@@ -655,11 +729,11 @@ def _cmd_merge(args: argparse.Namespace) -> int:
         return EXIT_NEEDS_REBASE
 
     if resnap.get("mergeable") == "CONFLICTING" or _CONFLICT_RE.search(output):
-        code = _transition_or_fail(
-            args.subtask_id, task_id, "needs_rebase",
+        code = _needs_rebase_or_blocked(
+            args.subtask_id, task_id,
             f"cb-phase merge: gh reported a conflict merging PR "
             f"#{pr_number}: {tail}",
-            store=store,
+            store=store, project_dir=project_dir,
         )
         if code is not None:
             return code

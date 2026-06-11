@@ -315,6 +315,19 @@ class AgentsConfig(_StrictModel):
     # subtask on its first verify attempt.
     max_verify_attempts: int = Field(default=20, ge=1)
 
+    # Per-subtask rebase-round cap (S2-1). Once a subtask has *entered*
+    # ``needs_rebase`` this many times (merge-gate send-backs: a moved head
+    # while queued, a conflicted PR), the merge leg escalates the next
+    # send-back to ``blocked`` (``BLOCKED [rebase_cap_reached]``) instead of
+    # another rework cycle. Bounds the one loop neither sibling cap can see:
+    # each rebase round writes fresh transition rows, so the watchdog's stall
+    # cap (``watchdog.max_phase_visits``) by construction never fires, and the
+    # loop never enters ``review_failed``, so ``max_review_rounds`` never
+    # counts it. Live-read by ``cli/merge.py`` like the sibling caps; default
+    # matches ``fsm.MAX_REBASE_ROUNDS``. ge=1: a zero would block every
+    # subtask on its first send-back.
+    max_rebase_rounds: int = Field(default=3, ge=1)
+
     def total_agent_count(self) -> int:
         """Band.ai seats used (excluding Watchdog — reuses Conductor creds)."""
         return (

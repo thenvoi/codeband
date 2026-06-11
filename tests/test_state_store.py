@@ -431,3 +431,114 @@ def test_concurrent_writers_do_not_corrupt(tmp_path: Path) -> None:
 
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_transition_log_index_on_fresh_db(tmp_path: Path) -> None:
+    """A fresh DB carries the (task_id, subtask_id) transition_log index (S8-F2)."""
+    store = StateStore(tmp_path / "state" / "orchestration.db")
+    conn = sqlite3.connect(store.db_path)
+    try:
+        names = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    assert "idx_transition_log_task_subtask" in names
+
+
+def test_transition_log_index_on_migrated_db(tmp_path: Path) -> None:
+    """A pre-index DB gains the index when StateStore is constructed against it.
+
+    The ``CREATE INDEX IF NOT EXISTS`` in the schema script runs on every
+    construction, so it doubles as the migration path — verify it lands on an
+    old-schema DB and that the legacy rows stay readable.
+    """
+    db_path = tmp_path / "state" / "orchestration.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE tasks ("
+        "task_id TEXT PRIMARY KEY, description TEXT NOT NULL, "
+        "room_id TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'active')"
+    )
+    conn.execute(
+        "CREATE TABLE transition_log ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "subtask_id TEXT NOT NULL, task_id TEXT NOT NULL, "
+        "from_state TEXT NOT NULL, to_state TEXT NOT NULL, "
+        "caller_role TEXT NOT NULL, timestamp TEXT NOT NULL, reason TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO transition_log "
+        "(subtask_id, task_id, from_state, to_state, caller_role, timestamp) "
+        "VALUES ('st-1', 'old-1', 'planned', 'assigned', 'conductor', "
+        "'2020-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    StateStore(db_path)  # schema script runs CREATE INDEX IF NOT EXISTS
+
+    conn = sqlite3.connect(db_path)
+    try:
+        names = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        count = conn.execute("SELECT COUNT(*) FROM transition_log").fetchone()[0]
+    finally:
+        conn.close()
+    assert "idx_transition_log_task_subtask" in names
+    assert count == 1  # legacy rows untouched
+
+
+def test_rebase_rounds_migrated_onto_legacy_subtask_table(tmp_path: Path) -> None:
+    """A pre-existing subtask_states table without ``rebase_rounds`` is migrated.
+
+    Guarded ALTER, matching review_round's pattern: legacy rows backfill to 0
+    and read back without KeyError.
+    """
+    db_path = tmp_path / "state" / "orchestration.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE tasks ("
+        "task_id TEXT PRIMARY KEY, description TEXT NOT NULL, "
+        "room_id TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'active')"
+    )
+    conn.execute(
+        "INSERT INTO tasks (task_id, description, room_id, created_at, status) "
+        "VALUES ('old-1', 'legacy', 'old-1', '2020-01-01T00:00:00+00:00', 'active')"
+    )
+    conn.execute(
+        "CREATE TABLE subtask_states ("
+        "subtask_id TEXT NOT NULL, "
+        "task_id TEXT NOT NULL REFERENCES tasks(task_id), "
+        "state TEXT NOT NULL DEFAULT 'planned', "
+        "assigned_worker TEXT, pr_number INTEGER, "
+        "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, metadata TEXT, "
+        "review_round INTEGER NOT NULL DEFAULT 0, "
+        "verify_attempts INTEGER NOT NULL DEFAULT 0, "
+        "merge_approved_by TEXT, merge_approved_sha TEXT, "
+        "merge_approval_requested_sha TEXT, "
+        "PRIMARY KEY (task_id, subtask_id))"
+    )
+    conn.execute(
+        "INSERT INTO subtask_states "
+        "(subtask_id, task_id, created_at, updated_at) "
+        "VALUES ('st-1', 'old-1', '2020-01-01T00:00:00+00:00', "
+        "'2020-01-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    store = StateStore(db_path)  # runs the guarded migration
+
+    legacy = store.get_subtask("st-1", "old-1")
+    assert legacy is not None
+    assert legacy.rebase_rounds == 0  # backfilled, no KeyError

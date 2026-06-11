@@ -153,3 +153,101 @@ def test_no_transition_out_of_terminal_state(store):
     with pytest.raises(InvalidTransitionError):
         transition("st-1", "room-1", "abandoned", caller_role="conductor", store=store)
     assert store.get_subtask("st-1", "room-1").state == "merged"
+
+
+# ── rebase-round counting + cap (S2-1) ───────────────────────────────────────
+
+def _walk_to_review_passed(store, sid="st-1", sha="sha-1"):
+    for new_state, role, head in [
+        ("assigned", "conductor", None),
+        ("in_progress", "coder", None),
+        ("verify_pending", "coder", None),
+        ("review_pending", "coder", sha),
+        ("review_passed", "reviewer", sha),
+    ]:
+        transition(sid, "room-1", new_state, caller_role=role, store=store,
+                   head_sha=head)
+
+
+def _rework_to_review_passed(store, sid="st-1", sha="sha-1"):
+    """Walk a needs_rebase subtask back to review_passed (legal edges only)."""
+    for new_state, role, head in [
+        ("in_progress", "coder", None),
+        ("verify_pending", "coder", None),
+        ("review_pending", "coder", sha),
+        ("review_passed", "reviewer", sha),
+    ]:
+        transition(sid, "room-1", new_state, caller_role=role, store=store,
+                   head_sha=head)
+
+
+def test_entering_needs_rebase_increments_rebase_rounds(store):
+    """One merge-gate send-back = one durable rebase round, counted by the FSM."""
+    _walk_to_review_passed(store)
+    assert store.get_subtask("st-1", "room-1").rebase_rounds == 0
+
+    transition("st-1", "room-1", "needs_rebase", caller_role="mergemaster",
+               store=store)
+    assert store.get_subtask("st-1", "room-1").rebase_rounds == 1
+
+    _rework_to_review_passed(store)
+    transition("st-1", "room-1", "needs_rebase", caller_role="mergemaster",
+               store=store)
+    assert store.get_subtask("st-1", "room-1").rebase_rounds == 2
+
+
+def test_rebase_rounds_survive_process_restart(store):
+    """The counter is durable — a reopened store reads the committed count."""
+    _walk_to_review_passed(store)
+    transition("st-1", "room-1", "needs_rebase", caller_role="mergemaster",
+               store=store)
+
+    reopened = StateStore(store.db_path)  # fresh instance, same file
+    assert reopened.get_subtask("st-1", "room-1").rebase_rounds == 1
+
+
+def test_needs_rebase_rejected_at_cap(store):
+    """The FSM refuses another send-back at the cap; blocked stays legal."""
+    _walk_to_review_passed(store)
+    for _ in range(2):
+        transition("st-1", "room-1", "needs_rebase", caller_role="mergemaster",
+                   store=store, max_rebase_rounds=2)
+        _rework_to_review_passed(store)
+
+    with pytest.raises(InvalidTransitionError, match="Rebase-round cap"):
+        transition("st-1", "room-1", "needs_rebase", caller_role="mergemaster",
+                   store=store, max_rebase_rounds=2)
+    # The rejection wrote nothing; the escalation escape remains legal.
+    assert store.get_subtask("st-1", "room-1").state == "review_passed"
+    assert store.get_subtask("st-1", "room-1").rebase_rounds == 2
+    transition("st-1", "room-1", "blocked", caller_role="watchdog", store=store)
+    assert store.get_subtask("st-1", "room-1").state == "blocked"
+
+
+def test_review_round_and_rebase_rounds_are_independent(store):
+    """A reviewer rejection and a merge-gate send-back advance separate counters."""
+    for new_state, role, head in [
+        ("assigned", "conductor", None),
+        ("in_progress", "coder", None),
+        ("verify_pending", "coder", None),
+        ("review_pending", "coder", "sha-1"),
+        ("review_failed", "reviewer", None),
+    ]:
+        transition("st-1", "room-1", new_state, caller_role=role, store=store,
+                   head_sha=head)
+    sub = store.get_subtask("st-1", "room-1")
+    assert sub.review_round == 1
+    assert sub.rebase_rounds == 0
+
+    for new_state, role, head in [
+        ("in_progress", "coder", None),
+        ("verify_pending", "coder", None),
+        ("review_pending", "coder", "sha-1"),
+        ("review_passed", "reviewer", "sha-1"),
+        ("needs_rebase", "mergemaster", None),
+    ]:
+        transition("st-1", "room-1", new_state, caller_role=role, store=store,
+                   head_sha=head)
+    sub = store.get_subtask("st-1", "room-1")
+    assert sub.review_round == 1
+    assert sub.rebase_rounds == 1

@@ -65,6 +65,19 @@ logger = logging.getLogger(__name__)
 # round. The review-round cap bounds exactly that productive-but-circular loop.
 MAX_REVIEW_ROUNDS = 3
 
+# Per-subtask rebase-round cap (S2-1). A subtask may *enter* ``needs_rebase``
+# at most this many times; the next attempt is rejected and the merge leg
+# escalates the subtask to ``blocked`` instead (``BLOCKED [rebase_cap_reached]``
+# in ``cli/merge.py``). This is the *default*; callers (and
+# ``config.AgentsConfig.max_rebase_rounds``) may override it via the
+# ``max_rebase_rounds`` argument to :func:`transition`.
+#
+# It is a DISTINCT mechanism from both siblings: an active rebase loop writes
+# fresh transition rows every cycle, so the watchdog's ``max_phase_visits``
+# stall cap BY CONSTRUCTION never fires on it, and it never enters
+# ``review_failed``, so the review-round cap never counts it.
+MAX_REBASE_ROUNDS = 3
+
 
 class InvalidTransitionError(Exception):
     """Raised when a requested transition is not permitted.
@@ -311,6 +324,7 @@ def transition(
     *,
     store: StateStore,
     max_review_rounds: int = MAX_REVIEW_ROUNDS,
+    max_rebase_rounds: int = MAX_REBASE_ROUNDS,
     head_sha: str | None = None,
 ) -> None:
     """Atomically advance a subtask to ``new_state``.
@@ -333,6 +347,14 @@ def transition(
       committed count inside the exclusive transaction, so it is race-safe and
       survives a crash/reopen (the count is durable). This bounds a productive
       loop that the watchdog's stall cap never catches.
+    * **Rebase-round counting + cap.** Entering ``needs_rebase`` increments the
+      subtask's durable ``rebase_rounds`` in the same transaction (one
+      merge-gate send-back = one rebase round) — and is rejected once the count
+      has reached ``max_rebase_rounds``; the subtask must instead go to
+      ``blocked``. An active rebase loop writes fresh transition rows every
+      cycle, so the watchdog's stall cap by construction never fires on it; this
+      counter is what bounds it. The merge leg (``cli/merge.py``) checks the cap
+      proactively and escalates with ``BLOCKED [rebase_cap_reached]``.
     * **The merge-eligibility gate (Stage-2).** Entering ``merge_pending``
       additionally requires :func:`check_merge_eligibility` to pass for the
       ``head_sha`` argument — every verdict leg in the task's
@@ -350,10 +372,10 @@ def transition(
       promotion), and only an ``'active'`` task is promoted (``'superseded'``
       keeps its status).
 
-    ``store`` and ``max_review_rounds`` are keyword-only so the positional
-    signature matches the RFC while still letting callers (and tests) inject the
-    concrete store and override the cap (e.g. from
-    ``config.AgentsConfig.max_review_rounds``).
+    ``store``, ``max_review_rounds`` and ``max_rebase_rounds`` are keyword-only
+    so the positional signature matches the RFC while still letting callers
+    (and tests) inject the concrete store and override the caps (e.g. from
+    ``config.AgentsConfig.max_review_rounds`` / ``max_rebase_rounds``).
 
     ``head_sha`` (keyword-only, default ``None``) pins the transition to the
     exact commit it was recorded against — ``cb-phase`` passes the worktree's
@@ -375,12 +397,13 @@ def transition(
         conn.execute("BEGIN EXCLUSIVE")
         try:
             row = conn.execute(
-                "SELECT state, review_round FROM subtask_states "
+                "SELECT state, review_round, rebase_rounds FROM subtask_states "
                 "WHERE task_id = ? AND subtask_id = ?",
                 (task_id, subtask_id),
             ).fetchone()
             current_state = row["state"] if row is not None else "planned"
             review_round = row["review_round"] if row is not None else 0
+            rebase_rounds = row["rebase_rounds"] if row is not None else 0
 
             if not _is_allowed(current_state, caller_role, new_state):
                 raise InvalidTransitionError(
@@ -402,6 +425,18 @@ def transition(
                     f"{review_round} of max {max_review_rounds} failed reviews. "
                     "No further rework is permitted — escalate by transitioning "
                     "this subtask to 'blocked'."
+                )
+
+            # Runtime cap guard (rebase): another merge-gate send-back is only
+            # legal while the subtask has rebase rounds left. At the cap,
+            # reject with an actionable error — ``blocked`` remains the legal
+            # escape (the merge leg escalates there proactively).
+            if new_state == "needs_rebase" and rebase_rounds >= max_rebase_rounds:
+                raise InvalidTransitionError(
+                    f"Rebase-round cap reached for subtask {subtask_id!r}: "
+                    f"{rebase_rounds} of max {max_rebase_rounds} merge-gate "
+                    "send-backs. No further rebase rework is permitted — "
+                    "escalate by transitioning this subtask to 'blocked'."
                 )
 
             # Merge-eligibility gate: the only edge into ``merge_pending``
@@ -435,6 +470,17 @@ def transition(
                 conn.execute(
                     "UPDATE subtask_states "
                     "SET state = ?, updated_at = ?, review_round = review_round + 1 "
+                    "WHERE task_id = ? AND subtask_id = ?",
+                    (new_state, now, task_id, subtask_id),
+                )
+            # One merge-gate send-back = one rebase round. Increment on *entry*
+            # to needs_rebase, in the same exclusive transaction (durable, like
+            # review_round above).
+            elif new_state == "needs_rebase":
+                conn.execute(
+                    "UPDATE subtask_states "
+                    "SET state = ?, updated_at = ?, "
+                    "rebase_rounds = rebase_rounds + 1 "
                     "WHERE task_id = ? AND subtask_id = ?",
                     (new_state, now, task_id, subtask_id),
                 )
