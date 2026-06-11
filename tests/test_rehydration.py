@@ -189,3 +189,40 @@ def test_run_agent_forever_falls_back_to_none_on_rehydration_error(tmp_path, mon
         )
 
     assert captured["rc"] is None
+
+
+def test_run_agent_forever_survives_activity_log_oserror(tmp_path, monkeypatch):
+    """The crash handler's own AGENT_CRASH log line raising OSError must not
+    kill the reconnect-forever loop it reports on (S6-F9)."""
+    from codeband.orchestration import runner
+
+    monkeypatch.setattr(runner, "_RECONNECT_BASE_DELAY_SECONDS", 0)
+
+    cycles = {"n": 0}
+
+    class _FakeAgent:
+        async def run(self):
+            cycles["n"] += 1
+            if cycles["n"] >= 3:
+                raise asyncio.CancelledError  # end the otherwise-infinite loop
+            raise RuntimeError("agent crashed")
+
+    class _DiskFullActivity:
+        calls = 0
+
+        def log(self, *a, **k):
+            type(self).calls += 1
+            raise OSError(28, "No space left on device")
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            runner._run_agent_forever(
+                lambda recovery_context=None: _FakeAgent(),
+                "conductor", _DiskFullActivity(),
+            )
+        )
+
+    # Two crashes were each logged (and each log raised); the loop lived on
+    # to the third cycle regardless.
+    assert cycles["n"] == 3
+    assert _DiskFullActivity.calls == 2

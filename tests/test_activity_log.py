@@ -129,3 +129,67 @@ class TestActivityEvent:
         event = ActivityEvent(**data)
         assert event.event_type == "MERGE_COMPLETED"
         assert event.details["branch"] == "codeband/player-0/auth"
+
+
+class TestTornLineRobustness:
+    """One malformed line must not kill `cb log` forever (S6-F8)."""
+
+    def test_reader_skips_torn_line_with_warning(self, tmp_path: Path, caplog):
+        log_path = tmp_path / "activity.jsonl"
+        logger = ActivityLogger(log_path)
+        logger.log("SYSTEM_START", "codeband", "Starting")
+        # A torn line — a crash mid-append left half a JSON object.
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write('{"timestamp": "2026-06-11T00:00:00+00:00", "event_ty\n')
+        logger.log("SESSION_START", "coder-0", "Session #1")
+
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            events = ActivityReader(log_path).read()
+
+        assert [e.event_type for e in events] == ["SYSTEM_START", "SESSION_START"]
+        assert any("malformed" in r.message.lower() for r in caplog.records)
+
+    def test_reader_skips_wrong_shape_lines(self, tmp_path: Path):
+        """Valid JSON that isn't an event (wrong keys, non-dict) is skipped too."""
+        log_path = tmp_path / "activity.jsonl"
+        log_path.write_text(
+            '{"timestamp": "2026-06-11T00:00:00+00:00", "event_type": "A", '
+            '"agent": "x", "summary": "ok", "details": null}\n'
+            '["not", "an", "event"]\n'
+            '{"unexpected": "keys"}\n'
+            '{"timestamp": "not-a-date", "event_type": "B", "agent": "x", '
+            '"summary": "bad ts", "details": null}\n',
+            encoding="utf-8",
+        )
+        # The bad-timestamp line only trips the `since` filter path.
+        events = ActivityReader(log_path).read(
+            since=datetime.now(UTC) - timedelta(days=365),
+        )
+        assert [e.event_type for e in events] == ["A"]
+
+    def test_concurrent_appends_do_not_tear_lines(self, tmp_path: Path):
+        """Appends hold an exclusive flock — parallel writers never interleave."""
+        import threading
+
+        log_path = tmp_path / "activity.jsonl"
+        logger = ActivityLogger(log_path)
+
+        def write_many(agent: str) -> None:
+            for i in range(50):
+                logger.log("EVENT", agent, f"line {i}", payload="x" * 256)
+
+        threads = [
+            threading.Thread(target=write_many, args=(f"agent-{n}",))
+            for n in range(4)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 200
+        for line in lines:
+            json.loads(line)  # every line parses — nothing torn

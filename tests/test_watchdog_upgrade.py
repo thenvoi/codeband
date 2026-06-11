@@ -318,8 +318,11 @@ async def test_patrol_still_nudges_stale_agent_with_store(tmp_path, monkeypatch)
     rest.agent_api_chats.list_agent_chats = AsyncMock(
         return_value=_chats_resp([room]),
     )
+    # 10 minutes: stale against the 300s threshold, comfortably inside the
+    # client-side read window (2 x max threshold = 30min) the agent-API path
+    # now applies after fetch.
     rest.agent_api_messages.list_agent_messages = AsyncMock(
-        return_value=MagicMock(data=[_msg("agent-p0", minutes_ago=30)]),
+        return_value=MagicMock(data=[_msg("agent-p0", minutes_ago=10)]),
     )
     parts = MagicMock()
     parts.data = [
@@ -528,10 +531,12 @@ async def test_owner_agent_participant_is_never_nudged(tmp_path, monkeypatch):
     rest.agent_api_chats.list_agent_chats = AsyncMock(
         return_value=_chats_resp([room]),
     )
+    # 10 minutes: stale against the 300s threshold, inside the client-side
+    # read window the agent-API path now applies after fetch.
     rest.agent_api_messages.list_agent_messages = AsyncMock(
         return_value=MagicMock(data=[
-            _msg("owner-agent", minutes_ago=30),  # Agent-typed owner, very stale
-            _msg("agent-p0", minutes_ago=30),     # non-owner agent, stale
+            _msg("owner-agent", minutes_ago=10),  # Agent-typed owner, stale
+            _msg("agent-p0", minutes_ago=10),     # non-owner agent, stale
         ]),
     )
     parts = MagicMock()
@@ -1016,3 +1021,102 @@ async def test_stall_escalation_fsm_success_burns_marker_despite_send_failure(
     health = daemon._subtask_state[(TASK_ID, SUBTASK_ID)]
     assert health.escalated is True
     assert store.get_subtask(SUBTASK_ID, TASK_ID).state == "blocked"
+
+
+# ── patrol cost: mention-pattern cache + client-side read window (S8-F1) ────
+
+class TestMentionPatternCache:
+    def test_patterns_compiled_once_per_participant_set(self):
+        from codeband.agents.watchdog import _mention_patterns
+
+        participants = frozenset({("p1", "Coder-Claude-0"), ("p2", "Reviewer-Codex-0")})
+        first = _mention_patterns(participants)
+        second = _mention_patterns(frozenset(participants))
+        assert first is second  # lru_cache hit — no recompilation
+
+    def test_cached_patterns_keep_boundary_semantics(self):
+        from codeband.agents.watchdog import _mentioned_participant_ids
+
+        names = {"p1": "Coder-Claude-0", "p2": "Coder-Claude-01"}
+
+        class _Msg:
+            mentions = None
+            content = "ping @Coder-Claude-0 please"
+
+        assert _mentioned_participant_ids(_Msg(), names) == {"p1"}
+
+        class _Email:
+            mentions = None
+            content = "mail me at me@Coder-Claude-0"
+
+        assert _mentioned_participant_ids(_Email(), names) == set()
+
+    def test_empty_names_excluded(self):
+        from codeband.agents.watchdog import _mention_patterns
+
+        patterns = _mention_patterns(frozenset({("p1", ""), ("p2", "Name")}))
+        assert [pid for pid, _ in patterns] == ["p2"]
+
+
+@pytest.mark.asyncio
+async def test_agent_api_messages_bounded_client_side(tmp_path):
+    """The free-tier agent-API path has no server-side `since` param, so the
+    window bound is applied client-side after fetch — old history never
+    reaches the per-message mention scan. Messages with no/unparseable
+    timestamp are kept (the patrol loop already skips them)."""
+    store = _seed_store(tmp_path)
+    now = datetime.now(UTC)
+
+    def _m(mid, ts):
+        m = MagicMock()
+        m.inserted_at = ts
+        m.id = mid
+        return m
+
+    recent = _m("recent", now - timedelta(minutes=5))
+    ancient = _m("ancient", now - timedelta(days=30))
+    no_ts = _m("no-ts", None)
+
+    rest = _mock_rest()
+    rest.agent_api_messages.list_agent_messages = AsyncMock(
+        return_value=MagicMock(data=[recent, ancient, no_ts]),
+    )
+    daemon = _daemon(store, config=WatchdogConfig(), rest=rest)
+
+    since = now - timedelta(minutes=60)
+    messages = await daemon._list_messages(ROOM_ID, since)
+    assert [m.id for m in messages] == ["recent", "no-ts"]
+
+
+@pytest.mark.asyncio
+async def test_human_api_messages_not_filtered_client_side(tmp_path):
+    """The human-API path passes `since` server-side; what comes back is
+    returned as-is."""
+    store = _seed_store(tmp_path)
+    now = datetime.now(UTC)
+
+    old_msg = MagicMock()
+    old_msg.inserted_at = now - timedelta(days=30)
+
+    human = MagicMock()
+    human.human_api_messages = MagicMock()
+    human.human_api_messages.list_my_chat_messages = AsyncMock(
+        return_value=MagicMock(data=[old_msg]),
+    )
+
+    from codeband.agents.watchdog import WatchdogDaemon
+
+    daemon = WatchdogDaemon(
+        config=WatchdogConfig(),
+        rest_client=_mock_rest(),
+        agent_id="agent-wd",
+        conductor_id="agent-cond",
+        state_store=store,
+        human_rest_client=human,
+    )
+    since = now - timedelta(minutes=60)
+    messages = await daemon._list_messages(ROOM_ID, since)
+    assert messages == [old_msg]
+    human.human_api_messages.list_my_chat_messages.assert_awaited_once_with(
+        chat_id=ROOM_ID, since=since,
+    )

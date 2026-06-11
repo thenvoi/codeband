@@ -182,6 +182,25 @@ def _patch_band_local_runtime() -> None:
     RoomPresence._subscribe_to_existing_rooms = _codeband_subscribe_to_existing_rooms
 
 
+def _log_activity_safe(
+    activity: object, event_type: str, name: str, summary: str,
+) -> None:
+    """Best-effort activity append inside a supervision loop (S6-F9).
+
+    The reconnect-forever loop is the thing being reported on — its own
+    bookkeeping must never kill it. Without this, the crash handler's
+    AGENT_CRASH log line raising ``OSError`` (full disk, unwritable state
+    dir) would take down the very loop it reports on.
+    """
+    try:
+        activity.log(event_type, name, summary)
+    except OSError:
+        logger.warning(
+            "Activity-log write (%s for %s) failed — continuing",
+            event_type, name, exc_info=True,
+        )
+
+
 async def _run_agent_forever(
     make_agent: Callable[..., object],
     name: str,
@@ -230,8 +249,8 @@ async def _run_agent_forever(
                     "%s crashed (attempt %d): %s: %s",
                     name, attempt, type(exc).__name__, exc,
                 )
-                activity.log(
-                    "AGENT_CRASH", name,
+                _log_activity_safe(
+                    activity, "AGENT_CRASH", name,
                     f"{type(exc).__name__}: {exc}",
                 )
             else:
@@ -239,8 +258,8 @@ async def _run_agent_forever(
                     "%s run() returned cleanly — reconnecting (attempt %d)",
                     name, attempt,
                 )
-                activity.log(
-                    "AGENT_RESTART", name,
+                _log_activity_safe(
+                    activity, "AGENT_RESTART", name,
                     f"Clean exit — reconnect #{attempt}",
                 )
         finally:

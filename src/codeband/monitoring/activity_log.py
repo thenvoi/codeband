@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import dataclasses
+import fcntl
 import json
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
+
+logger = logging.getLogger(__name__)
 
 
 class EventType:
@@ -35,7 +39,14 @@ class ActivityLogger:
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
     def log(self, event_type: str, agent: str, summary: str, **details) -> None:
-        """Append an event to the activity log."""
+        """Append an event to the activity log.
+
+        The append holds an exclusive ``fcntl.flock`` for the write — the
+        same discipline ``LocalMemoryStore`` uses (S6-F8). Every agent task
+        in the process (plus the watchdog) shares this one file; without the
+        lock, concurrent appends can interleave into a torn line that then
+        poisons every future read.
+        """
         event = {
             "timestamp": datetime.now(UTC).isoformat(),
             "event_type": event_type,
@@ -44,7 +55,11 @@ class ActivityLogger:
             "details": details if details else None,
         }
         with open(self._path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event) + "\n")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(json.dumps(event) + "\n")
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 class ActivityReader:
@@ -92,14 +107,20 @@ class ActivityReader:
         for line in text.splitlines():
             if not line:
                 continue
-            data = json.loads(line)
-            if agent and data["agent"] != agent:
-                continue
-            if event_type and data["event_type"] != event_type:
-                continue
-            if since:
-                ts = datetime.fromisoformat(data["timestamp"])
-                if ts < since:
+            # One torn/malformed line (a crash mid-append, a corrupted byte)
+            # must not kill `cb log` forever — skip it with a warning, the
+            # same policy as LocalMemoryStore._iter_records (S6-F8).
+            try:
+                data = json.loads(line)
+                if agent and data["agent"] != agent:
                     continue
-            events.append(ActivityEvent(**data))
+                if event_type and data["event_type"] != event_type:
+                    continue
+                if since:
+                    ts = datetime.fromisoformat(data["timestamp"])
+                    if ts < since:
+                        continue
+                events.append(ActivityEvent(**data))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                logger.warning("Skipping malformed activity log line: %s", exc)
         return events

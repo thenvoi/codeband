@@ -488,3 +488,61 @@ class TestWorkerSupervisor:
         assert len(recovery_records) >= 2, (
             "expected at least 2 cycles to fail recovery context"
         )
+
+
+class TestSupervisorBookkeepingIsBestEffort:
+    """Bookkeeping writes inside the supervision loop must not kill it (S6-F9)."""
+
+    @pytest.mark.asyncio
+    async def test_loop_survives_activity_and_identity_oserror(self, tmp_path: Path):
+        """OSError from activity.log AND identity.save (full disk, unwritable
+        state dir) degrades to warnings; the reconnect-forever loop lives."""
+        from codeband.session.supervisor import WorkerSupervisor
+
+        call_count = 0
+        target_reached = asyncio.Event()
+
+        async def mock_run():
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 3:
+                target_reached.set()
+                await asyncio.sleep(60)  # block until cancelled
+            raise RuntimeError("session crashed")
+
+        activity = MagicMock()
+        activity.log = MagicMock(side_effect=OSError(28, "No space left on device"))
+
+        supervisor = WorkerSupervisor(
+            worker_id="coder-claude_sdk-0",
+            agent_id="agent-123",
+            create_agent_fn=AsyncMock(
+                return_value=MagicMock(run=mock_run, close=AsyncMock()),
+            ),
+            state_dir=tmp_path,
+            worktree_path=tmp_path,
+            restart_delay_seconds=0.0,
+            activity=activity,
+        )
+
+        with patch("codeband.session.supervisor.build_recovery_context", return_value="ctx"):
+            with patch.object(
+                WorkerIdentity, "save", side_effect=OSError(28, "No space left"),
+            ):
+                with patch.object(WorkerIdentity, "load", return_value=None):
+                    task = asyncio.create_task(supervisor.run())
+                    try:
+                        await asyncio.wait_for(target_reached.wait(), timeout=2.0)
+                    finally:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+
+        assert call_count == 3, (
+            "supervisor must keep restarting when its own bookkeeping writes fail"
+        )
+        # The bookkeeping was attempted (and failed) every cycle — proving the
+        # failures were swallowed rather than the calls skipped.
+        assert activity.log.call_count >= 3

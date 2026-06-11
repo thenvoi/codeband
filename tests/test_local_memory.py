@@ -191,3 +191,120 @@ def _child_writer(path_str: str, prefix: str, count: int) -> None:
                 scope="organization", thought="",
             )
     asyncio.run(run())
+
+
+class TestSidecarLockAndCompaction:
+    """S6-F10 (stable sidecar lock) + S8-F4 (archived-history compaction)."""
+
+    def _record(self, n: int, status: str = "active") -> MemoryRecord:
+        return MemoryRecord(
+            id=f"mem_{n:04d}",
+            content=f"record {n}",
+            system="working",
+            type="episodic",
+            segment="agent",
+            scope="organization",
+            status=status,
+        )
+
+    def test_append_during_archive_is_not_lost(self, tmp_path: Path, monkeypatch):
+        """The archive-vs-append lost-write race is closed (S6-F10).
+
+        archive() replaces the data file's inode; under the old data-file
+        lock, an append racing the rewrite could acquire the OLD inode's lock
+        and write into the orphaned file — silently dropping a protocol-state
+        envelope. The sidecar lock serializes the whole read-modify-rewrite
+        against the append; the appender, blocked until archive finishes,
+        re-opens the path and lands in the NEW file.
+        """
+        import threading
+
+
+        store = LocalMemoryStore(tmp_path / "memories.jsonl")
+        rec = asyncio.run(
+            store.store(
+                content="seed", system="working", type="episodic", segment="agent",
+            ),
+        )
+
+        in_rewrite = threading.Event()
+        appender_started = threading.Event()
+        orig_rewrite = LocalMemoryStore._rewrite_locked
+
+        def slow_rewrite(self, records):
+            in_rewrite.set()
+            # Hold the lock long enough for the appender to be blocked on it.
+            appender_started.wait(timeout=5)
+            import time
+
+            time.sleep(0.2)
+            return orig_rewrite(self, records)
+
+        monkeypatch.setattr(LocalMemoryStore, "_rewrite_locked", slow_rewrite)
+
+        def do_append():
+            in_rewrite.wait(timeout=5)
+            appender_started.set()
+            store._append(self._record(999))
+
+        t = threading.Thread(target=do_append)
+        t.start()
+        asyncio.run(store.archive(rec.id))
+        t.join(timeout=5)
+        assert not t.is_alive()
+
+        contents = (tmp_path / "memories.jsonl").read_text(encoding="utf-8")
+        assert "mem_0999" in contents  # the racing append survived
+        assert '"status": "archived"' in contents  # and so did the archive
+
+    def test_lock_uses_stable_sidecar_file(self, tmp_path: Path):
+        store = LocalMemoryStore(tmp_path / "memories.jsonl")
+        with store._locked():
+            pass
+        assert (tmp_path / "memories.jsonl.lock").exists()
+
+    def test_archive_compacts_archived_history_beyond_keep_last(
+        self, tmp_path: Path,
+    ):
+        """archive()'s rewrite keeps only the newest 50 archived records;
+        live records are untouched and list() semantics unchanged (S8-F4)."""
+        from codeband.memory.local_store import _ARCHIVED_KEEP_LAST
+
+        store = LocalMemoryStore(tmp_path / "memories.jsonl")
+        # 60 already-archived records (oldest first), 3 live ones, then
+        # archive one more live record to trigger the rewrite.
+        for n in range(60):
+            store._append(self._record(n, status="archived"))
+        for n in range(100, 103):
+            store._append(self._record(n))
+        trigger = self._record(200)
+        store._append(trigger)
+
+        result = asyncio.run(store.archive(trigger.id))
+        assert result is not None
+
+        records = list(store._iter_records())
+        archived = [r for r in records if r.status == "archived"]
+        active = [r for r in records if r.status == "active"]
+        assert len(archived) == _ARCHIVED_KEEP_LAST == 50
+        # Newest archived kept: the trigger plus the tail of the original 60.
+        assert archived[-1].id == "mem_0200"
+        assert archived[0].id == "mem_0011"  # 60+1 archived → oldest 11 dropped
+        # Live records untouched, in order.
+        assert [r.id for r in active] == ["mem_0100", "mem_0101", "mem_0102"]
+        # list() for live records is unchanged.
+        listed = asyncio.run(store.list())
+        assert [r.id for r in listed.data] == ["mem_0100", "mem_0101", "mem_0102"]
+
+    def test_no_compaction_below_threshold(self, tmp_path: Path):
+        """At or below keep-last-50 archived records, nothing is dropped."""
+        store = LocalMemoryStore(tmp_path / "memories.jsonl")
+        for n in range(20):
+            store._append(self._record(n, status="archived"))
+        trigger = self._record(50)
+        store._append(trigger)
+
+        asyncio.run(store.archive(trigger.id))
+
+        archived = [r for r in store._iter_records() if r.status == "archived"]
+        assert len(archived) == 21

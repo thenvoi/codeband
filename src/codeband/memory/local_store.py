@@ -2,9 +2,18 @@
 
 The store is a single append-only JSONL file. Reads do a full scan and filter
 in memory; volume is tiny (typically <100 live envelopes per task), so this
-is fine. Writes use an advisory `fcntl.flock` to stay safe when multiple
-agents in one process (or sibling processes sharing the workspace) append
-simultaneously.
+is fine. To keep the file honoring that assumption over long sessions,
+`archive()`'s rewrite compacts history: archived records beyond the newest
+:data:`_ARCHIVED_KEEP_LAST` (50) are dropped (S8-F4). Live records are never
+compacted and `list()` semantics for them are unchanged.
+
+Writes serialize on an advisory `fcntl.flock` held on a stable SIDECAR file
+(`memories.jsonl.lock`), not on the data file itself (S6-F10): `archive()`
+replaces the data file (a new inode), so a writer that locked the OLD
+inode's handle could proceed against a file no longer at the path and its
+append would be silently lost — the archive-vs-append lost-write race on
+the protocol-state channel. The sidecar inode is never replaced, and every
+writer re-opens the data file only after acquiring the lock.
 
 Returned records duck-type the Band.ai SDK's Pydantic Memory objects well
 enough for existing readers at `kickoff.py:_format_task_status` and the
@@ -25,6 +34,12 @@ from pathlib import Path
 from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
+
+# Compaction bound (S8-F4): how many archived records `archive()`'s rewrite
+# keeps (newest first, by file order). Pairs with the module-header "<100 live
+# envelopes" sizing assumption — without compaction, months of archived
+# protocol-state envelopes accumulate and every full-scan read pays for them.
+_ARCHIVED_KEEP_LAST = 50
 
 
 def _now_iso() -> str:
@@ -145,18 +160,26 @@ class LocalMemoryStore:
         return MemoryListResponse(data=matches)
 
     async def archive(self, memory_id: str) -> MemoryRecord | None:
-        """Mark `memory_id` archived. Returns the updated record, or None if unknown."""
+        """Mark `memory_id` archived. Returns the updated record, or None if unknown.
+
+        The read-modify-rewrite runs entirely under the sidecar lock (S6-F10),
+        so a concurrent append cannot land between the read and the rewrite
+        and be dropped. The rewrite also compacts: archived records beyond the
+        newest :data:`_ARCHIVED_KEEP_LAST` are dropped (S8-F4); live records
+        are untouched.
+        """
         updated: MemoryRecord | None = None
-        records = list(self._iter_records())
-        for rec in records:
-            if rec.id == memory_id and rec.status != "archived":
-                rec.status = "archived"
-                rec.archived_at = _now_iso()
-                rec.updated_at = rec.archived_at
-                updated = rec
-                break
-        if updated is not None:
-            self._rewrite(records)
+        with self._locked():
+            records = list(self._iter_records())
+            for rec in records:
+                if rec.id == memory_id and rec.status != "archived":
+                    rec.status = "archived"
+                    rec.archived_at = _now_iso()
+                    rec.updated_at = rec.archived_at
+                    updated = rec
+                    break
+            if updated is not None:
+                self._rewrite_locked(self._compact(records))
         return updated
 
     # --- internals ----------------------------------------------------------
@@ -183,24 +206,51 @@ class LocalMemoryStore:
                 except (json.JSONDecodeError, TypeError) as exc:
                     logger.warning("Skipping malformed memory record: %s", exc)
 
-    def _append(self, record: MemoryRecord) -> None:
-        with self._locked("a") as fh:
-            fh.write(record.to_json() + "\n")
+    @staticmethod
+    def _compact(records: list[MemoryRecord]) -> list[MemoryRecord]:
+        """Drop archived records beyond the newest ``_ARCHIVED_KEEP_LAST``.
 
-    def _rewrite(self, records: list[MemoryRecord]) -> None:
-        # Rewrite atomically via temp file to avoid partial writes during archive.
+        File order is chronological (append-only), so "newest" is the tail.
+        Live (non-archived) records are always kept, in order — ``list()``
+        semantics for them are unchanged.
+        """
+        archived = [r for r in records if r.status == "archived"]
+        overflow = len(archived) - _ARCHIVED_KEEP_LAST
+        if overflow <= 0:
+            return records
+        dropped = {id(r) for r in archived[:overflow]}
+        return [r for r in records if id(r) not in dropped]
+
+    def _append(self, record: MemoryRecord) -> None:
+        # Open the data file only AFTER acquiring the sidecar lock: a
+        # concurrent archive() may have replaced the file's inode, and a
+        # handle opened before the lock could point at the orphaned one.
+        with self._locked():
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(record.to_json() + "\n")
+
+    def _rewrite_locked(self, records: list[MemoryRecord]) -> None:
+        """Atomically replace the data file. Caller must hold the sidecar lock."""
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with self._locked("a"):  # hold the lock on the real file while writing tmp
-            with tmp.open("w", encoding="utf-8") as fh:
-                for rec in records:
-                    fh.write(rec.to_json() + "\n")
-            tmp.replace(self.path)
+        with tmp.open("w", encoding="utf-8") as fh:
+            for rec in records:
+                fh.write(rec.to_json() + "\n")
+        tmp.replace(self.path)
 
     @contextlib.contextmanager
-    def _locked(self, mode: str) -> Iterator[Any]:
-        with self.path.open(mode, encoding="utf-8") as fh:
+    def _locked(self) -> Iterator[None]:
+        """Hold the exclusive advisory lock on the stable sidecar file.
+
+        The sidecar (``memories.jsonl.lock``) is never replaced, so its inode
+        is stable — unlike the data file, which ``archive()`` swaps via
+        tmp+rename. Locking the data file directly is exactly the lost-write
+        race this replaces (S6-F10): a writer could acquire the lock on an
+        inode that ``archive()`` had already orphaned and append into the void.
+        """
+        lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        with lock_path.open("a", encoding="utf-8") as fh:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             try:
-                yield fh
+                yield
             finally:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)

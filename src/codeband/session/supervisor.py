@@ -78,6 +78,34 @@ class WorkerSupervisor:
         doublings = min(consecutive_same, self._MAX_BACKOFF_DOUBLINGS)
         return min(self._MAX_BACKOFF_SECONDS, self._restart_delay * (2 ** doublings))
 
+    def _save_identity_safe(self, identity: WorkerIdentity) -> None:
+        """Best-effort identity persistence inside the supervision loop (S6-F9).
+
+        The reconnect-forever loop must outlive its own bookkeeping: a full
+        disk / unwritable state dir degrades recovery context on the next
+        restart, which is strictly better than the supervisor dying and the
+        worker never restarting at all.
+        """
+        try:
+            identity.save(self._state_dir)
+        except OSError:
+            logger.warning(
+                "Failed to persist worker identity for %s — continuing",
+                self._worker_id, exc_info=True,
+            )
+
+    def _log_activity_safe(self, event_type: str, summary: str) -> None:
+        """Best-effort activity append inside the supervision loop (S6-F9)."""
+        if not self._activity:
+            return
+        try:
+            self._activity.log(event_type, self._worker_id, summary)
+        except OSError:
+            logger.warning(
+                "Activity-log write (%s for %s) failed — continuing",
+                event_type, self._worker_id, exc_info=True,
+            )
+
     def _load_assignment_state(self) -> dict:
         """Load assignment state from .codeband_state.json in worktree.
 
@@ -143,12 +171,10 @@ class WorkerSupervisor:
                             self._worker_id, exc_info=True,
                         )
 
-            identity.save(self._state_dir)
-            if self._activity:
-                self._activity.log(
-                    "SESSION_START", self._worker_id,
-                    f"Session #{identity.session_count}",
-                )
+            self._save_identity_safe(identity)
+            self._log_activity_safe(
+                "SESSION_START", f"Session #{identity.session_count}",
+            )
             agent = await self._create_agent_fn(recovery_context=recovery_context)
 
             exit_reason: str
@@ -162,14 +188,13 @@ class WorkerSupervisor:
                 raise
             except Exception as exc:
                 identity.last_session_error = str(exc)
-                identity.save(self._state_dir)
+                self._save_identity_safe(identity)
                 exit_reason = f"crash: {type(exc).__name__}: {exc}"
                 exit_signature = f"crash:{_exception_signature(exc)}"
-                if self._activity:
-                    self._activity.log(
-                        "SESSION_CRASH", self._worker_id,
-                        f"Session #{identity.session_count} crashed: {exc}",
-                    )
+                self._log_activity_safe(
+                    "SESSION_CRASH",
+                    f"Session #{identity.session_count} crashed: {exc}",
+                )
 
             # Normal exit path (clean or exception). Cancellation already
             # closed the agent above before re-raising; we only reach here
@@ -183,12 +208,11 @@ class WorkerSupervisor:
                 consecutive_same = 0
             delay = self._compute_backoff(consecutive_same)
 
-            if self._activity:
-                self._activity.log(
-                    "SESSION_RESTART", self._worker_id,
-                    f"Session #{identity.session_count} ended ({exit_reason}) — "
-                    f"restarting as #{identity.session_count + 1}",
-                )
+            self._log_activity_safe(
+                "SESSION_RESTART",
+                f"Session #{identity.session_count} ended ({exit_reason}) — "
+                f"restarting as #{identity.session_count + 1}",
+            )
             logger.warning(
                 "Worker %s session %d ended (%s). Restarting in %.1fs...",
                 self._worker_id, identity.session_count,

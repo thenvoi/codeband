@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import logging
 import re
@@ -33,6 +34,33 @@ def _parse_ts(value: Any) -> datetime | None:
     return None
 
 
+@functools.lru_cache(maxsize=64)
+def _mention_patterns(
+    participants: frozenset[tuple[str, str]],
+) -> tuple[tuple[str, re.Pattern[str]], ...]:
+    """Compile @-mention patterns ONCE per participant set (S8-F1).
+
+    Previously every message × participant recompiled the same regex — a
+    patrol over a busy room cost hundreds of identical ``re.compile`` calls
+    per cycle. A room's participant set is stable across patrols, so the
+    LRU cache (keyed on the frozen ``(id, name)`` set) makes compilation a
+    once-per-set cost shared by every later patrol.
+
+    Both-sided word boundary: ``@`` must be a true mention prefix (not part
+    of a longer token like ``email@Coder-Claude-0``), and trailing chars must
+    terminate the name (so ``@Coder-Claude-0`` is not a substring match of
+    ``@Coder-Claude-01``).
+    """
+    return tuple(
+        (
+            pid,
+            re.compile(rf"(?<![A-Za-z0-9_\-])@{re.escape(pname)}(?![A-Za-z0-9_\-])"),
+        )
+        for pid, pname in sorted(participants)
+        if pname
+    )
+
+
 def _mentioned_participant_ids(
     msg: Any, participant_names: dict[str, str],
 ) -> set[str]:
@@ -40,10 +68,10 @@ def _mentioned_participant_ids(
 
     Tries structured ``msg.mentions`` first (Band.ai chat messages carry
     mentions as a list of items with ``.id``); falls back to scanning the
-    message content for ``@<display_name>`` with right-side word-boundary
-    semantics so ``@Coder-Claude-0`` does not match ``@Coder-Claude-01``.
-    Test mocks that don't set these fields are silently ignored — the
-    isinstance checks reject MagicMock-typed sentinels.
+    message content with the cached per-participant-set patterns from
+    :func:`_mention_patterns`. Test mocks that don't set these fields are
+    silently ignored — the isinstance checks reject MagicMock-typed
+    sentinels.
     """
     found: set[str] = set()
 
@@ -56,16 +84,7 @@ def _mentioned_participant_ids(
 
     content = getattr(msg, "content", None)
     if isinstance(content, str):
-        for pid, pname in participant_names.items():
-            if not pname:
-                continue
-            # Both-sided word boundary: `@` must be a true mention prefix
-            # (not part of a longer token like `email@Coder-Claude-0`), and
-            # trailing chars must terminate the name (so `@Coder-Claude-0`
-            # is not a substring match of `@Coder-Claude-01`).
-            pattern = re.compile(
-                rf"(?<![A-Za-z0-9_\-])@{re.escape(pname)}(?![A-Za-z0-9_\-])",
-            )
+        for pid, pattern in _mention_patterns(frozenset(participant_names.items())):
             if pattern.search(content):
                 found.add(pid)
 
@@ -348,11 +367,24 @@ class WatchdogDaemon:
             resp = await self._human_rest.human_api_messages.list_my_chat_messages(
                 chat_id=room_id, since=since,
             )
-        else:
-            resp = await self._rest.agent_api_messages.list_agent_messages(
-                chat_id=room_id, status="all",
-            )
-        return list(resp.data or [])
+            return list(resp.data or [])
+        resp = await self._rest.agent_api_messages.list_agent_messages(
+            chat_id=room_id, status="all",
+        )
+        # The agent API has no ``since`` parameter (server-side paging gap —
+        # a platform ask, not something to fight client-side), so the whole
+        # room history comes back every patrol. Apply the same window bound
+        # the human-API path gets server-side here, after fetch, so the
+        # per-message mention scan never chews through months of history.
+        # Messages with a missing/unparseable timestamp are kept — the patrol
+        # loop already skips them, and dropping them here would silently
+        # change behavior for partial records.
+        messages = []
+        for msg in resp.data or []:
+            ts = _parse_ts(getattr(msg, "inserted_at", None))
+            if ts is None or ts >= since:
+                messages.append(msg)
+        return messages
 
     async def _patrol(self) -> None:
         """Single patrol cycle: check all rooms for stale agents."""
