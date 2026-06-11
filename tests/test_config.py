@@ -480,3 +480,132 @@ class TestMergemasterConfig:
         config.to_yaml(yaml_path)
         loaded = CodebandConfig.from_yaml(yaml_path)
         assert loaded.agents.mergemaster.review_guidelines == "Must have tests"
+
+
+class TestNumericConstraints:
+    """Garbage caps/intervals must fail loud at config load (F7-9).
+
+    A zero here doesn't disable the feature — it bricks the swarm silently
+    (``max_verify_attempts: 0`` blocks every subtask on its first verify;
+    ``check_interval_seconds: 0`` hot-loops the Band API).
+    """
+
+    WATCHDOG_GE1_FIELDS = [
+        "check_interval_seconds",
+        "stale_threshold_seconds",
+        "nudge_grace_seconds",
+        "nudge_suppression_seconds",
+        "swarm_idle_grace_seconds",
+        "max_phase_visits",
+    ]
+    AGENTS_GE1_FIELDS = ["max_review_rounds", "max_verify_attempts"]
+
+    @pytest.mark.parametrize("field", WATCHDOG_GE1_FIELDS)
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_watchdog_rejects_nonpositive(self, field: str, bad: int):
+        from codeband.config import WatchdogConfig
+
+        with pytest.raises(ValueError) as excinfo:
+            WatchdogConfig(**{field: bad})
+        assert field in str(excinfo.value)
+
+    @pytest.mark.parametrize("field", WATCHDOG_GE1_FIELDS)
+    def test_watchdog_accepts_one(self, field: str):
+        from codeband.config import WatchdogConfig
+
+        assert getattr(WatchdogConfig(**{field: 1}), field) == 1
+
+    @pytest.mark.parametrize("field", AGENTS_GE1_FIELDS)
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_agents_rejects_nonpositive(self, field: str, bad: int):
+        with pytest.raises(ValueError) as excinfo:
+            AgentsConfig(**{field: bad})
+        assert field in str(excinfo.value)
+
+    @pytest.mark.parametrize("field", AGENTS_GE1_FIELDS)
+    def test_agents_accepts_one(self, field: str):
+        assert getattr(AgentsConfig(**{field: 1}), field) == 1
+
+    def test_restart_delay_rejects_negative(self):
+        with pytest.raises(ValueError) as excinfo:
+            PoolEntry(restart_delay_seconds=-0.1)
+        assert "restart_delay_seconds" in str(excinfo.value)
+
+    def test_restart_delay_accepts_zero(self):
+        assert PoolEntry(restart_delay_seconds=0.0).restart_delay_seconds == 0.0
+
+    def test_bad_value_fails_full_yaml_load(self, tmp_path: Path):
+        """The constraint fires through CodebandConfig.from_yaml, naming the key."""
+        yaml_path = tmp_path / "codeband.yaml"
+        yaml_path.write_text(
+            "repo:\n  url: https://github.com/a/b.git\n"
+            "agents:\n  watchdog:\n    check_interval_seconds: 0\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError) as excinfo:
+            CodebandConfig.from_yaml(yaml_path)
+        assert "check_interval_seconds" in str(excinfo.value)
+
+
+class TestRoleStaleThresholdKeys:
+    """role_stale_thresholds keys must name real roles.
+
+    A typo'd key was previously silently ignored at threshold lookup,
+    defeating the override's purpose.
+    """
+
+    def test_valid_keys_accepted(self):
+        from codeband.config import WatchdogConfig
+
+        cfg = WatchdogConfig(
+            role_stale_thresholds={
+                "coder": 900,
+                "reviewer": 300,
+                "planner": 300,
+                "plan_reviewer": 300,
+                "conductor": 300,
+                "mergemaster": 900,
+                "watchdog": 300,
+            },
+        )
+        assert cfg.role_stale_thresholds["coder"] == 900
+
+    def test_unknown_key_rejected_and_named(self):
+        from codeband.config import WatchdogConfig
+
+        with pytest.raises(ValueError) as excinfo:
+            WatchdogConfig(role_stale_thresholds={"codr": 900})
+        msg = str(excinfo.value)
+        assert "codr" in msg
+        assert "mergemaster" in msg  # lists the valid roles
+
+    def test_unknown_key_fails_yaml_load(self, tmp_path: Path):
+        yaml_path = tmp_path / "codeband.yaml"
+        yaml_path.write_text(
+            "repo:\n  url: https://github.com/a/b.git\n"
+            "agents:\n  watchdog:\n    role_stale_thresholds:\n      merge_master: 900\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError) as excinfo:
+            CodebandConfig.from_yaml(yaml_path)
+        assert "merge_master" in str(excinfo.value)
+
+
+class TestEnvVarDocsCanary:
+    """docs/CONFIGURATION.md documents every recovery-critical env var (S9-4)."""
+
+    DOCUMENTED_ENV_VARS = [
+        "WORKSPACE",
+        "CODEBAND_PROJECT_DIR",
+        "CODEBAND_LOCAL_SUBSCRIBE_EXISTING",
+        "WATCHDOG_LIVENESS_MODE",
+        "CODEBAND_FALLBACK_ANTHROPIC_API_KEY",
+        "CODEBAND_FALLBACK_OPENAI_API_KEY",
+    ]
+
+    @pytest.mark.parametrize("var", DOCUMENTED_ENV_VARS)
+    def test_env_var_documented(self, var: str):
+        doc = Path(__file__).parent.parent / "docs" / "CONFIGURATION.md"
+        assert var in doc.read_text(encoding="utf-8"), (
+            f"{var} missing from docs/CONFIGURATION.md Environment Variables section"
+        )

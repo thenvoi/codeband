@@ -1372,21 +1372,18 @@ def _parse_since(value: str):
 
 
 def _detect_git_credentials(env: dict[str, str]) -> None:
-    """Detect host git credentials and set env vars for Docker containers."""
+    """Detect host git credentials and set env vars for Docker containers.
+
+    SSH access flows through the agent socket (``SSH_AUTH_SOCK`` bind mount
+    in the compose files); the old ``SSH_AUTH_DIR`` export had no reader
+    anywhere and was removed.
+    """
     home = Path.home()
 
     # Check for ~/.git-credentials (git credential store)
     git_creds = home / ".git-credentials"
     if git_creds.is_file():
         env.setdefault("GIT_CREDENTIALS_PATH", str(git_creds))
-        return
-
-    # Check for SSH key
-    for key_name in ("id_ed25519", "id_rsa", "id_ecdsa"):
-        ssh_key = home / ".ssh" / key_name
-        if ssh_key.is_file():
-            env.setdefault("SSH_AUTH_DIR", str(home / ".ssh"))
-            return
 
 
 # Pools whose two framework variants are profile-gated in the bundled

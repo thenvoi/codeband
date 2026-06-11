@@ -21,7 +21,6 @@ x-agent-base: &agent-base
       required: false
   environment: &env-base
     CODEBAND_CONFIG: /app/config/codeband.yaml
-    AGENT_CONFIG: /app/config/agent_config.yaml
     # In-container project dir (config + active-room pointer) for cb-phase /
     # cb approve resolution from any cwd. Distinct from the HOST-side
     # ${CODEBAND_PROJECT_DIR:-.} used by compose interpolation below — this
@@ -31,8 +30,6 @@ x-agent-base: &agent-base
     REPO_URL: ${REPO_URL:-}
     REPO_BRANCH: ${REPO_BRANCH:-}
     WORKTREE_PREFIX: ${WORKTREE_PREFIX:-codeband}
-    BAND_REST_URL: ${BAND_REST_URL:-https://app.band.ai}
-    BAND_WS_URL: ${BAND_WS_URL:-wss://app.band.ai/api/v1/socket/websocket}
     BAND_MEMORY_MODE: ${BAND_MEMORY_MODE:-}
     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
@@ -43,7 +40,6 @@ x-agent-base: &agent-base
   volumes: &volumes-base
     - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
     - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
-    - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro  # overrides only; package defaults used when present
     - ${GIT_CREDENTIALS_PATH:-/dev/null}:/home/appuser/.git-credentials:ro
     - ${SSH_AUTH_SOCK:-/dev/null}:/run/ssh-agent:ro
     - bare_repo:/workspace/repo.git
@@ -63,7 +59,6 @@ x-agent-base: &agent-base
 x-volumes-codex: &volumes-codex
   - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
   - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
-  - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
   - ${GIT_CREDENTIALS_PATH:-/dev/null}:/home/appuser/.git-credentials:ro
   - ${SSH_AUTH_SOCK:-/dev/null}:/run/ssh-agent:ro
   - ${CODEX_HOME:-${HOME}/.codex}:/home/appuser/.codex:ro

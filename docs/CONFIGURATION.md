@@ -176,6 +176,20 @@ band:
   memory_mode: local
 ```
 
+## Environment Variables
+
+Recovery-critical variables that change where Codeband reads state or how it
+authenticates. All are optional; defaults are correct for a standard install.
+
+| Variable | What it does |
+|----------|--------------|
+| `WORKSPACE` | Base directory for resolving a **relative** `workspace.path`. When set, `workspace.path` resolves against `$WORKSPACE` instead of the project directory — the one shared rule (`config.resolve_workspace_path`) used by the runner, `cb-phase` / `cb approve`, task registration, and `cb doctor`. The Docker images set it to `/workspace` (the shared volume), so every container resolves state to the same place. Absolute `workspace.path` values ignore it. |
+| `CODEBAND_PROJECT_DIR` | Project directory (config files + active-room pointer) used by `cb-phase` / `cb approve` to resolve context from any cwd, and by `cb up` / `cb down` for compose interpolation. The compose files set the in-container value to `/app/config`. |
+| `CODEBAND_LOCAL_SUBSCRIBE_EXISTING` | In local mode (plain `cb`), agents skip websocket subscriptions to pre-existing rooms at startup — replaying old room state is unsafe when the whole fleet shares one event loop. Set to `1` to restore startup backlog subscription for debugging/recovery. |
+| `WATCHDOG_LIVENESS_MODE` | Force the watchdog's liveness signal: `human` (richer human-API signal, enterprise-only) or `agent` (always-available agent-API inbox signal). Overrides `band.liveness_mode` and skips the startup probe. Invalid values are ignored with a warning. |
+| `CODEBAND_FALLBACK_ANTHROPIC_API_KEY` | Process-local backup of a stripped `ANTHROPIC_API_KEY`. Codeband strips the key at startup when Claude subscription OAuth exists (subscription-first policy); preflight restores it from this variable only after the subscription path reports usage-limit exhaustion. Set automatically — you only need to set it manually when providing a fallback key the environment never had. |
+| `CODEBAND_FALLBACK_OPENAI_API_KEY` | Same mechanism for Codex: backup of a stripped `OPENAI_API_KEY` when a Codex ChatGPT subscription is logged in, restored by preflight on subscription usage-limit exhaustion. |
+
 ## Manual Agent Registration (Free Tier)
 
 If `cb setup-agents` is unavailable, create these eight agents in the Band.ai web UI:

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Reject unknown fields by default. Catches YAML indentation bugs (e.g.
 # `agents:` nested under `repo:` instead of at top level) that would
@@ -69,18 +69,31 @@ class MergemasterConfig(_StrictModel):
     auto_merge: AutoMergePolicy = AutoMergePolicy.LOW
 
 
+# Role names the watchdog resolves thresholds for — the universe of valid
+# `role_stale_thresholds` keys. Matches the AGENT_ROLE values the runner
+# registers in its agent_id→role map.
+_WATCHDOG_ROLE_KEYS = {
+    "coder", "reviewer", "planner", "plan_reviewer",
+    "conductor", "mergemaster", "watchdog",
+}
+
+
 class WatchdogConfig(_StrictModel):
     """Configuration for the watchdog agent."""
 
-    check_interval_seconds: int = 120
-    stale_threshold_seconds: int = 300
-    nudge_grace_seconds: int = 60
+    # All interval/threshold knobs require >= 1: a zero here doesn't disable
+    # the feature, it bricks the swarm silently (check_interval_seconds: 0
+    # hot-loops the Band API; a zero threshold marks every agent stale on
+    # every patrol).
+    check_interval_seconds: int = Field(default=120, ge=1)
+    stale_threshold_seconds: int = Field(default=300, ge=1)
+    nudge_grace_seconds: int = Field(default=60, ge=1)
     # After an agent responds to a nudge, suppress further nudges for this
     # long. Without it, a legitimately-idle agent (e.g. Planner waiting on
     # human approval) gets re-nudged every `stale_threshold_seconds` forever,
     # because the old logic wiped the per-agent state the moment the agent
     # replied. Escalation (nudged-but-no-response) is unaffected.
-    nudge_suppression_seconds: int = 1800
+    nudge_suppression_seconds: int = Field(default=1800, ge=1)
     # Per-role threshold overrides. Coders and the Mergemaster do long-running
     # work and are instructed to stay silent in chat while working — a uniform
     # 5-minute threshold nudges them mid-task. Roles not listed here fall back
@@ -88,19 +101,33 @@ class WatchdogConfig(_StrictModel):
     role_stale_thresholds: dict[str, int] = Field(
         default_factory=lambda: {"coder": 900, "mergemaster": 900},
     )
+
+    @field_validator("role_stale_thresholds")
+    @classmethod
+    def _known_role_keys(cls, v: dict[str, int]) -> dict[str, int]:
+        """Reject unknown role keys — a typo'd key is otherwise silently
+        ignored at threshold lookup, defeating the override's purpose."""
+        unknown = sorted(set(v) - _WATCHDOG_ROLE_KEYS)
+        if unknown:
+            raise ValueError(
+                f"Unknown role key(s) in role_stale_thresholds: {unknown}. "
+                f"Valid roles: {sorted(_WATCHDOG_ROLE_KEYS)}"
+            )
+        return v
     # When the Conductor records that the user-facing task is complete or
     # waiting on human merge approval via a `swarm status …` memory envelope,
     # suppress all nudging for this long. Prevents the watchdog from poking
     # correctly-idle agents between actionable steps. Falls back to time-based
     # behavior if no envelope is present (e.g. Conductor crashed before writing
     # one).
-    swarm_idle_grace_seconds: int = 1800
+    swarm_idle_grace_seconds: int = Field(default=1800, ge=1)
     # Cycle/stall cap (RFC WS4). When a subtask makes no mechanical progress —
     # no git-HEAD change on its branch and no new transition-log entry — for
     # this many consecutive patrols, the watchdog marks it blocked and escalates
     # to the Conductor + human. Catches stalls that chat-recency alone misses
     # (e.g. a timed-out turn that produces no commit and no transition).
-    max_phase_visits: int = 10
+    # ge=1: a zero would mark every subtask blocked on its first patrol.
+    max_phase_visits: int = Field(default=10, ge=1)
     # Toggle for the mechanical (git-HEAD / PR-state / transition-log) progress
     # signals. When False the watchdog falls back to chat-recency-only behavior.
     git_progress_check: bool = True
@@ -132,7 +159,7 @@ class PoolEntry(BaseModel):
     # WorkerSupervisor; only SIGINT/SIGTERM ends a session. Kept for backward
     # compatibility so existing codeband.yaml files don't fail to parse.
     max_restarts: int = 5
-    restart_delay_seconds: float = 5.0
+    restart_delay_seconds: float = Field(default=5.0, ge=0.0)
 
 
 class FrameworkPool(_StrictModel):
@@ -272,7 +299,8 @@ class AgentsConfig(_StrictModel):
     # band-of-devs' ``max_phase_visits`` and the 2-3-round review plateau. Wired
     # into ``fsm.transition`` via ``max_review_rounds`` (default
     # ``fsm.MAX_REVIEW_ROUNDS``); the live caller lands with P5 activation.
-    max_review_rounds: int = 3
+    # ge=1: a zero would block every subtask at its first review.
+    max_review_rounds: int = Field(default=3, ge=1)
 
     # Per-subtask verify-attempt cap (RFC two-level model). Once a subtask has
     # had this many ``cb-phase verify`` attempts *rejected* (a failed gate: dirty
@@ -283,8 +311,9 @@ class AgentsConfig(_StrictModel):
     # fires, and the review-round cap (``max_review_rounds``) never sees it (the
     # subtask never reaches ``review_failed``). Read by ``cli/handoff.py`` (the
     # already-live enforcement seam); default 20 matches ``fsm`` /
-    # ``cli.handoff.MAX_VERIFY_ATTEMPTS``.
-    max_verify_attempts: int = 20
+    # ``cli.handoff.MAX_VERIFY_ATTEMPTS``. ge=1: a zero would block every
+    # subtask on its first verify attempt.
+    max_verify_attempts: int = Field(default=20, ge=1)
 
     def total_agent_count(self) -> int:
         """Band.ai seats used (excluding Watchdog — reuses Conductor creds)."""

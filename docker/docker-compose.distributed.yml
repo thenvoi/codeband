@@ -20,7 +20,7 @@
 #   docker compose -f docker/docker-compose.distributed.yml up conductor
 
 # Shared config bind mounts (repeated per service since YAML list anchors
-# cannot be merged). Each service needs these three read-only mounts.
+# cannot be merged). Each service needs the two read-only config mounts.
 # Paths use CODEBAND_PROJECT_DIR (set by `codeband up`, defaults to ".").
 
 x-agent-base: &agent-base
@@ -39,8 +39,6 @@ x-agent-base: &agent-base
     # literal value is what processes inside the container see.
     CODEBAND_PROJECT_DIR: /app/config
     DEPLOYMENT_MODE: distributed
-    BAND_REST_URL: ${BAND_REST_URL:-https://app.band.ai}
-    BAND_WS_URL: ${BAND_WS_URL:-wss://app.band.ai/api/v1/socket/websocket}
     BAND_MEMORY_MODE: ${BAND_MEMORY_MODE:-}
     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
@@ -64,7 +62,6 @@ services:
     volumes:
       - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
       - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
-      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
       - conductor_workspace:/workspace
     command: ["python", "-m", "codeband.orchestration.agent_main"]
 
@@ -77,7 +74,6 @@ services:
     volumes:
       - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
       - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
-      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
       - mergemaster_workspace:/workspace
     command: ["python", "-m", "codeband.orchestration.agent_main"]
 
@@ -95,7 +91,6 @@ services:
     volumes:
       - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
       - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
-      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
       - planner_claude_0_workspace:/workspace
     command: ["python", "-m", "codeband.orchestration.agent_main"]
 
@@ -109,7 +104,6 @@ services:
     volumes:
       - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
       - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
-      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
       - ${CODEX_HOME:-${HOME}/.codex}:/home/appuser/.codex:ro
       - planner_codex_0_workspace:/workspace
     command: ["python", "-m", "codeband.orchestration.agent_main"]
@@ -127,7 +121,6 @@ services:
     volumes:
       - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
       - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
-      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
       - plan_reviewer_claude_0_workspace:/workspace
     command: ["python", "-m", "codeband.orchestration.agent_main"]
 
@@ -141,7 +134,6 @@ services:
     volumes:
       - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
       - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
-      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
       - ${CODEX_HOME:-${HOME}/.codex}:/home/appuser/.codex:ro
       - plan_reviewer_codex_0_workspace:/workspace
     command: ["python", "-m", "codeband.orchestration.agent_main"]
@@ -155,7 +147,6 @@ services:
     volumes:
       - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
       - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
-      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
       - coder_claude_0_workspace:/workspace
     command: ["python", "-m", "codeband.orchestration.agent_main"]
 
@@ -168,7 +159,6 @@ services:
     volumes:
       - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
       - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
-      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
       - ${CODEX_HOME:-${HOME}/.codex}:/home/appuser/.codex:ro
       - coder_codex_0_workspace:/workspace
     command: ["python", "-m", "codeband.orchestration.agent_main"]
@@ -182,7 +172,6 @@ services:
     volumes:
       - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
       - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
-      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
       - reviewer_claude_0_workspace:/workspace
     command: ["python", "-m", "codeband.orchestration.agent_main"]
 
@@ -195,7 +184,6 @@ services:
     volumes:
       - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
       - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
-      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
       - ${CODEX_HOME:-${HOME}/.codex}:/home/appuser/.codex:ro
       - reviewer_codex_0_workspace:/workspace
     command: ["python", "-m", "codeband.orchestration.agent_main"]
@@ -209,7 +197,6 @@ services:
     volumes:
       - ${CODEBAND_PROJECT_DIR:-.}/codeband.yaml:/app/config/codeband.yaml:ro
       - ${CODEBAND_PROJECT_DIR:-.}/agent_config.yaml:/app/config/agent_config.yaml:ro
-      - ${CODEBAND_PROJECT_DIR:-.}/prompts:/app/config/prompts:ro
       - watchdog_workspace:/workspace
     command: ["python", "-m", "codeband.orchestration.agent_main"]
 
