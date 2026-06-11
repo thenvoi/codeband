@@ -359,11 +359,62 @@ class TestWorkerSupervisor:
         agent = MagicMock()
         agent.stop = AsyncMock(return_value=True)
         agent.close = AsyncMock()
+        agent._runtime = None  # nothing leaked — closure verification stays quiet
 
         await supervisor._close_agent(agent)
 
         agent.stop.assert_awaited_once_with(timeout=2.0)
         agent.close.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_close_agent_failure_logs_error_and_does_not_raise(self, caplog):
+        """Teardown failures are loud (ERROR + worker id), never fatal."""
+        import logging
+
+        supervisor = self._build_supervisor(AsyncMock())
+        agent = MagicMock()
+        agent.stop = AsyncMock(side_effect=RuntimeError("socket exploded"))
+        agent._runtime = None
+
+        with caplog.at_level("ERROR", logger="codeband.session.supervisor"):
+            await supervisor._close_agent(agent)
+
+        errors = [
+            r for r in caplog.records
+            if r.name == "codeband.session.supervisor"
+            and r.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1
+        assert "coder-claude_sdk-0" in errors[0].getMessage()
+        assert "socket exploded" in errors[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_close_agent_leak_verification_fires(self, caplog):
+        """A still-open websocket after stop() gets its own ERROR line."""
+        import logging
+
+        class LeakyLink:
+            _ws = object()
+            is_connected = True
+
+        class LeakyRuntime:
+            _link = LeakyLink()
+
+        supervisor = self._build_supervisor(AsyncMock())
+        agent = MagicMock()
+        agent.stop = AsyncMock(return_value=True)
+        agent._runtime = LeakyRuntime()
+
+        with caplog.at_level("ERROR", logger="codeband.session.supervisor"):
+            await supervisor._close_agent(agent)
+
+        errors = [
+            r for r in caplog.records
+            if r.name == "codeband.session.supervisor"
+            and r.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1
+        assert "leaked" in errors[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_infinite_restart_until_cancelled(self):

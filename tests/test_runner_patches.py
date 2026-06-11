@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -492,18 +493,47 @@ class TestPhoenixReconnectOwnership:
             "_codeband_no_signal_handlers", False,
         ) is True
 
-    @pytest.mark.asyncio
-    async def test_local_patch_skips_existing_room_subscriptions_by_default(
-        self, monkeypatch,
-    ):
+class TestSubscribeExistingSweep:
+    """Local-mode startup sweep: subscribe-by-default, store-scoped (finding 9).
+
+    Matrix: fresh run / mid-task resume / stale rooms / store failure /
+    --fresh opt-out / deprecated env var. Filtering happens inside OUR
+    patched sweep — never via the SDK's ``RoomPresence(room_filter=...)``,
+    which also gates live ``room_added`` joins and would block new tasks.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _sweep_settings(self, monkeypatch):
+        """Isolate the module-level sweep settings per test."""
+        from codeband.orchestration import runner
+
+        monkeypatch.setattr(
+            runner, "_local_sweep_settings", runner._LocalSweepSettings(),
+        )
+        monkeypatch.delenv("CODEBAND_LOCAL_SUBSCRIBE_EXISTING", raising=False)
+        return runner._local_sweep_settings
+
+    def _make_store(self, tmp_path: Path, active_rooms: list[str]) -> Path:
+        from codeband.state import StateStore
+
+        db_path = tmp_path / "state" / "orchestration.db"
+        store = StateStore(db_path)
+        for room_id in active_rooms:
+            store.create_task(
+                task_id=room_id, description="task", room_id=room_id,
+            )
+        return db_path
+
+    async def _run_sweep(self, monkeypatch, participant_rooms: list[str]):
+        """Run the patched sweep against fake link + rooms; return subscribe calls."""
         from thenvoi.runtime.presence import RoomPresence
 
         original_subscribe = RoomPresence._subscribe_to_existing_rooms
-        calls = []
+        calls: list[str] = []
 
         class FakeLink:
             async def subscribe_room(self, room_id):
-                calls.append(("subscribe", room_id))
+                calls.append(room_id)
 
         try:
             _patch_band_local_runtime()
@@ -511,54 +541,261 @@ class TestPhoenixReconnectOwnership:
             presence.link = FakeLink()
             presence.rooms = set()
             presence.on_room_joined = None
-            monkeypatch.delenv("CODEBAND_LOCAL_SUBSCRIBE_EXISTING", raising=False)
-            presence._list_existing_rooms = AsyncMock(return_value=[
-                ("room-1", {}),
-                ("room-2", {}),
-            ])
+            presence._list_existing_rooms = AsyncMock(
+                return_value=[(room_id, {}) for room_id in participant_rooms],
+            )
             monkeypatch.setattr(
                 "codeband.orchestration.runner.asyncio.sleep", AsyncMock(),
             )
-
             await RoomPresence._subscribe_to_existing_rooms(presence)
         finally:
             RoomPresence._subscribe_to_existing_rooms = original_subscribe
+        return calls, presence
 
-        presence._list_existing_rooms.assert_not_awaited()
+    @pytest.mark.asyncio
+    async def test_fresh_run_subscribes_nothing_without_warning(
+        self, monkeypatch, tmp_path, caplog, _sweep_settings,
+    ):
+        """Store readable, zero active tasks, no rooms — normal, no warning."""
+        _sweep_settings.state_db_path = self._make_store(tmp_path, [])
+
+        with caplog.at_level("INFO", logger="codeband.orchestration.runner"):
+            calls, presence = await self._run_sweep(monkeypatch, [])
+
         assert calls == []
         assert presence.rooms == set()
+        assert not [
+            r for r in caplog.records
+            if r.name.startswith("codeband") and r.levelno >= logging.WARNING
+        ]
 
     @pytest.mark.asyncio
-    async def test_local_patch_can_serialize_existing_room_subscriptions(
-        self, monkeypatch,
+    async def test_mid_task_resume_rejoins_active_room(
+        self, monkeypatch, tmp_path, _sweep_settings,
     ):
-        from thenvoi.runtime.presence import RoomPresence
+        _sweep_settings.state_db_path = self._make_store(tmp_path, ["room-1"])
 
-        original_subscribe = RoomPresence._subscribe_to_existing_rooms
-        calls = []
+        calls, presence = await self._run_sweep(monkeypatch, ["room-1"])
 
-        class FakeLink:
-            async def subscribe_room(self, room_id):
-                calls.append(("subscribe", room_id))
+        assert calls == ["room-1"]
+        assert presence.rooms == {"room-1"}
 
-        try:
-            _patch_band_local_runtime()
-            presence = object.__new__(RoomPresence)
-            presence.link = FakeLink()
-            presence.rooms = set()
-            presence.on_room_joined = None
-            monkeypatch.setenv("CODEBAND_LOCAL_SUBSCRIBE_EXISTING", "1")
-            presence._list_existing_rooms = AsyncMock(return_value=[
-                ("room-1", {}),
-                ("room-2", {}),
-            ])
-            monkeypatch.setattr(
-                "codeband.orchestration.runner.asyncio.sleep", AsyncMock(),
+    @pytest.mark.asyncio
+    async def test_stale_rooms_skipped_with_info_line(
+        self, monkeypatch, tmp_path, caplog, _sweep_settings,
+    ):
+        """Rooms not tied to an active task are skipped, with one INFO count."""
+        _sweep_settings.state_db_path = self._make_store(tmp_path, ["room-1"])
+
+        with caplog.at_level("INFO", logger="codeband.orchestration.runner"):
+            calls, presence = await self._run_sweep(
+                monkeypatch, ["room-1", "stale-a", "stale-b"],
             )
 
-            await RoomPresence._subscribe_to_existing_rooms(presence)
-        finally:
-            RoomPresence._subscribe_to_existing_rooms = original_subscribe
+        assert calls == ["room-1"]
+        assert presence.rooms == {"room-1"}
+        skip_lines = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and "Skipping 2" in r.getMessage()
+        ]
+        assert len(skip_lines) == 1
 
-        assert calls == [("subscribe", "room-1"), ("subscribe", "room-2")]
-        assert presence.rooms == {"room-1", "room-2"}
+    @pytest.mark.asyncio
+    async def test_store_failure_subscribes_all_with_error(
+        self, monkeypatch, tmp_path, caplog, _sweep_settings,
+    ):
+        """Unreadable store → loud ERROR, subscribe ALL (fail toward connectivity)."""
+        corrupt = tmp_path / "state" / "orchestration.db"
+        corrupt.parent.mkdir(parents=True)
+        corrupt.write_text("this is not a sqlite database, not even close")
+        _sweep_settings.state_db_path = corrupt
+
+        with caplog.at_level("ERROR", logger="codeband.orchestration.runner"):
+            calls, _ = await self._run_sweep(monkeypatch, ["room-1", "room-2"])
+
+        assert calls == ["room-1", "room-2"]
+        errors = [
+            r for r in caplog.records
+            if r.name == "codeband.orchestration.runner"
+            and r.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1
+        assert "ALL participant rooms" in errors[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_unresolved_state_dir_subscribes_all_with_error(
+        self, monkeypatch, caplog, _sweep_settings,
+    ):
+        assert _sweep_settings.state_db_path is None
+
+        with caplog.at_level("ERROR", logger="codeband.orchestration.runner"):
+            calls, _ = await self._run_sweep(monkeypatch, ["room-1"])
+
+        assert calls == ["room-1"]
+        errors = [
+            r for r in caplog.records
+            if r.name == "codeband.orchestration.runner"
+            and r.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1
+        assert "state dir unresolved" in errors[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_fresh_flag_skips_sweep_even_with_active_rooms(
+        self, monkeypatch, tmp_path, _sweep_settings,
+    ):
+        _sweep_settings.state_db_path = self._make_store(tmp_path, ["room-1"])
+        _sweep_settings.fresh = True
+
+        calls, presence = await self._run_sweep(monkeypatch, ["room-1"])
+
+        assert calls == []
+        assert presence.rooms == set()
+        presence._list_existing_rooms.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_deprecated_env_var_warns_and_changes_nothing(
+        self, monkeypatch, tmp_path, caplog, _sweep_settings,
+    ):
+        """CODEBAND_LOCAL_SUBSCRIBE_EXISTING is ignored: one deprecation warning,
+        behavior identical to the store-scoped default."""
+        monkeypatch.setenv("CODEBAND_LOCAL_SUBSCRIBE_EXISTING", "1")
+        _sweep_settings.state_db_path = self._make_store(tmp_path, ["room-1"])
+
+        with caplog.at_level("WARNING", logger="codeband.orchestration.runner"):
+            calls, _ = await self._run_sweep(monkeypatch, ["room-1", "stale-a"])
+
+        assert calls == ["room-1"]  # stale room still skipped — default semantics
+        deprecations = [
+            r for r in caplog.records if "deprecated" in r.getMessage()
+        ]
+        assert len(deprecations) == 1
+        assert "--fresh" in deprecations[0].getMessage()
+
+
+class TestSessionConfigWiring:
+    """agents.idle_resync_seconds reaches the SDK at the Agent.create seam."""
+
+    def test_create_band_agent_passes_idle_resync_seconds(self, tmp_path, monkeypatch):
+        import thenvoi
+
+        from codeband.config import AgentCredentials
+        from codeband.orchestration.runner import _create_band_agent
+
+        config = _make_config(tmp_path)
+        config.agents.idle_resync_seconds = 7
+        captured = {}
+
+        def fake_create(cls, **kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(
+            thenvoi.Agent, "create", classmethod(fake_create),
+        )
+        _create_band_agent(
+            adapter=MagicMock(),
+            creds=AgentCredentials(agent_id="agent-1", api_key="key-1"),
+            config=config,
+        )
+
+        session_config = captured["session_config"]
+        assert session_config.idle_resync_seconds == 7
+
+    def test_default_is_30(self, tmp_path):
+        config = _make_config(tmp_path)
+        assert config.agents.idle_resync_seconds == 30
+
+
+class TestSafeStopAgentFailsLoud:
+    """Teardown failures log at ERROR and verify closure — never raise."""
+
+    @pytest.mark.asyncio
+    async def test_stop_failure_logs_error_and_does_not_raise(self, caplog):
+        from codeband.orchestration.runner import _safe_stop_agent
+
+        class FailingAgent:
+            _runtime = None
+
+            async def stop(self, timeout=None):
+                raise RuntimeError("socket exploded")
+
+        with caplog.at_level("ERROR", logger="codeband.orchestration.runner"):
+            await _safe_stop_agent(FailingAgent(), "conductor")
+
+        errors = [
+            r for r in caplog.records
+            if r.name == "codeband.orchestration.runner"
+            and r.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1
+        message = errors[0].getMessage()
+        assert "conductor" in message
+        assert "socket exploded" in message
+
+    @pytest.mark.asyncio
+    async def test_leaked_connection_logs_second_error(self, caplog):
+        from codeband.orchestration.runner import _safe_stop_agent
+
+        class LeakyLink:
+            _ws = object()  # still holding a websocket after stop()
+            is_connected = True
+
+        class LeakyRuntime:
+            _link = LeakyLink()
+
+        class LeakyAgent:
+            _runtime = LeakyRuntime()
+
+            async def stop(self, timeout=None):
+                return True  # claims success but leaves the socket open
+
+        with caplog.at_level("ERROR", logger="codeband.orchestration.runner"):
+            await _safe_stop_agent(LeakyAgent(), "mergemaster")
+
+        errors = [
+            r for r in caplog.records
+            if r.name == "codeband.orchestration.runner"
+            and r.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1
+        assert "mergemaster" in errors[0].getMessage()
+        assert "leaked" in errors[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_clean_stop_logs_nothing(self, caplog):
+        from codeband.orchestration.runner import _safe_stop_agent
+
+        class ClosedLink:
+            _ws = None
+            is_connected = False
+
+        class ClosedRuntime:
+            _link = ClosedLink()
+
+        class CleanAgent:
+            _runtime = ClosedRuntime()
+
+            async def stop(self, timeout=None):
+                return True
+
+        with caplog.at_level("ERROR", logger="codeband.orchestration.runner"):
+            await _safe_stop_agent(CleanAgent(), "conductor")
+
+        assert not [
+            r for r in caplog.records
+            if r.name.startswith("codeband") and r.levelno >= logging.ERROR
+        ]
+
+    @pytest.mark.asyncio
+    async def test_cancellation_propagates(self):
+        from codeband.orchestration.runner import _safe_stop_agent
+
+        class CancelledAgent:
+            _runtime = None
+
+            async def stop(self, timeout=None):
+                raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await _safe_stop_agent(CancelledAgent(), "conductor")

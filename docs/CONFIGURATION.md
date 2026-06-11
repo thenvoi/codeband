@@ -176,6 +176,43 @@ band:
   memory_mode: local
 ```
 
+## Reconnect & Room Subscription (local mode)
+
+In local mode (plain `cb` / `cb run`), agents **rejoin existing rooms by
+default** at startup and on every reconnect cycle — scoped to rooms tied to
+an `active` task in the durable state store. This is the mid-task recovery
+path: rejoin, then the SDK drains the room backlog through the agent's
+rehydrated context. Rooms not tied to an active task are skipped (one INFO
+line reports the skipped count), capping the blast radius of stale-room
+backlog storms. If the state store is unreadable, the sweep logs one
+ERROR-level line and subscribes to **all** participant rooms — it fails
+toward connectivity, never toward deafness.
+
+Opt out with:
+
+```bash
+cb run --fresh   # skip rejoining existing rooms and their backlog (fresh start)
+```
+
+`CODEBAND_LOCAL_SUBSCRIBE_EXISTING` (the old opt-in from when the default
+was to skip) is deprecated and ignored; setting it prints one deprecation
+warning.
+
+The delivery backstop for missed websocket pushes is the SDK's idle resync —
+how quickly an idle agent re-polls its pending queue — tuned via:
+
+```yaml
+agents:
+  idle_resync_seconds: 30   # default; minimum 1
+```
+
+It applies to every role uniformly. Lower values recover faster from missed
+pushes but generate more REST traffic (each resync fires one poll per
+subscribed room).
+
+Distributed mode (`cb run --agent <key>`) is intentionally untouched: it
+runs the SDK-native reconnect and subscribe-existing behavior.
+
 ## Environment Variables
 
 Recovery-critical variables that change where Codeband reads state or how it
@@ -185,7 +222,6 @@ authenticates. All are optional; defaults are correct for a standard install.
 |----------|--------------|
 | `WORKSPACE` | Base directory for resolving a **relative** `workspace.path`. When set, `workspace.path` resolves against `$WORKSPACE` instead of the project directory — the one shared rule (`config.resolve_workspace_path`) used by the runner, `cb-phase` / `cb approve`, task registration, and `cb doctor`. The Docker images set it to `/workspace` (the shared volume), so every container resolves state to the same place. Absolute `workspace.path` values ignore it. |
 | `CODEBAND_PROJECT_DIR` | Project directory (config files + active-room pointer) used by `cb-phase` / `cb approve` to resolve context from any cwd, and by `cb up` / `cb down` for compose interpolation. The compose files set the in-container value to `/app/config`. |
-| `CODEBAND_LOCAL_SUBSCRIBE_EXISTING` | In local mode (plain `cb`), agents skip websocket subscriptions to pre-existing rooms at startup — replaying old room state is unsafe when the whole fleet shares one event loop. Set to `1` to restore startup backlog subscription for debugging/recovery. |
 | `WATCHDOG_LIVENESS_MODE` | Force the watchdog's liveness signal: `human` (richer human-API signal, enterprise-only) or `agent` (always-available agent-API inbox signal). Overrides `band.liveness_mode` and skips the startup probe. Invalid values are ignored with a warning. |
 | `CODEBAND_FALLBACK_ANTHROPIC_API_KEY` | Process-local backup of a stripped `ANTHROPIC_API_KEY`. Codeband strips the key at startup when Claude subscription OAuth exists (subscription-first policy); preflight restores it from this variable only after the subscription path reports usage-limit exhaustion. Set automatically — you only need to set it manually when providing a fallback key the environment never had. |
 | `CODEBAND_FALLBACK_OPENAI_API_KEY` | Same mechanism for Codex: backup of a stripped `OPENAI_API_KEY` when a Codex ChatGPT subscription is logged in, restored by preflight on subscription usage-limit exhaustion. |

@@ -432,6 +432,18 @@ class StateStore:
             ).fetchone()
         return _task_from_row(row) if row is not None else None
 
+    def list_active_task_room_ids(self) -> list[str]:
+        """Room ids of all ``'active'`` tasks.
+
+        Powers the local-mode startup room sweep (``runner``): rooms tied to
+        an active task are rejoined on reconnect, everything else is skipped.
+        """
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT room_id FROM tasks WHERE status = 'active'"
+            ).fetchall()
+        return [row["room_id"] for row in rows]
+
     # ── subtasks ───────────────────────────────────────────────────────────
 
     def ensure_subtask(

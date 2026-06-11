@@ -429,8 +429,15 @@ def setup_agents(project_dir: str) -> None:
     "--skip-preflight", is_flag=True,
     help="Skip the Claude auth preflight check (advanced; use for offline/CI).",
 )
+@click.option(
+    "--fresh", is_flag=True,
+    help="Skip rejoining existing rooms and their backlog (fresh start).",
+)
 @_project_aware
-def run(agent: str | None, debug: bool, project_dir: str, skip_preflight: bool) -> None:
+def run(
+    agent: str | None, debug: bool, project_dir: str,
+    skip_preflight: bool, fresh: bool,
+) -> None:
     """Run agents locally.
 
     Without --agent: runs all agents in-process (local mode).
@@ -472,6 +479,12 @@ def run(agent: str | None, debug: bool, project_dir: str, skip_preflight: bool) 
             raise click.ClickException(f"{err.summary}\n\n{err.remediation}")
 
     if agent:
+        if fresh:
+            click.echo(
+                "Warning: --fresh only applies to local mode (it controls the "
+                "in-process startup room sweep); ignored with --agent.",
+                err=True,
+            )
         click.echo(f"Starting agent {agent}... (Ctrl+C to stop)")
         from codeband.orchestration.runner import run_agent
         _run_async(run_agent(config, project, agent))
@@ -485,7 +498,7 @@ def run(agent: str | None, debug: bool, project_dir: str, skip_preflight: bool) 
         total = config.agents.total_agent_count()
         click.echo(f"Starting Codeband with {total} agents... (Ctrl+C to stop)")
         from codeband.orchestration.runner import run_local
-        _run_async(run_local(config, project))
+        _run_async(run_local(config, project, fresh=fresh))
 
     click.echo("All agents stopped.")
 

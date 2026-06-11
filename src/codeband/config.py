@@ -328,6 +328,16 @@ class AgentsConfig(_StrictModel):
     # subtask on its first send-back.
     max_rebase_rounds: int = Field(default=3, ge=1)
 
+    # How quickly an idle agent re-polls its pending message queue — the
+    # SDK's Phase-2 idle resync, the delivery backstop for missed websocket
+    # pushes. Passed to every role uniformly (coders included — same intake
+    # stack) as ``SessionConfig(idle_resync_seconds=...)`` at Agent.create
+    # (``runner._create_band_agent``). Lower values recover faster from
+    # missed pushes but generate more REST traffic: each resync fires one
+    # /next poll per subscribed room. ge=1: the SDK rejects values <= 0
+    # (they would turn the resync into a REST hot loop).
+    idle_resync_seconds: int = Field(default=30, ge=1)
+
     def total_agent_count(self) -> int:
         """Band.ai seats used (excluding Watchdog — reuses Conductor creds)."""
         return (

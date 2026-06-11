@@ -56,6 +56,20 @@ def test_create_task_then_get(store: StateStore) -> None:
     assert task.created_at  # ISO-8601 UTC timestamp populated
 
 
+def test_list_active_task_room_ids_filters_on_status(store: StateStore) -> None:
+    store.create_task(task_id="t-1", description="live", room_id="room-1")
+    store.create_task(
+        task_id="t-2", description="done", room_id="room-2", status="superseded",
+    )
+    store.create_task(task_id="t-3", description="also live", room_id="room-3")
+
+    assert sorted(store.list_active_task_room_ids()) == ["room-1", "room-3"]
+
+
+def test_list_active_task_room_ids_empty_store(store: StateStore) -> None:
+    assert store.list_active_task_room_ids() == []
+
+
 def test_create_task_with_owner_id_round_trips(store: StateStore) -> None:
     store.create_task(
         task_id="room-1",

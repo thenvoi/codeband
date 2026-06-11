@@ -47,6 +47,37 @@ class TestRunOutput:
         assert result.exit_code == 0
         assert "stopped" in result.output.lower()
 
+    @patch("codeband.cli.load_config")
+    @patch("codeband.orchestration.runner.run_local", new_callable=AsyncMock)
+    def test_run_fresh_flag_reaches_run_local(
+        self, mock_run_local, mock_load_config, tmp_path,
+    ):
+        """--fresh threads through to run_local(fresh=True)."""
+        mock_load_config.return_value = _make_mock_config()
+        mock_run_local.return_value = None
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli, ["run", "--skip-preflight", "--fresh", "--dir", str(tmp_path)],
+        )
+
+        assert result.exit_code == 0
+        assert mock_run_local.call_args.kwargs.get("fresh") is True
+
+    @patch("codeband.cli.load_config")
+    @patch("codeband.orchestration.runner.run_local", new_callable=AsyncMock)
+    def test_run_default_is_not_fresh(
+        self, mock_run_local, mock_load_config, tmp_path,
+    ):
+        mock_load_config.return_value = _make_mock_config()
+        mock_run_local.return_value = None
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["run", "--skip-preflight", "--dir", str(tmp_path)])
+
+        assert result.exit_code == 0
+        assert mock_run_local.call_args.kwargs.get("fresh") is False
+
 
 class TestPreflightErrorOutput:
     """Verify 'cb run' prints a clean preflight error: just the actionable

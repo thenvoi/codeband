@@ -221,16 +221,30 @@ class WorkerSupervisor:
             await asyncio.sleep(delay)
 
     async def _close_agent(self, agent: Any) -> None:
-        """Best-effort SDK teardown between worker restart cycles."""
+        """Loud best-effort SDK teardown between worker restart cycles.
+
+        Same discipline as the runner's ``_safe_stop_agent``: failures log at
+        ERROR (a silently-swallowed stop is the classic CLOSE_WAIT/socket-leak
+        source) and closure is verified afterwards, but nothing raises —
+        teardown is loud, never fatal.
+        """
+        from codeband.orchestration.runner import _agent_connection_open
+
         stop = getattr(agent, "stop", None)
         if stop is not None:
             try:
                 await stop(timeout=2.0)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.debug(
-                    "Error stopping agent %s", self._worker_id, exc_info=True,
+            except Exception as exc:
+                logger.error(
+                    "Teardown of worker %s failed: %s: %s",
+                    self._worker_id, type(exc).__name__, exc, exc_info=True,
+                )
+            if _agent_connection_open(agent):
+                logger.error(
+                    "Worker %s leaked its websocket connection: still open "
+                    "after stop()", self._worker_id,
                 )
             return
 
@@ -239,7 +253,8 @@ class WorkerSupervisor:
             return
         try:
             await close()
-        except Exception:
-            logger.debug(
-                "Error closing agent %s", self._worker_id, exc_info=True,
+        except Exception as exc:
+            logger.error(
+                "Teardown of worker %s failed: %s: %s",
+                self._worker_id, type(exc).__name__, exc, exc_info=True,
             )

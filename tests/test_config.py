@@ -594,10 +594,12 @@ class TestRoleStaleThresholdKeys:
 class TestEnvVarDocsCanary:
     """docs/CONFIGURATION.md documents every recovery-critical env var (S9-4)."""
 
+    # CODEBAND_LOCAL_SUBSCRIBE_EXISTING is deliberately absent: deprecated
+    # and ignored since subscribe-existing became the default (use
+    # ``cb run --fresh`` to opt out); the doc keeps only a deprecation note.
     DOCUMENTED_ENV_VARS = [
         "WORKSPACE",
         "CODEBAND_PROJECT_DIR",
-        "CODEBAND_LOCAL_SUBSCRIBE_EXISTING",
         "WATCHDOG_LIVENESS_MODE",
         "CODEBAND_FALLBACK_ANTHROPIC_API_KEY",
         "CODEBAND_FALLBACK_OPENAI_API_KEY",
@@ -624,3 +626,19 @@ class TestMaxRebaseRounds:
         with pytest.raises(ValueError) as excinfo:
             AgentsConfig(max_rebase_rounds=0)
         assert "max_rebase_rounds" in str(excinfo.value)
+
+
+class TestIdleResyncSeconds:
+    """agents.idle_resync_seconds — the SDK idle-resync delivery backstop."""
+
+    def test_default_is_30(self):
+        assert AgentsConfig().idle_resync_seconds == 30
+
+    def test_zero_rejected(self):
+        """The SDK rejects <= 0 — it would turn the resync into a REST hot loop."""
+        with pytest.raises(ValueError) as excinfo:
+            AgentsConfig(idle_resync_seconds=0)
+        assert "idle_resync_seconds" in str(excinfo.value)
+
+    def test_one_is_the_floor(self):
+        assert AgentsConfig(idle_resync_seconds=1).idle_resync_seconds == 1

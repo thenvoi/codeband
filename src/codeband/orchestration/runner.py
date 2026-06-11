@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -42,13 +44,80 @@ _RECONNECT_BASE_DELAY_SECONDS = 2.0
 _RECONNECT_MAX_DELAY_SECONDS = 60.0
 
 
-async def _safe_stop_agent(agent: object) -> None:
-    """Best-effort teardown of a Band.ai Agent between reconnect cycles.
+@dataclass
+class _LocalSweepSettings:
+    """Per-process inputs for the patched startup room sweep (local mode).
+
+    ``run_local`` fills these in before agents start; the patched
+    ``_subscribe_to_existing_rooms`` reads them at sweep time so every
+    reconnect cycle sees the current values.
+    """
+
+    state_db_path: Path | None = None
+    fresh: bool = False
+
+
+_local_sweep_settings = _LocalSweepSettings()
+
+
+def _agent_connection_open(agent: object) -> bool:
+    """True when the agent's websocket link is verifiably still open.
+
+    Walks the SDK teardown chain ``Agent._runtime`` (PlatformRuntime) →
+    ``_link`` (ThenvoiLink) → ``_ws`` (WebSocketClient). A successful
+    ``link.disconnect()`` sets ``_ws = None`` and ``_is_connected = False``
+    (thenvoi/platform/link.py), so a non-None ``_ws`` or a truthy
+    ``is_connected`` after stop means the connection leaked. Unknown shapes
+    report closed — verification must never produce false alarms on fakes.
+    """
+    runtime = getattr(agent, "_runtime", None)
+    link = getattr(runtime, "_link", None)
+    if link is None:
+        return False
+    return getattr(link, "_ws", None) is not None or bool(
+        getattr(link, "is_connected", False)
+    )
+
+
+def _read_active_room_ids(state_db_path: Path | None) -> set[str] | None:
+    """Room ids of ``active`` tasks in the StateStore, or ``None`` on failure.
+
+    ``None`` is the loud-but-connected degradation [decision (b′)]: when the
+    state dir is unresolved or the store is unreadable, the sweep subscribes
+    to ALL participant rooms rather than risk skipping a live task's room.
+    An empty set is the normal fresh-run answer (store readable, no active
+    tasks) and is NOT a failure.
+    """
+    if state_db_path is None:
+        logger.error(
+            "Subscribe-existing: state dir unresolved — subscribing to ALL "
+            "participant rooms (fail toward connectivity)",
+        )
+        return None
+    try:
+        from codeband.state import StateStore
+
+        return set(StateStore(state_db_path).list_active_task_room_ids())
+    except Exception as exc:  # noqa: BLE001 - any store failure degrades the same way
+        logger.error(
+            "Subscribe-existing: StateStore read failed at %s (%s: %s) — "
+            "subscribing to ALL participant rooms (fail toward connectivity)",
+            state_db_path, type(exc).__name__, exc,
+        )
+        return None
+
+
+async def _safe_stop_agent(agent: object, name: str = "unknown-agent") -> None:
+    """Loud best-effort teardown of a Band.ai Agent between reconnect cycles.
 
     Why: PHXChannelsClient owns its own auto-reconnect task. Without an
     explicit stop, that task survives ``agent.run()`` returning and races
     the next cycle, producing ``PHXTopicError: already subscribed`` and
     ``cannot call recv while another coroutine is already running recv``.
+
+    Failures log at ERROR (a silently-swallowed stop is the classic
+    CLOSE_WAIT/socket-leak source) and closure is verified afterwards, but
+    nothing raises — teardown is loud, never fatal.
     """
     stop = getattr(agent, "stop", None)
     if stop is None:
@@ -57,8 +126,16 @@ async def _safe_stop_agent(agent: object) -> None:
         await stop(timeout=2.0)
     except asyncio.CancelledError:
         raise
-    except Exception:
-        logger.debug("agent.stop() raised during teardown", exc_info=True)
+    except Exception as exc:
+        logger.error(
+            "Teardown of agent %s failed: %s: %s",
+            name, type(exc).__name__, exc, exc_info=True,
+        )
+    if _agent_connection_open(agent):
+        logger.error(
+            "Agent %s leaked its websocket connection: still open after stop()",
+            name,
+        )
 
 
 def _patch_band_local_runtime() -> None:
@@ -77,11 +154,25 @@ def _patch_band_local_runtime() -> None:
     registers process signal handlers, and RoomPresence auto-joins existing
     room topics during startup. Those are reasonable defaults for one agent
     per process, but unsafe/noisy when plain ``cb`` runs the full fleet in
-    one event loop. In local mode Codeband owns signals, and agents subscribe
-    to new rooms via ``agent_rooms`` instead of replaying old room state at
-    startup. Set ``CODEBAND_LOCAL_SUBSCRIBE_EXISTING=1`` to restore startup
-    backlog subscription for debugging.
+    one event loop. In local mode Codeband owns signals, and the startup
+    room sweep is replaced with a store-scoped serial sweep: rooms tied to
+    an ``active`` task in the StateStore are rejoined (mid-task recovery —
+    the SDK then drains their backlog through rehydrated context), stale
+    rooms are skipped (caps the backlog-storm blast radius), and a store
+    failure subscribes ALL participant rooms — fail toward connectivity,
+    never toward deafness. ``cb run --fresh`` skips the sweep entirely.
+
+    Scope: this patch exists for the IN-PROCESS fleet — competing lifecycle
+    owners and shared signal handlers — and is local-mode only. Distributed
+    mode (``run_agent``) intentionally runs the SDK-native reconnect and
+    subscribe-existing behavior unpatched.
     """
+    if os.environ.get("CODEBAND_LOCAL_SUBSCRIBE_EXISTING") is not None:
+        logger.warning(
+            "CODEBAND_LOCAL_SUBSCRIBE_EXISTING is deprecated and ignored — "
+            "subscribe-existing is now the default; use `cb run --fresh` "
+            "to opt out.",
+        )
     try:
         from thenvoi.client.streaming import client as streaming_client
         from thenvoi.runtime.presence import RoomPresence
@@ -139,17 +230,35 @@ def _patch_band_local_runtime() -> None:
         return
 
     async def _codeband_subscribe_to_existing_rooms(self) -> None:
-        import os
-
-        if os.environ.get("CODEBAND_LOCAL_SUBSCRIBE_EXISTING") != "1":
+        if _local_sweep_settings.fresh:
             logger.info(
-                "Skipping existing-room websocket subscriptions in local mode"
+                "--fresh: skipping existing-room websocket subscriptions"
             )
             return
+
+        # Store-scoped filter, applied in OUR sweep — not via the SDK's
+        # RoomPresence(room_filter=...), which also gates live room_added
+        # joins (thenvoi/runtime/presence.py:203) and would block the new
+        # task's room. None means "subscribe everything" (decision b′:
+        # fail toward connectivity, never toward deafness).
+        allowed = _read_active_room_ids(_local_sweep_settings.state_db_path)
 
         logger.debug("Subscribing to existing rooms serially")
         try:
             rooms_to_join = await self._list_existing_rooms()
+            if allowed is not None:
+                kept = [
+                    (room_id, payload)
+                    for room_id, payload in rooms_to_join
+                    if room_id in allowed
+                ]
+                skipped = len(rooms_to_join) - len(kept)
+                if skipped:
+                    logger.info(
+                        "Skipping %d existing room(s) not tied to an active "
+                        "task", skipped,
+                    )
+                rooms_to_join = kept
             if not rooms_to_join:
                 return
 
@@ -263,7 +372,7 @@ async def _run_agent_forever(
                     f"Clean exit — reconnect #{attempt}",
                 )
         finally:
-            await _safe_stop_agent(agent)
+            await _safe_stop_agent(agent, name)
         delay = min(
             _RECONNECT_BASE_DELAY_SECONDS * (2 ** min(attempt - 1, 5)),
             _RECONNECT_MAX_DELAY_SECONDS,
@@ -467,8 +576,15 @@ def _resolve_workspace_config(config: CodebandConfig, project_dir: Path) -> Code
 
 
 def _create_band_agent(adapter, creds: AgentCredentials, config: CodebandConfig):
-    """Create a Band.ai Agent with standard connection args."""
+    """Create a Band.ai Agent with standard connection args.
+
+    The session config tunes the SDK's Phase-2 idle resync — how quickly an
+    idle agent re-polls its pending queue. It is the delivery backstop for
+    missed websocket pushes and applies to every role uniformly (all roles
+    funnel through this factory, local and distributed alike).
+    """
     from thenvoi import Agent
+    from thenvoi.runtime.types import SessionConfig
 
     return Agent.create(
         adapter=adapter,
@@ -476,6 +592,9 @@ def _create_band_agent(adapter, creds: AgentCredentials, config: CodebandConfig)
         api_key=creds.api_key,
         ws_url=config.band.ws_url,
         rest_url=config.band.rest_url,
+        session_config=SessionConfig(
+            idle_resync_seconds=config.agents.idle_resync_seconds,
+        ),
     )
 
 
@@ -595,6 +714,7 @@ async def run_local(
     *,
     shutdown_event: asyncio.Event | None = None,
     ready_event: asyncio.Event | None = None,
+    fresh: bool = False,
 ) -> None:
     """Run all Codeband agents in a single async process.
 
@@ -607,11 +727,22 @@ async def run_local(
     If ``ready_event`` is supplied, it is set once the agents banner has
     been printed and all tasks have been spawned. Used by the shell to
     sequence the "Ready; use /help…" hint after the orchestrator banner.
+
+    ``fresh=True`` (``cb run --fresh``) skips rejoining existing rooms and
+    their backlog at startup; the default rejoins rooms tied to active
+    tasks in the StateStore (mid-task recovery).
     """
 
     agent_config = await _ensure_agents_registered(config, project_dir)
     resolved_config = _resolve_workspace_config(config, project_dir)
     layout = initialize_workspace(resolved_config)
+    # Inputs for the patched startup sweep, read at sweep time. The store
+    # path uses the same post-#36/#40 resolution every state consumer shares
+    # (resolve_workspace_path via _resolve_workspace_config above).
+    _local_sweep_settings.state_db_path = (
+        Path(resolved_config.workspace.path) / "state" / "orchestration.db"
+    )
+    _local_sweep_settings.fresh = fresh
     _patch_band_local_runtime()
     # Every agent session spawned below inherits the resolved project dir so
     # cb-phase / cb approve resolve config + state from any cwd.
