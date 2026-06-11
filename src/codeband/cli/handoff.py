@@ -8,8 +8,10 @@ if every gate passes, regardless of what the Conductor intended.
 
 The authoritative ``task_id`` (the FK target of every subtask row) is *not*
 taken from the command line: it is resolved from the active-room pointer
-``<project_dir>/.codeband_room`` that ``kickoff.send_task`` writes (where
-``tasks.task_id == room_id``). The ``--task`` flag is accepted for readability
+``{workspace}/state/.codeband_room`` that task registration writes next to
+the state DB (legacy ``<project_dir>/.codeband_room`` is read as a
+fallback — see ``state/registration.py``), where ``tasks.task_id ==
+room_id``. The ``--task`` flag is accepted for readability
 but is a non-authoritative label only — agents pass the semantic ``task_key``
 there, which would FK-fail if trusted (see :func:`_resolve_task_id`).
 
@@ -130,8 +132,9 @@ EXIT_DIRTY_TREE = 2
 EXIT_NO_PR = 3
 EXIT_VERIFY_FAILED = 4
 EXIT_CAP_REACHED = 5
-# No active task could be resolved from ``<project_dir>/.codeband_room`` (the
-# pointer is missing/empty, or names a room with no matching ``tasks`` row).
+# No active task could be resolved from the active-room pointer
+# ``{workspace}/state/.codeband_room`` (or its legacy project-dir fallback) —
+# the pointer is missing/empty, or names a room with no matching ``tasks`` row.
 # Distinct from the gate rejections above: nothing was attempted and nothing
 # written — the caller cannot proceed because the authoritative task_id (the FK
 # target of every subtask row) is unknown.
@@ -197,13 +200,16 @@ def _resolve_task_id(
 ) -> tuple[str | None, int | None]:
     """Resolve the authoritative ``task_id`` from the active-room pointer.
 
-    ``kickoff.send_task`` sets ``tasks.task_id == room_id`` and writes that room
-    UUID to ``<project_dir>/.codeband_room``. Every ``subtask_states`` row FKs to
+    ``kickoff.send_task`` sets ``tasks.task_id == room_id`` and registers that
+    room UUID in the active-room pointer ``{workspace}/state/.codeband_room``
+    — next to the DB it names a row in (legacy
+    ``<project_dir>/.codeband_room`` is still read as a fallback; see
+    ``state/registration.py``). Every ``subtask_states`` row FKs to
     ``tasks.task_id``, so the room UUID — not whatever label an agent passes — is
     the only value that satisfies the constraint. Agents are trained on the
     semantic ``task_key`` (e.g. ``add-redact-helper``) and pass *that* to
     ``--task``; using it for the FK is exactly the bug this resolves. So the
-    authoritative id is read from ``.codeband_room`` and ``--task`` is treated as
+    authoritative id is read from the pointer and ``--task`` is treated as
     a non-authoritative label only.
 
     Returns ``(task_id, None)`` on success. On failure returns
@@ -212,10 +218,12 @@ def _resolve_task_id(
     or a pointer with no matching ``tasks`` row) both mean the same thing to the
     caller: there is no seeded task to attach work to.
     """
-    room_file = project_dir / ".codeband_room"
-    room_id = ""
-    if room_file.is_file():
-        room_id = room_file.read_text(encoding="utf-8").strip()
+    from codeband.state.registration import read_room_pointer, state_pointer_path
+
+    # The store IS the resolution authority: the pointer lives next to its DB.
+    state_dir = Path(store.db_path).parent
+    room_file = state_pointer_path(state_dir)
+    room_id = read_room_pointer(project_dir, state_dir) or ""
 
     if not room_id:
         print(
@@ -228,7 +236,8 @@ def _resolve_task_id(
     if store.get_task(room_id) is None:
         print(
             f"cb-phase: no active task — no tasks row matches active room "
-            f"{room_id} (from {room_file}); was the task seeded via `cb task`?",
+            f"{room_id} (from {room_file} or its legacy fallback); was the "
+            "task seeded via `cb task`?",
             file=sys.stderr,
         )
         return None, EXIT_NO_ACTIVE_TASK

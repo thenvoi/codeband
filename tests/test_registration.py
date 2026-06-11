@@ -41,6 +41,22 @@ def store(tmp_path: Path) -> StateStore:
 
 
 def _pointer(project_dir: Path) -> Path:
+    """Canonical pointer location for the primitive tests' store fixture.
+
+    The ``store`` fixture lives at ``tmp_path/state/orchestration.db``, and
+    the pointer now sits next to that DB.
+    """
+    return project_dir / "state" / ".codeband_room"
+
+
+def _ws_pointer(project_dir: Path) -> Path:
+    """Canonical pointer for the send_task/CLI tests (sample_config uses
+    ``workspace.path: workspace`` → DB at ``workspace/state/``)."""
+    return project_dir / "workspace" / "state" / ".codeband_room"
+
+
+def _legacy_pointer(project_dir: Path) -> Path:
+    """The pre-relocation pointer location (read-fallback only)."""
     return project_dir / ".codeband_room"
 
 
@@ -182,6 +198,78 @@ class TestRegisterTask:
         assert store.get_task("room-1") is not None
         assert _pointer(tmp_path).read_text(encoding="utf-8").strip() == "room-1"
 
+    def test_fresh_registration_writes_new_location_only(
+        self, tmp_path: Path, store: StateStore
+    ) -> None:
+        """The pointer lives next to the DB; nothing writes the legacy
+        project-dir location anymore."""
+        register_task(
+            room_id="room-1",
+            description="task",
+            owner_id="owner-7",
+            agents=_gated_agents(),
+            project_dir=tmp_path,
+            store=store,
+        )
+        assert _pointer(tmp_path).read_text(encoding="utf-8").strip() == "room-1"
+        assert not _legacy_pointer(tmp_path).exists()
+
+    def test_legacy_pointer_is_read_for_supersede_detection(
+        self, tmp_path: Path, store: StateStore
+    ) -> None:
+        """A pre-relocation install: the active task is known only via the
+        legacy pointer. Registering a new room must still supersede it."""
+        register_task(
+            room_id="room-old",
+            description="old",
+            owner_id="owner-a",
+            agents=_gated_agents(),
+            project_dir=tmp_path,
+            store=store,
+        )
+        # Simulate the pre-relocation on-disk state: pointer at the legacy
+        # location only.
+        _legacy_pointer(tmp_path).write_text("room-old", encoding="utf-8")
+        _pointer(tmp_path).unlink()
+
+        result = register_task(
+            room_id="room-new",
+            description="new",
+            owner_id="owner-b",
+            agents=_gated_agents(),
+            project_dir=tmp_path,
+            store=store,
+        )
+        assert result.outcome == "superseded"
+        assert result.superseded_task_id == "room-old"
+
+    def test_reregistration_migrates_legacy_pointer(
+        self, tmp_path: Path, store: StateStore
+    ) -> None:
+        """Re-registering writes the new location and removes the legacy
+        file — the migration path for pre-relocation installs."""
+        register_task(
+            room_id="room-1",
+            description="task",
+            owner_id="owner-a",
+            agents=_gated_agents(),
+            project_dir=tmp_path,
+            store=store,
+        )
+        _legacy_pointer(tmp_path).write_text("room-1", encoding="utf-8")
+        _pointer(tmp_path).unlink()
+
+        register_task(
+            room_id="room-1",
+            description="task",
+            owner_id="owner-b",
+            agents=_gated_agents(),
+            project_dir=tmp_path,
+            store=store,
+        )
+        assert _pointer(tmp_path).read_text(encoding="utf-8").strip() == "room-1"
+        assert not _legacy_pointer(tmp_path).exists()
+
     def test_row_without_pointer_restores_pointer(
         self, tmp_path: Path, store: StateStore
     ) -> None:
@@ -211,6 +299,66 @@ class TestRegisterTask:
         assert task is not None
         assert task.owner_id == "owner-b"
         assert _task_row_count(store.db_path) == 1
+
+
+# ---------------------------------------------------------------------------
+# read_room_pointer — dual-location read (canonical next-to-DB + legacy)
+# ---------------------------------------------------------------------------
+
+class TestReadRoomPointer:
+    def test_reads_canonical_location_first(self, tmp_path: Path) -> None:
+        from codeband.state.registration import read_room_pointer
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        (state_dir / ".codeband_room").write_text("room-new", encoding="utf-8")
+        _legacy_pointer(tmp_path).write_text("room-stale", encoding="utf-8")
+        assert read_room_pointer(tmp_path, state_dir) == "room-new"
+
+    def test_legacy_fallback_resolves_with_deprecation_warning(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        from codeband.state.registration import read_room_pointer
+
+        state_dir = tmp_path / "state"
+        _legacy_pointer(tmp_path).write_text("room-legacy", encoding="utf-8")
+        assert read_room_pointer(tmp_path, state_dir) == "room-legacy"
+        err = capsys.readouterr().err
+        assert "legacy" in err
+        assert str(_legacy_pointer(tmp_path)) in err
+        assert str(state_dir / ".codeband_room") in err
+
+    def test_legacy_fallback_warning_is_suppressible(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        from codeband.state.registration import read_room_pointer
+
+        _legacy_pointer(tmp_path).write_text("room-legacy", encoding="utf-8")
+        assert (
+            read_room_pointer(tmp_path, tmp_path / "state", warn_legacy=False)
+            == "room-legacy"
+        )
+        assert capsys.readouterr().err == ""
+
+    def test_no_pointer_anywhere_returns_none(self, tmp_path: Path) -> None:
+        from codeband.state.registration import read_room_pointer
+
+        assert read_room_pointer(tmp_path, tmp_path / "state") is None
+
+    def test_cb_phase_resolves_task_via_legacy_pointer(
+        self, tmp_path: Path, store: StateStore, capsys
+    ) -> None:
+        """End-to-end through cb-phase's resolver: a pre-relocation repo
+        (legacy pointer only) still resolves, with the deprecation warning."""
+        from codeband.cli.handoff import _resolve_task_id
+
+        store.create_task(task_id="room-1", description="t", room_id="room-1")
+        # The store fixture's pointer dir is tmp_path/state — leave it empty.
+        _legacy_pointer(tmp_path).write_text("room-1", encoding="utf-8")
+
+        task_id, error = _resolve_task_id(tmp_path, store, None)
+        assert (task_id, error) == ("room-1", None)
+        assert "legacy" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +558,7 @@ class TestSendTaskRegistration:
         human_client.human_api_participants.add_my_chat_participant.assert_not_called()
         human_client.human_api_messages.send_my_chat_message.assert_not_called()
         # … and before anything was registered.
-        assert not _pointer(tmp_path).exists()
+        assert not _ws_pointer(tmp_path).exists()
         db_path = tmp_path / "workspace" / "state" / "orchestration.db"
         assert not db_path.exists() or _task_row_count(db_path) == 0
 
@@ -442,7 +590,7 @@ class TestSendTaskRegistration:
             events.append("message")
             # The pointer and the tasks row must already exist when the task
             # message (the agent-activation edge) is posted.
-            assert _pointer(tmp_path).read_text(encoding="utf-8").strip() == "room-123"
+            assert _ws_pointer(tmp_path).read_text(encoding="utf-8").strip() == "room-123"
             db_path = tmp_path / "workspace" / "state" / "orchestration.db"
             task = StateStore(db_path).get_task("room-123")
             assert task is not None
@@ -480,7 +628,7 @@ class TestRegisterTaskCli:
 
         assert result.exit_code == 0, result.output
         assert "Registered task room-cli" in result.output
-        assert _pointer(tmp_path).read_text(encoding="utf-8").strip() == "room-cli"
+        assert _ws_pointer(tmp_path).read_text(encoding="utf-8").strip() == "room-cli"
         task = StateStore(
             tmp_path / "workspace" / "state" / "orchestration.db"
         ).get_task("room-cli")
@@ -503,5 +651,5 @@ class TestRegisterTaskCli:
         ])
 
         assert result.exit_code != 0
-        assert not _pointer(tmp_path).exists()
+        assert not _ws_pointer(tmp_path).exists()
         assert not (tmp_path / "workspace" / "state" / "orchestration.db").exists()

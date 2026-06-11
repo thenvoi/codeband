@@ -150,20 +150,24 @@ async def send_room_message(
 ) -> None:
     """Send a message to the existing Codeband task room (for approve/reject).
 
-    Reads the room ID from .codeband_room (written by send_task) and sends
-    the message @mentioning the Conductor. Does NOT create a new room.
+    Reads the room ID from the active-room pointer (canonical
+    ``{workspace}/state/.codeband_room``, legacy project-dir fallback — see
+    ``state/registration.py``) and sends the message @mentioning the
+    Conductor. Does NOT create a new room.
     """
     from thenvoi_rest import AsyncRestClient, ChatMessageRequest
     from thenvoi_rest.types import ChatMessageRequestMentionsItem as Mention
 
-    room_file = project_dir / ".codeband_room"
-    try:
-        task_room_id = room_file.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
+    from codeband.state.registration import read_room_pointer, resolve_state_dir
+
+    task_room_id = read_room_pointer(
+        project_dir, resolve_state_dir(config, project_dir),
+    )
+    if not task_room_id:
         task_cmd = "/task" if command_style == "slash" else "cb task"
         issue_cmd = "/issue" if command_style == "slash" else "cb issue"
         raise RuntimeError(
-            "No active Codeband task room found (.codeband_room missing). "
+            "No active Codeband task room found (state/.codeband_room missing). "
             f"Start a task first with '{task_cmd}' or '{issue_cmd}'."
         )
 
@@ -436,16 +440,20 @@ async def _cleanup_rooms(
 ) -> None:
     """Remove agents from the previous task room only.
 
-    Reads .codeband_room to find the specific room to clean up. Other rooms
-    (including concurrent Codeband tasks) are left untouched. Each agent
-    leaves on its own credentials, so a 404 (already-not-a-member, common
-    under lazy invites where most agents were never added) is harmless.
+    Reads the active-room pointer (both locations — the canonical
+    ``{workspace}/state/.codeband_room`` and the legacy project-dir file) to
+    find the specific room to clean up. Other rooms (including concurrent
+    Codeband tasks) are left untouched. Each agent leaves on its own
+    credentials, so a 404 (already-not-a-member, common under lazy invites
+    where most agents were never added) is harmless.
     """
-    room_file = project_dir / ".codeband_room"
-    try:
-        prev_room_id = room_file.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        prev_room_id = None
+    from codeband.state.registration import read_room_pointer, resolve_state_dir
+
+    # warn_legacy=False: send_task re-registers immediately after this,
+    # which migrates a legacy pointer anyway — no need to nag here.
+    prev_room_id = read_room_pointer(
+        project_dir, resolve_state_dir(config, project_dir), warn_legacy=False,
+    )
 
     if not prev_room_id:
         logger.debug("No previous task room found, skipping cleanup")
@@ -460,18 +468,29 @@ async def reset_active_room(config: CodebandConfig, project_dir: Path) -> str | 
 
     Returns the room id that was cleaned up, or None if there was nothing to
     reset. Safe to call repeatedly — missing file or dead-on-Band room both
-    reduce to a no-op.
+    reduce to a no-op. Clears BOTH pointer locations (canonical
+    ``{workspace}/state/.codeband_room`` and the legacy project-dir file) so
+    a reset can never leave a stale legacy pointer behind to resurrect a
+    dead room.
     """
-    room_file = project_dir / ".codeband_room"
-    try:
-        room_id = room_file.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return None
+    from codeband.state.registration import (
+        legacy_pointer_path,
+        read_room_pointer,
+        resolve_state_dir,
+        state_pointer_path,
+    )
+
+    state_dir = resolve_state_dir(config, project_dir)
+    pointer_files = (state_pointer_path(state_dir), legacy_pointer_path(project_dir))
+
+    room_id = read_room_pointer(project_dir, state_dir, warn_legacy=False)
     if not room_id:
-        room_file.unlink(missing_ok=True)
+        for f in pointer_files:
+            f.unlink(missing_ok=True)
         return None
 
     agent_config = load_agent_config(project_dir)
     await _remove_agents_from_room(room_id, agent_config, config)
-    room_file.unlink(missing_ok=True)
+    for f in pointer_files:
+        f.unlink(missing_ok=True)
     return room_id
