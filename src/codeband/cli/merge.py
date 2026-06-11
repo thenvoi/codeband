@@ -85,7 +85,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from codeband.cli.handoff import _output_tail, _resolve_store, _resolve_task_id
+from codeband.cli.handoff import (
+    _output_tail,
+    _resolve_store,
+    _resolve_task_id,
+    resolve_project_dir,
+)
 from codeband.state.fsm import (
     InvalidTransitionError,
     MergeNotEligibleError,
@@ -308,7 +313,7 @@ def _transition_or_fail(
 
 
 def _cmd_merge(args: argparse.Namespace) -> int:
-    project_dir = Path(args.project_dir).resolve()
+    project_dir = resolve_project_dir(args.project_dir)
     worktree = Path(args.worktree).resolve()
     store = _resolve_store(project_dir)
 
@@ -673,7 +678,7 @@ def add_merge_subparser(sub: argparse._SubParsersAction) -> None:
     merge.set_defaults(func=_cmd_merge)
 
 
-def record_approval_grant(project_dir: Path, pr_number: int) -> list[str]:
+def record_approval_grant(project_dir: Path | str, pr_number: int) -> list[str]:
     """Record a SHA-pinned merge-approval grant for ``pr_number``'s subtask(s).
 
     The store half of ``cb approve <pr>`` (the chat half is unchanged):
@@ -683,10 +688,16 @@ def record_approval_grant(project_dir: Path, pr_number: int) -> list[str]:
     empty when no subtask is bound to the PR (the legacy chat-only flow,
     which records nothing and changes nothing).
 
+    ``project_dir`` is the raw ``--dir`` flag value: it goes through
+    :func:`~codeband.cli.handoff.resolve_project_dir` (explicit flag >
+    ``$CODEBAND_PROJECT_DIR`` > cwd), the same contract as every ``cb-phase``
+    leg, so ``cb approve`` works from any cwd when the env var is set.
+
     Raises :class:`RuntimeError` when a bound subtask exists but the PR head
     cannot be read — a grant that silently pins nothing would strand the
     merge leg in awaiting-approval forever.
     """
+    project_dir = resolve_project_dir(project_dir)
     store = _resolve_store(project_dir)
     task_id, error_code = _resolve_task_id(project_dir, store, None)
     if error_code is not None:

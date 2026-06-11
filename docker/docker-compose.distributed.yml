@@ -33,6 +33,11 @@ x-agent-base: &agent-base
       required: false
   environment: &env-base
     CODEBAND_CONFIG: /app/config/codeband.yaml
+    # In-container project dir (config + active-room pointer) for cb-phase /
+    # cb approve resolution from any cwd. Distinct from the HOST-side
+    # ${CODEBAND_PROJECT_DIR:-.} used by compose interpolation — this
+    # literal value is what processes inside the container see.
+    CODEBAND_PROJECT_DIR: /app/config
     DEPLOYMENT_MODE: distributed
     BAND_REST_URL: ${BAND_REST_URL:-https://app.band.ai}
     BAND_WS_URL: ${BAND_WS_URL:-wss://app.band.ai/api/v1/socket/websocket}

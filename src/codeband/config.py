@@ -335,9 +335,16 @@ class CodebandConfig(_StrictModel):
 
     @classmethod
     def from_yaml(cls, path: Path) -> CodebandConfig:
-        """Load configuration from a YAML file."""
+        """Load configuration from a YAML file.
+
+        ``yaml.safe_load`` yields ``None`` for a zero-byte / comments-only
+        file; normalize to ``{}`` (as ``AgentConfigFile.from_yaml`` already
+        does) so an empty ``codeband.yaml`` fails with the actionable
+        "repo: Field required" instead of the opaque "Input should be a
+        valid dictionary".
+        """
         with open(path, encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+            data = yaml.safe_load(f) or {}
         return cls.model_validate(data)
 
     def to_yaml(self, path: Path) -> None:

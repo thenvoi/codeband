@@ -92,6 +92,27 @@ class TestCodebandConfig:
         with pytest.raises(FileNotFoundError, match="codeband.yaml not found"):
             load_config(tmp_path)
 
+    def test_from_yaml_empty_file_reports_missing_repo(self, tmp_path: Path):
+        """[F7-10] A zero-byte codeband.yaml normalizes to {} so the error is
+        the actionable 'repo: Field required', not 'Input should be a valid
+        dictionary'."""
+        from pydantic import ValidationError
+
+        yaml_path = tmp_path / "codeband.yaml"
+        yaml_path.write_text("", encoding="utf-8")
+        with pytest.raises(ValidationError, match="repo") as excinfo:
+            CodebandConfig.from_yaml(yaml_path)
+        assert "Field required" in str(excinfo.value)
+
+    def test_from_yaml_comments_only_file_reports_missing_repo(self, tmp_path: Path):
+        """A comments-only file also safe_loads to None — same normalization."""
+        from pydantic import ValidationError
+
+        yaml_path = tmp_path / "codeband.yaml"
+        yaml_path.write_text("# nothing here yet\n", encoding="utf-8")
+        with pytest.raises(ValidationError, match="repo"):
+            CodebandConfig.from_yaml(yaml_path)
+
 
 class TestAgentConfigFile:
     """Tests for agent credentials file."""
