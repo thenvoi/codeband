@@ -996,7 +996,12 @@ def pending(project_dir: str, command_style: str = "cli") -> None:
 @_project_aware
 def approve(number: int, project_dir: str, command_style: str = "cli") -> None:
     """Approve a PR for merge (sends approval to Conductor in existing task room)."""
-    project = Path(project_dir).resolve()
+    # Resolved through the shared cb-phase contract (explicit --dir >
+    # $CODEBAND_PROJECT_DIR > cwd) — without this, the config load below
+    # would fail on cwd before the env-var-resolving grant half ever ran.
+    from codeband.cli.handoff import resolve_project_dir
+
+    project = resolve_project_dir(project_dir)
     config = load_config(project)
 
     from codeband.github.prs import pr_url, repo_slug
@@ -1008,9 +1013,12 @@ def approve(number: int, project_dir: str, command_style: str = "cli") -> None:
     # ``cb-phase merge`` leg queries. Recorded before the chat message so a
     # failure here is loud and re-runnable, never masked by a sent chat. A PR
     # with no bound subtask (the legacy chat-only flow) records nothing.
+    # The RAW --dir value is passed (not the cwd-resolved ``project``) so the
+    # grant half resolves it through the shared cb-phase contract: explicit
+    # flag > $CODEBAND_PROJECT_DIR > cwd.
     from codeband.cli.merge import record_approval_grant
 
-    for line in record_approval_grant(project, number):
+    for line in record_approval_grant(project_dir, number):
         click.echo(line)
 
     message = (

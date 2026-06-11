@@ -60,7 +60,31 @@ next step, and each failure mode exits with a distinct code.
 
 The tags (``dirty_tree`` / ``no_pr`` / ``verify_failed`` / ``cap_reached``) are
 part of the contract — they feed the verify-gate activation's telemetry later —
-so keep them stable.
+so keep them stable. The machine-greppable contract extends to config/IO
+failures too: :func:`main` catches anything the legs raise and prints a
+single tagged line instead of a traceback —
+
+    cb-phase: <msg>                       (FileNotFoundError — missing config)
+    cb-phase: fatal — <Type>: <msg>       (ValidationError / anything else)
+
+both exiting 1, so a missing or malformed ``codeband.yaml`` is as routable as
+a failed gate.
+
+**Project-dir resolution (contract).** Every leg (and ``cb approve``'s grant
+half in ``cli/merge.py``) resolves the project directory — the home of
+``codeband.yaml`` and the workspace/state store — through ONE shared helper,
+:func:`resolve_project_dir`, with this precedence:
+
+1. an explicit, non-default ``--project-dir`` flag value;
+2. the ``$CODEBAND_PROJECT_DIR`` environment variable (exported by the
+   runner into every spawned agent session, and set to ``/app/config`` in
+   the Docker images);
+3. the process cwd (the historical behavior, kept as the last resort).
+
+The default flag value ``"."`` means "not explicitly given" — so a literal
+``--project-dir .`` is indistinguishable from the default and yields to the
+env var. Prompts deliberately pass no ``--project-dir``: the env var carries
+the context, so the prompt surface gains zero new flags.
 
 The ``cb-phase merge`` subcommand (the gated merge-execution leg) lives in
 ``cli/merge.py`` — it talks to Band for the approval request, which this
@@ -73,6 +97,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -128,6 +153,27 @@ EXIT_HEAD_MISMATCH = 14
 # the ``REJECTED [verify_failed]`` message — enough to see the failure without
 # dumping a whole test log into the chat relay.
 _VERIFY_OUTPUT_TAIL_LINES = 20
+
+
+def resolve_project_dir(flag_value: str | Path = ".") -> Path:
+    """Resolve the project dir: explicit flag > $CODEBAND_PROJECT_DIR > cwd.
+
+    The ONE shared helper behind every ``cb-phase`` leg and ``cb approve``'s
+    grant half (see the module docstring's contract section). ``flag_value``
+    is the raw ``--project-dir`` / ``--dir`` value: anything other than the
+    default ``"."`` is an explicit choice and wins outright. Otherwise a
+    non-empty ``$CODEBAND_PROJECT_DIR`` wins — the runner exports it into
+    every spawned agent session and the Docker images pin it to
+    ``/app/config``, so agents resolve the right config from any cwd
+    (worktrees, scratch dirs, containers). Only when both are absent does
+    the historical cwd fallback apply.
+    """
+    if str(flag_value) not in ("", "."):
+        return Path(flag_value).resolve()
+    env_value = os.environ.get("CODEBAND_PROJECT_DIR")
+    if env_value:
+        return Path(env_value).resolve()
+    return Path(flag_value or ".").resolve()
 
 
 def _resolve_store(project_dir: Path) -> StateStore:
@@ -557,7 +603,7 @@ def _walk_to_verify_pending(
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
-    project_dir = Path(args.project_dir).resolve()
+    project_dir = resolve_project_dir(args.project_dir)
     worktree = Path(args.worktree).resolve()
     store = _resolve_store(project_dir)
 
@@ -705,7 +751,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     start, so no gate runs — the gates that matter (verify → review_pending,
     the review verdict) stay downstream and untouched.
     """
-    project_dir = Path(args.project_dir).resolve()
+    project_dir = resolve_project_dir(args.project_dir)
     store = _resolve_store(project_dir)
 
     task_id, error_code = _resolve_task_id(project_dir, store, args.task)
@@ -759,7 +805,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
     verification — the route is enforced in code, not by an LLM following a
     prompt.
     """
-    project_dir = Path(args.project_dir).resolve()
+    project_dir = resolve_project_dir(args.project_dir)
     store = _resolve_store(project_dir)
 
     task_id, error_code = _resolve_task_id(project_dir, store, args.task)
@@ -902,10 +948,29 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Console entry point for ``cb-phase``. Returns a process exit code."""
+    """Console entry point for ``cb-phase``. Returns a process exit code.
+
+    Top-level error handling [F7-4]: the legs raise freely (missing
+    ``codeband.yaml``, a pydantic ``ValidationError`` from a malformed one,
+    unexpected IO errors); this is the single place that turns any of them
+    into one tagged, traceback-free stderr line — keeping the module
+    docstring's machine-greppable promise true for config/IO failures too.
+    A ``FileNotFoundError`` (missing config) already carries an actionable
+    message, so it is printed verbatim under the ``cb-phase:`` prefix;
+    everything else is tagged ``fatal`` with its type name.
+    """
     parser = _build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except FileNotFoundError as exc:
+        print(f"cb-phase: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 — the traceback-free contract
+        print(
+            f"cb-phase: fatal — {type(exc).__name__}: {exc}", file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":  # pragma: no cover

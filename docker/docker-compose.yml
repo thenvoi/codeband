@@ -22,6 +22,11 @@ x-agent-base: &agent-base
   environment: &env-base
     CODEBAND_CONFIG: /app/config/codeband.yaml
     AGENT_CONFIG: /app/config/agent_config.yaml
+    # In-container project dir (config + active-room pointer) for cb-phase /
+    # cb approve resolution from any cwd. Distinct from the HOST-side
+    # ${CODEBAND_PROJECT_DIR:-.} used by compose interpolation below — this
+    # literal value is what processes inside the container see.
+    CODEBAND_PROJECT_DIR: /app/config
     WORKSPACE: /workspace
     REPO_URL: ${REPO_URL:-}
     REPO_BRANCH: ${REPO_BRANCH:-}

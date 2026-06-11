@@ -425,6 +425,25 @@ async def _install_memory_backend(
 
 # ─── workspace path helpers ─────────────────────────────────────────────────
 
+def _export_project_dir_env(project_dir: Path) -> None:
+    """Export ``CODEBAND_PROJECT_DIR`` for every session this process spawns.
+
+    The coder/reviewer/mergemaster CLI sessions (Claude Code / Codex
+    subprocesses spawned by the adapters, which already receive their ``cwd``
+    from the runner) inherit this process's environment — exporting here is
+    the one seam that injects the resolved project dir into every spawned
+    session, local and supervised alike. ``cb-phase`` and ``cb approve``
+    resolve their project dir from this variable when no explicit
+    ``--project-dir`` is given (see ``cli/handoff.py:resolve_project_dir``),
+    so prompts pass no new flags and agents stop depending on their cwd
+    happening to be the project dir. Docker sets the same variable to
+    ``/app/config`` in the compose env block.
+    """
+    import os
+
+    os.environ["CODEBAND_PROJECT_DIR"] = str(Path(project_dir).resolve())
+
+
 def _resolve_workspace_config(config: CodebandConfig, project_dir: Path) -> CodebandConfig:
     """Resolve workspace path relative to project_dir, returning updated config."""
     import os
@@ -591,6 +610,9 @@ async def run_local(
     resolved_config = _resolve_workspace_config(config, project_dir)
     layout = initialize_workspace(resolved_config)
     _patch_band_local_runtime()
+    # Every agent session spawned below inherits the resolved project dir so
+    # cb-phase / cb approve resolve config + state from any cwd.
+    _export_project_dir_env(project_dir)
 
     # Resolve memory backend once per process, using the Conductor's creds.
     conductor_creds = agent_config.get("conductor")
@@ -870,6 +892,11 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
 
     resolved_config = _resolve_workspace_config(config, project_dir)
     layout = initialize_agent_workspace(resolved_config, agent_key, role)
+    # Same seam as run_local: the agent session spawned below inherits the
+    # resolved project dir so cb-phase / cb approve work from any cwd. In
+    # Docker the compose env block already pins this to /app/config — the
+    # re-export resolves to the identical path (project_dir IS that dir).
+    _export_project_dir_env(project_dir)
 
     # Resolve memory backend per process.
     probe_client = _create_rest_client(creds.api_key, resolved_config.band.rest_url)
