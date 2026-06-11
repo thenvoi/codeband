@@ -89,7 +89,21 @@ def env(monkeypatch, store):
         merge, "_resolve_task_id",
         lambda project_dir, store, task_arg: (TASK, None),
     )
-    monkeypatch.setattr(merge, "_pr_snapshot", lambda pr_number, cwd: dict(pr))
+    snapshot_repos: list[str | None] = []
+
+    def _fake_snapshot(pr_number, cwd, repo=None):
+        snapshot_repos.append(repo)
+        return dict(pr)
+
+    monkeypatch.setattr(merge, "_pr_snapshot", _fake_snapshot)
+    # record_approval_grant derives its --repo slug from config repo.url —
+    # stub the config load so no codeband.yaml is needed on disk.
+    monkeypatch.setattr(
+        merge, "load_config",
+        lambda project_dir: SimpleNamespace(
+            repo=SimpleNamespace(url="https://github.com/acme/widgets.git"),
+        ),
+    )
 
     def _fake_merge(pr_number, cwd, pending_sha):
         gh_merges.append(pr_number)
@@ -110,6 +124,7 @@ def env(monkeypatch, store):
     return SimpleNamespace(
         store=store, pr=pr, gh_merges=gh_merges, gh_merge_pins=gh_merge_pins,
         sends=sends, branch_deletes=branch_deletes,
+        snapshot_repos=snapshot_repos,
     )
 
 
@@ -542,19 +557,79 @@ def test_record_approval_grant_pins_pr_head_sha(env):
     assert sub.merge_approved_by == "owner"  # the task's snapshotted approver
 
 
-def test_record_approval_grant_noops_without_bound_subtask(env):
-    # Legacy chat-only flow: nothing binds the PR, nothing is recorded.
+def test_record_approval_grant_pins_repo_via_config_slug(env):
+    """The grant's PR snapshot carries --repo <slug> from config repo.url —
+    repo identity never depends on what repo the cwd happens to be in."""
+    env.store.set_pr_number("st-1", TASK, 42)
+    merge.record_approval_grant(Path("."), 42)
+    assert env.snapshot_repos == ["acme/widgets"]
+
+
+def test_record_approval_grant_unbound_pr_warns_loud_and_records_nothing(
+    env, capsys,
+):
+    # Approve-before-binding: nothing binds the PR yet — nothing is recorded,
+    # and the human is TOLD so (a silent [] looked like success).
     assert merge.record_approval_grant(Path("."), 99) == []
     assert env.store.get_subtask("st-1", TASK).merge_approved_sha is None
+    err = capsys.readouterr().err
+    assert "NO durable merge grant was recorded" in err
+    assert "cb approve 99" in err  # tells the human exactly what to re-run
+
+
+def test_record_approval_grant_raises_when_no_active_task(env, monkeypatch):
+    """Task-resolution failure must RAISE — an 'approval' recorded against
+    nothing must never look like success."""
+    monkeypatch.setattr(
+        merge, "_resolve_task_id",
+        lambda project_dir, store, task_arg: (None, 6),
+    )
+    with pytest.raises(RuntimeError, match="no active task"):
+        merge.record_approval_grant(Path("."), 42)
 
 
 def test_record_approval_grant_fails_loud_when_head_unreadable(env, monkeypatch):
     env.store.set_pr_number("st-1", TASK, 42)
-    monkeypatch.setattr(merge, "_pr_snapshot", lambda pr_number, cwd: None)
+    monkeypatch.setattr(
+        merge, "_pr_snapshot", lambda pr_number, cwd, repo=None: None,
+    )
 
     with pytest.raises(RuntimeError, match="head SHA"):
         merge.record_approval_grant(Path("."), 42)
     assert env.store.get_subtask("st-1", TASK).merge_approved_sha is None
+
+
+def test_record_approval_grant_fails_loud_on_unresolvable_slug(env, monkeypatch):
+    env.store.set_pr_number("st-1", TASK, 42)
+    monkeypatch.setattr(
+        merge, "load_config",
+        lambda project_dir: SimpleNamespace(
+            repo=SimpleNamespace(url="https://gitlab.example.com/g/p.git"),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="repo slug"):
+        merge.record_approval_grant(Path("."), 42)
+    assert env.store.get_subtask("st-1", TASK).merge_approved_sha is None
+
+
+def test_cb_approve_command_renders_grant_failures_as_clean_errors(tmp_path):
+    """The approve command wraps the grant half in ClickException: a human
+    gets the message, not a traceback. No pointer/task exists here, so the
+    grant half raises 'no active task'."""
+    from click.testing import CliRunner
+
+    from codeband.cli import cli as cb_cli
+
+    (tmp_path / "codeband.yaml").write_text(
+        "repo:\n  url: https://github.com/acme/widgets\n", encoding="utf-8",
+    )
+    result = CliRunner().invoke(
+        cb_cli, ["approve", "42", "--dir", str(tmp_path)],
+    )
+    combined = result.output + result.stderr
+    assert result.exit_code != 0
+    assert "no active task" in combined
+    assert "Traceback" not in combined
 
 
 # ─────────────────────────────────────────────────────────────────────────────

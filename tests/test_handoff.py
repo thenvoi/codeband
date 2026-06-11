@@ -35,12 +35,26 @@ def patch_gates(monkeypatch, store):
     monkeypatch.setattr(handoff, "_max_review_rounds", lambda project_dir: 3)
     monkeypatch.setattr(handoff, "_uncommitted_files", lambda worktree: [])
     monkeypatch.setattr(handoff, "_current_branch", lambda worktree: "feat-x")
-    monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
     monkeypatch.setattr(handoff, "_run_verify_command", lambda cmd, cwd: (0, ""))
     monkeypatch.setattr(handoff, "_git_head", lambda worktree: "cafe1234")
-    # The PR head matches the worktree HEAD (the coder pushed) by default.
-    monkeypatch.setattr(handoff, "_pr_head_sha", lambda project_dir, pr: "cafe1234")
+    # Verify's ONE gh snapshot: OPEN, on the worktree's branch, with the PR
+    # head matching the worktree HEAD (the coder pushed) by default.
+    monkeypatch.setattr(
+        handoff, "_verify_pr_snapshot",
+        lambda project_dir, pr: {
+            "state": "OPEN", "headRefName": "feat-x", "headRefOid": "cafe1234",
+        },
+    )
     return store
+
+
+def _snapshot(monkeypatch, **overrides):
+    """Re-stub the verify snapshot with specific fields overridden."""
+    base = {"state": "OPEN", "headRefName": "feat-x", "headRefOid": "cafe1234"}
+    base.update(overrides)
+    monkeypatch.setattr(
+        handoff, "_verify_pr_snapshot", lambda project_dir, pr: dict(base),
+    )
 
 
 def _run():
@@ -62,7 +76,7 @@ def test_verify_fails_on_dirty_tree(patch_gates, monkeypatch):
 
 def test_verify_fails_on_non_open_pr(patch_gates, monkeypatch):
     store = patch_gates
-    monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: False)
+    _snapshot(monkeypatch, state="CLOSED")
     assert _run() != 0
     assert store.get_subtask("st-1", "room-1").state == "verify_pending"
 
@@ -135,7 +149,7 @@ def test_dirty_tree_emits_tag_and_exit_code(patch_gates, monkeypatch, capsys):
 
 
 def test_no_pr_emits_tag_branch_and_exit_code(patch_gates, monkeypatch, capsys):
-    monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: False)
+    _snapshot(monkeypatch, state="CLOSED")
     monkeypatch.setattr(handoff, "_current_branch", lambda worktree: "feat/login")
     assert _run() == handoff.EXIT_NO_PR
     err = capsys.readouterr().err
@@ -186,8 +200,10 @@ def test_each_failure_mode_has_a_distinct_exit_code():
         handoff.EXIT_NO_ACTIVE_TASK,
         handoff.EXIT_HEAD_UNRESOLVED,
         handoff.EXIT_HEAD_MISMATCH,
+        handoff.EXIT_PR_QUERY_FAILED,
+        handoff.EXIT_WRONG_PR,
     }
-    assert len(codes) == 7  # all distinct
+    assert len(codes) == 9  # all distinct
     assert 0 not in codes  # never collide with success
     # 7–12 belong to the merge leg (cli/merge.py) — never reuse them here.
     assert codes.isdisjoint(range(7, 13))
@@ -228,13 +244,81 @@ def test_uncommitted_files_treats_git_failure_as_dirty(monkeypatch, tmp_path):
     assert handoff._uncommitted_files(tmp_path) != []  # non-empty → gate rejects
 
 
-def test_pr_is_open_parses_state(monkeypatch):
+def test_verify_pr_snapshot_queries_gh_once_with_repo_slug(monkeypatch, tmp_path):
+    """ONE query, cwd-independent by construction: --repo from config repo.url,
+    and all three decision fields requested together."""
+    from types import SimpleNamespace
+
+    calls = []
+
     class _Result:
         returncode = 0
-        stdout = '{"state": "OPEN"}'
+        stdout = '{"state": "OPEN", "headRefName": "feat-x", "headRefOid": "cafe1234"}'
+        stderr = ""
 
-    monkeypatch.setattr(handoff.subprocess, "run", lambda cmd, **kw: _Result())
-    assert handoff._pr_is_open(7) is True
+    def _fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _Result()
+
+    monkeypatch.setattr(
+        handoff, "load_config",
+        lambda project_dir: SimpleNamespace(
+            repo=SimpleNamespace(url="https://github.com/acme/widgets.git"),
+        ),
+    )
+    monkeypatch.setattr(handoff.subprocess, "run", _fake_run)
+    snap = handoff._verify_pr_snapshot(tmp_path, 7)
+    assert snap == {
+        "state": "OPEN", "headRefName": "feat-x", "headRefOid": "cafe1234",
+    }
+    assert calls == [[
+        "gh", "pr", "view", "7",
+        "--json", "state,headRefName,headRefOid", "--repo", "acme/widgets",
+    ]]
+
+
+def test_verify_pr_snapshot_returns_none_on_failure(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        handoff, "load_config",
+        lambda project_dir: SimpleNamespace(
+            repo=SimpleNamespace(url="https://github.com/acme/widgets.git"),
+        ),
+    )
+
+    class _Fail:
+        returncode = 1
+        stdout = ""
+        stderr = "no such PR"
+
+    monkeypatch.setattr(handoff.subprocess, "run", lambda cmd, **kw: _Fail())
+    assert handoff._verify_pr_snapshot(tmp_path, 7) is None
+
+    class _Garbage:
+        returncode = 0
+        stdout = "not json"
+        stderr = ""
+
+    monkeypatch.setattr(handoff.subprocess, "run", lambda cmd, **kw: _Garbage())
+    assert handoff._verify_pr_snapshot(tmp_path, 7) is None
+
+
+def test_verify_pr_snapshot_returns_none_on_non_github_url(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        handoff, "load_config",
+        lambda project_dir: SimpleNamespace(
+            repo=SimpleNamespace(url="https://gitlab.example.com/g/p.git"),
+        ),
+    )
+
+    def _boom(cmd, **kw):  # pragma: no cover - must not be called
+        raise AssertionError("gh must not run without a resolvable slug")
+
+    monkeypatch.setattr(handoff.subprocess, "run", _boom)
+    assert handoff._verify_pr_snapshot(tmp_path, 7) is None
 
 
 # ── cb-phase start — seed the subtask lifecycle into in_progress ─────────────
@@ -477,7 +561,7 @@ def test_verify_head_mismatch_burns_attempt_and_records_nothing(
     """Worktree HEAD ≠ PR head: the coder forgot to push — a legitimate coder
     error that counts as one verify attempt and writes no review_pending row."""
     store = patch_gates
-    monkeypatch.setattr(handoff, "_pr_head_sha", lambda project_dir, pr: "feed0042")
+    _snapshot(monkeypatch, headRefOid="feed0042")
     attempts_before = store.get_subtask("st-1", "room-1").verify_attempts
 
     assert _run() == handoff.EXIT_HEAD_MISMATCH
@@ -493,8 +577,10 @@ def test_verify_head_mismatch_burns_attempt_and_records_nothing(
 def test_verify_pr_head_unresolved_fails_loud_without_burning_attempt(
     patch_gates, monkeypatch, capsys,
 ):
+    """The snapshot resolved (OPEN, right branch) but carries no head SHA —
+    still an infra failure: loud, nothing recorded, no attempt burned."""
     store = patch_gates
-    monkeypatch.setattr(handoff, "_pr_head_sha", lambda project_dir, pr: None)
+    _snapshot(monkeypatch, headRefOid=None)
     attempts_before = store.get_subtask("st-1", "room-1").verify_attempts
 
     assert _run() == handoff.EXIT_HEAD_UNRESOLVED
@@ -518,6 +604,96 @@ def test_verify_worktree_head_unresolved_fails_loud_instead_of_null(
     assert _run() == handoff.EXIT_HEAD_UNRESOLVED
     assert "REJECTED [head_unresolved]" in capsys.readouterr().err
     assert store.get_subtask("st-1", "room-1").state == "verify_pending"
+
+
+# ── one-snapshot verify matrix (C1): infra/no-burn, closed, wrong-PR, bind ──
+
+def test_verify_pr_query_failed_does_not_burn_attempt(
+    patch_gates, monkeypatch, capsys,
+):
+    """gh infra failure (snapshot is None): loud tagged rejection, nothing
+    recorded, no verify attempt burned — infra never burns durable budget."""
+    store = patch_gates
+    monkeypatch.setattr(handoff, "_verify_pr_snapshot", lambda project_dir, pr: None)
+    attempts_before = store.get_subtask("st-1", "room-1").verify_attempts
+
+    assert _run() == handoff.EXIT_PR_QUERY_FAILED
+    err = capsys.readouterr().err
+    assert "REJECTED [pr_query_failed]" in err
+    assert "no attempt burned" in err
+    sub = store.get_subtask("st-1", "room-1")
+    assert sub.state == "verify_pending"
+    assert sub.verify_attempts == attempts_before
+
+
+def test_verify_wrong_pr_burns_attempt_and_names_both_branches(
+    patch_gates, monkeypatch, capsys,
+):
+    """An OPEN PR whose head branch is not the worktree's branch is some
+    OTHER PR's number — a coder error that burns one attempt and writes no
+    transition. Closes the any-open-PR-number gate hole."""
+    store = patch_gates
+    _snapshot(monkeypatch, headRefName="feat-other")
+    attempts_before = store.get_subtask("st-1", "room-1").verify_attempts
+
+    assert _run() == handoff.EXIT_WRONG_PR
+    err = capsys.readouterr().err
+    assert "REJECTED [wrong_pr]" in err
+    assert "feat-other" in err and "feat-x" in err  # names both branches
+    sub = store.get_subtask("st-1", "room-1")
+    assert sub.state == "verify_pending"
+    assert sub.verify_attempts == attempts_before + 1
+
+
+def test_verify_wrong_pr_rejects_before_running_the_verify_command(
+    patch_gates, monkeypatch,
+):
+    """The wrong-PR check precedes the (expensive) verify command — a wrong
+    PR number must not buy a free test run."""
+    _snapshot(monkeypatch, headRefName="feat-other")
+
+    def _boom(cmd, cwd):  # pragma: no cover - must not be called
+        raise AssertionError("verify command must not run for a wrong PR")
+
+    monkeypatch.setattr(handoff, "_run_verify_command", _boom)
+    assert _run() == handoff.EXIT_WRONG_PR
+
+
+def test_verify_unresolvable_worktree_branch_fails_loud_without_burn(
+    patch_gates, monkeypatch, capsys,
+):
+    """A detached/broken worktree (no branch name) is an infra failure, not a
+    coder error: loud rejection, no burn — the wrong-PR check must never
+    pass-by-default on a missing branch."""
+    store = patch_gates
+    monkeypatch.setattr(handoff, "_current_branch", lambda worktree: None)
+    attempts_before = store.get_subtask("st-1", "room-1").verify_attempts
+
+    assert _run() == handoff.EXIT_HEAD_UNRESOLVED
+    assert "REJECTED [head_unresolved]" in capsys.readouterr().err
+    sub = store.get_subtask("st-1", "room-1")
+    assert sub.state == "verify_pending"
+    assert sub.verify_attempts == attempts_before
+
+
+def test_verify_pass_persists_the_pr_binding(patch_gates):
+    """On PASS the subtask↔PR binding is created by the coder who knows the
+    PR — not first at merge time."""
+    store = patch_gates
+    assert store.get_subtask("st-1", "room-1").pr_number is None
+
+    assert _run() == 0
+    sub = store.get_subtask("st-1", "room-1")
+    assert sub.state == "review_pending"
+    assert sub.pr_number == 42
+
+
+def test_verify_rejection_does_not_bind_the_pr(patch_gates, monkeypatch):
+    """A failed gate must not bind: only a PROVEN PR is persisted."""
+    store = patch_gates
+    _snapshot(monkeypatch, headRefOid="feed0042")  # head mismatch → reject
+    assert _run() == handoff.EXIT_HEAD_MISMATCH
+    assert store.get_subtask("st-1", "room-1").pr_number is None
 
 
 def test_pr_head_sha_queries_gh_with_repo_slug(monkeypatch, tmp_path):

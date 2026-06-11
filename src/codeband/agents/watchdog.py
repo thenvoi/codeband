@@ -155,12 +155,25 @@ class WatchdogDaemon:
         state_store: Any | None = None,
         owner_id: str | None = None,
         owner_handle: str | None = None,
+        bare_repo: Any | None = None,
+        repo_slug: str | None = None,
     ):
         self._config = config
         self._rest = rest_client
         self._human_rest = human_rest_client
         self._agent_id = agent_id
         self._conductor_id = conductor_id
+        # Repo context for the mechanical-progress probes (S9-1), injected at
+        # construction by the runner: ``bare_repo`` is the workspace layout's
+        # bare clone (``{workspace}/repo.git``) that every coder branch is
+        # pushed through, ``repo_slug`` is ``owner/repo`` from config
+        # ``repo.url``. Without them the probes ran from the watchdog
+        # process's cwd — which is the project dir only in the dogfood
+        # topology, so in any other layout ``_git_head`` / ``_pr_updated_at``
+        # silently resolved nothing (or, worse, the WRONG repo's state).
+        # ``None`` degrades to the historical cwd behavior.
+        self._bare_repo = bare_repo
+        self._repo_slug = repo_slug
         # Owner/CC participant to @mention when a subtask lands in ``blocked``
         # (from ANY source — the watchdog's own stall cap, the verify-attempt
         # cap, or the review-round cap). ``owner_id`` is the Band participant id
@@ -741,10 +754,22 @@ class WatchdogDaemon:
             await self._send_blocked_escalation(sub)
 
     def _git_head(self, branch: str) -> str | None:
-        """Return the commit SHA at ``branch``, or ``None`` if it can't be read."""
+        """Return the commit SHA at ``branch``, or ``None`` if it can't be read.
+
+        Runs against the injected bare repo (``git -C <bare_repo>``) when one
+        was supplied at construction — cwd-independent. ``--verify`` makes a
+        nonexistent branch a clean non-zero exit instead of echoed garbage,
+        and ``--end-of-options`` stops a branch name from ever being parsed
+        as an option (the sweep-4 F-6 argument-injection note). A ``None``
+        result is counted exactly as before — stall semantics are Batch 3's.
+        """
+        cmd = ["git"]
+        if self._bare_repo is not None:
+            cmd += ["-C", str(self._bare_repo)]
+        cmd += ["rev-parse", "--verify", "--end-of-options", branch]
         try:
             result = subprocess.run(
-                ["git", "rev-parse", branch],
+                cmd,
                 capture_output=True, text=True, timeout=30, check=False,
             )
         except (OSError, subprocess.SubprocessError):
@@ -758,11 +783,16 @@ class WatchdogDaemon:
         """Return the PR's ``updatedAt`` timestamp via ``gh``, or ``None``.
 
         A change in ``updatedAt`` captures any PR activity — including state
-        transitions — so it doubles as the PR-state progress signal.
+        transitions — so it doubles as the PR-state progress signal. Pinned
+        with ``--repo <slug>`` when the runner injected one — repo identity
+        from config, not from whatever repo the cwd happens to be in.
         """
+        cmd = ["gh", "pr", "view", str(pr_number), "--json", "state,updatedAt"]
+        if self._repo_slug is not None:
+            cmd += ["--repo", self._repo_slug]
         try:
             result = subprocess.run(
-                ["gh", "pr", "view", str(pr_number), "--json", "state,updatedAt"],
+                cmd,
                 capture_output=True, text=True, timeout=30, check=False,
             )
         except (OSError, subprocess.SubprocessError):

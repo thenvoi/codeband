@@ -710,3 +710,103 @@ async def test_superseded_task_subtask_progress_not_tracked(tmp_path, monkeypatc
     assert calls == []
     assert (TASK_ID, SUBTASK_ID) not in daemon._subtask_state
     rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+
+# ── probe repo context (S9-1): injected at construction, used in argv ────────
+
+class TestProbeRepoContext:
+    """The runner injects the bare-repo path + config repo slug; the probes
+    must use them — cwd-independent git/gh — without changing how a ``None``
+    result is counted (stall semantics belong to Batch 3)."""
+
+    def _daemon(self, **kwargs):
+        from codeband.agents.watchdog import WatchdogDaemon
+
+        return WatchdogDaemon(
+            config=WatchdogConfig(),
+            rest_client=_mock_rest(),
+            agent_id="agent-wd",
+            conductor_id="agent-cond",
+            **kwargs,
+        )
+
+    def test_git_head_runs_against_injected_bare_repo(self, tmp_path, monkeypatch):
+        calls: list = []
+
+        class _R:
+            returncode = 0
+            stdout = "abc123\n"
+
+        monkeypatch.setattr(
+            subprocess, "run", lambda cmd, **kw: calls.append(cmd) or _R(),
+        )
+        daemon = self._daemon(bare_repo=tmp_path / "repo.git")
+        assert daemon._git_head("feature-x") == "abc123"
+        assert calls == [[
+            "git", "-C", str(tmp_path / "repo.git"),
+            "rev-parse", "--verify", "--end-of-options", "feature-x",
+        ]]
+
+    def test_git_head_without_context_keeps_cwd_resolution(self, monkeypatch):
+        calls: list = []
+
+        class _R:
+            returncode = 0
+            stdout = "abc123\n"
+
+        monkeypatch.setattr(
+            subprocess, "run", lambda cmd, **kw: calls.append(cmd) or _R(),
+        )
+        daemon = self._daemon()
+        assert daemon._git_head("feature-x") == "abc123"
+        # No -C injection, but --verify/--end-of-options still applied (the
+        # branch name can never be parsed as an option — sweep-4 F-6).
+        assert calls == [[
+            "git", "rev-parse", "--verify", "--end-of-options", "feature-x",
+        ]]
+
+    def test_git_head_unreadable_branch_is_none_as_before(
+        self, tmp_path, monkeypatch,
+    ):
+        class _R:
+            returncode = 128
+            stdout = ""
+
+        monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: _R())
+        daemon = self._daemon(bare_repo=tmp_path / "repo.git")
+        assert daemon._git_head("gone-branch") is None  # counting unchanged
+
+    def test_pr_updated_at_pins_repo_slug(self, monkeypatch):
+        calls: list = []
+
+        class _R:
+            returncode = 0
+            stdout = json.dumps(
+                {"state": "OPEN", "updatedAt": "2026-06-01T00:00:00+00:00"},
+            )
+
+        monkeypatch.setattr(
+            subprocess, "run", lambda cmd, **kw: calls.append(cmd) or _R(),
+        )
+        daemon = self._daemon(repo_slug="acme/widgets")
+        assert daemon._pr_updated_at(42) is not None
+        assert calls == [[
+            "gh", "pr", "view", "42",
+            "--json", "state,updatedAt", "--repo", "acme/widgets",
+        ]]
+
+    def test_pr_updated_at_without_slug_keeps_cwd_resolution(self, monkeypatch):
+        calls: list = []
+
+        class _R:
+            returncode = 0
+            stdout = json.dumps(
+                {"state": "OPEN", "updatedAt": "2026-06-01T00:00:00+00:00"},
+            )
+
+        monkeypatch.setattr(
+            subprocess, "run", lambda cmd, **kw: calls.append(cmd) or _R(),
+        )
+        daemon = self._daemon()
+        assert daemon._pr_updated_at(42) is not None
+        assert calls == [["gh", "pr", "view", "42", "--json", "state,updatedAt"]]

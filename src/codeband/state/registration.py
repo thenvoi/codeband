@@ -1,8 +1,11 @@
 """Atomic task registration — the single writer of "a task exists".
 
 A task is *registered* when two things agree: a ``tasks`` row in the durable
-state store and the ``<project_dir>/.codeband_room`` pointer file naming that
-row's room. Historically those were written by separate code paths at
+state store and the ``{workspace}/state/.codeband_room`` pointer file —
+living next to the very DB it pairs with — naming that row's room.
+(``<project_dir>/.codeband_room`` is the legacy location, still read as a
+fallback with a deprecation warning and migrated away on the next
+registration.) Historically those were written by separate code paths at
 separate times (``send_task`` wrote the row best-effort mid-kickoff and the
 pointer only after the task message; the ``/codeband`` peer-seeding path wrote
 the pointer and never the row), which produced four observable broken states:
@@ -22,7 +25,8 @@ one transaction, and writes the pointer only after the commit — **row-first**,
 because a row without a pointer is the recoverable state (re-running the
 registration repairs it), while a pointer without a row is a dead end for
 ``cb-phase``. Both ``send_task`` and ``cb register-task`` call it; nothing
-else may write ``.codeband_room`` or a ``tasks`` row.
+else may write ``{workspace}/state/.codeband_room`` (or the legacy
+``<project_dir>/.codeband_room``) or a ``tasks`` row.
 
 This module is deliberately import-clean of any Band/network client — it owns
 only the DB (via :class:`~codeband.state.store.StateStore`) and the pointer
@@ -31,15 +35,18 @@ file, so peer seeders can call it without Band credentials.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from codeband.config import AgentsConfig
+from codeband.config import AgentsConfig, CodebandConfig
 from codeband.state.store import StateStore
 
-# Name of the active-room pointer file, relative to the project dir. The
-# single source of truth for "which task is active" as read by cb-phase,
-# cb approve/reject, cleanup and doctor.
+# Name of the active-room pointer file. The single source of truth for
+# "which task is active" as read by cb-phase, cb approve/reject, cleanup and
+# doctor. Canonical location: ``{workspace}/state/`` — next to the
+# ``orchestration.db`` it pairs with (see :func:`state_pointer_path`).
+# Legacy location: the project dir (see :func:`legacy_pointer_path`).
 ROOM_POINTER_NAME = ".codeband_room"
 
 # The verdict legs registration understands. Anything else in
@@ -169,13 +176,69 @@ def resolve_merge_approval(agents: AgentsConfig) -> str:
     )
 
 
-def _read_pointer(project_dir: Path) -> str | None:
-    """Return the current pointer's room id, or ``None`` if absent/empty."""
-    pointer = project_dir / ROOM_POINTER_NAME
+def resolve_state_dir(config: CodebandConfig, project_dir: Path) -> Path:
+    """Resolve the workspace ``state/`` dir — same resolution the store uses.
+
+    Mirrors ``cli/handoff.py:_resolve_store`` / ``kickoff.send_task``: the
+    config's ``workspace.path``, made absolute against ``project_dir`` when
+    relative, plus ``state/`` — the directory holding ``orchestration.db``,
+    ``memories.jsonl`` and (now) the active-room pointer.
+    """
+    workspace = Path(config.workspace.path)
+    if not workspace.is_absolute():
+        workspace = project_dir / workspace
+    return workspace / "state"
+
+
+def state_pointer_path(state_dir: Path) -> Path:
+    """Canonical pointer location: ``{workspace}/state/.codeband_room``.
+
+    Next to the ``orchestration.db`` it pairs with — the pointer names a
+    ``tasks`` row in that exact DB, so the two must travel (and be wiped)
+    together. In Docker, ``state/`` is the shared volume every container
+    mounts, so the pointer is visible swarm-wide for free.
+    """
+    return state_dir / ROOM_POINTER_NAME
+
+
+def legacy_pointer_path(project_dir: Path) -> Path:
+    """Legacy pointer location: ``<project_dir>/.codeband_room``.
+
+    Read as a fallback (with a deprecation warning) and removed on the next
+    registration; nothing writes it anymore.
+    """
+    return project_dir / ROOM_POINTER_NAME
+
+
+def read_room_pointer(
+    project_dir: Path, state_dir: Path, *, warn_legacy: bool = True,
+) -> str | None:
+    """Return the active room id, or ``None`` if no pointer resolves.
+
+    Reads the canonical ``{state_dir}/.codeband_room`` first; falls back to
+    the legacy ``<project_dir>/.codeband_room`` (one-line stderr deprecation
+    warning naming both paths, suppressible via ``warn_legacy=False`` for
+    callers that are about to migrate/remove it anyway).
+    """
+    new_pointer = state_pointer_path(state_dir)
     try:
-        room_id = pointer.read_text(encoding="utf-8").strip()
+        room_id = new_pointer.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        room_id = ""
+    if room_id:
+        return room_id
+
+    legacy = legacy_pointer_path(project_dir)
+    try:
+        room_id = legacy.read_text(encoding="utf-8").strip()
     except (FileNotFoundError, OSError):
         return None
+    if room_id and warn_legacy:
+        print(
+            f"warning: read legacy active-room pointer {legacy}; the pointer "
+            f"now lives at {new_pointer} (the next registration migrates it).",
+            file=sys.stderr,
+        )
     return room_id or None
 
 
@@ -229,7 +292,10 @@ def register_task(
     required_verdicts = resolve_required_verdicts(agents)
     merge_approval = resolve_merge_approval(agents)
 
-    pointer_room = _read_pointer(project_dir)
+    # The pointer lives next to the DB the store owns — derive its directory
+    # from the store itself so the two can never disagree on resolution.
+    state_dir = Path(store.db_path).parent
+    pointer_room = read_room_pointer(project_dir, state_dir, warn_legacy=False)
 
     # A pointer to a different room only matters if that room has a live row;
     # a dangling pointer (no row) is the invalid H2 state and is simply
@@ -253,8 +319,19 @@ def register_task(
 
     # Row-first: the pointer is written only after the commit. A failure here
     # is raised loudly — the row already exists, so re-running register_task
-    # for the same room repairs the pointer.
-    (project_dir / ROOM_POINTER_NAME).write_text(room_id, encoding="utf-8")
+    # for the same room repairs the pointer. Written to the canonical
+    # location next to the DB; a stale legacy pointer is then removed
+    # (best-effort) so the two locations can never disagree — this is the
+    # migration path for pre-relocation installs.
+    pointer = state_pointer_path(state_dir)
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(room_id, encoding="utf-8")
+    legacy = legacy_pointer_path(project_dir)
+    if legacy != pointer:
+        try:
+            legacy.unlink(missing_ok=True)
+        except OSError:
+            pass  # reads prefer the canonical location; a leftover is inert
 
     if supersede_task_id is not None:
         outcome = "superseded"

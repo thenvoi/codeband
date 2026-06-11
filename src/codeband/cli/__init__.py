@@ -1016,9 +1016,22 @@ def approve(number: int, project_dir: str, command_style: str = "cli") -> None:
     # The RAW --dir value is passed (not the cwd-resolved ``project``) so the
     # grant half resolves it through the shared cb-phase contract: explicit
     # flag > $CODEBAND_PROJECT_DIR > cwd.
-    from codeband.cli.merge import record_approval_grant
+    from codeband.cli.merge import NoActiveTaskError, record_approval_grant
 
-    for line in record_approval_grant(project_dir, number):
+    try:
+        grant_lines = record_approval_grant(project_dir, number)
+    except NoActiveTaskError as e:
+        # Same root cause the chat half would hit (no room pointer) — fail
+        # here with the UI-appropriate task hint instead of letting the
+        # chat half phrase it later.
+        task_cmd = "/task" if command_style == "slash" else "cb task"
+        issue_cmd = "/issue" if command_style == "slash" else "cb issue"
+        raise click.ClickException(
+            f"{e} Start a task first with '{task_cmd}' or '{issue_cmd}'."
+        ) from None
+    except Exception as e:  # noqa: BLE001 — humans get the message, not a traceback
+        raise click.ClickException(str(e)) from None
+    for line in grant_lines:
         click.echo(line)
 
     message = (

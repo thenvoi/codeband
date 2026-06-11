@@ -67,15 +67,21 @@ def _project(tmp_path, *, verify_command=None):
     return project_dir, store
 
 
-def _match_pr_head(monkeypatch, repo: Path) -> None:
-    """Stub the PR-head seam (gh) to track the repo's real HEAD.
+def _stub_pr_snapshot(monkeypatch, repo: Path, *, state: str = "OPEN") -> None:
+    """Stub verify's ONE PR snapshot (gh) to track the repo's real state.
 
-    PR-pinned verify outcomes require worktree HEAD == PR head; these tests
-    exercise the real git side, so the gh side is made to agree.
+    PR-pinned verify outcomes require worktree HEAD == PR head and the PR's
+    head branch == the worktree branch; these tests exercise the real git
+    side, so the gh side is made to agree (lazily — evaluated per call, so a
+    commit made mid-test moves the stubbed PR head too).
     """
     monkeypatch.setattr(
-        handoff, "_pr_head_sha",
-        lambda project_dir, pr: _git(repo, "rev-parse", "HEAD"),
+        handoff, "_verify_pr_snapshot",
+        lambda project_dir, pr: {
+            "state": state,
+            "headRefName": _git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
+            "headRefOid": _git(repo, "rev-parse", "HEAD"),
+        },
     )
 
 
@@ -117,8 +123,7 @@ class TestVerifyFromInProgress:
         project_dir, store = _project(tmp_path, verify_command="exit 0")
         _seed_in_progress(store)
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
-        _match_pr_head(monkeypatch, repo)
+        _stub_pr_snapshot(monkeypatch, repo)
 
         assert _run_verify(project_dir, repo) == 0
         assert store.get_subtask("st-1", "room-1").state == "review_pending"
@@ -136,7 +141,7 @@ class TestVerifyFromInProgress:
         project_dir, store = _project(tmp_path)
         _seed_in_progress(store)
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: False)
+        _stub_pr_snapshot(monkeypatch, repo, state="CLOSED")
 
         assert _run_verify(project_dir, repo) == handoff.EXIT_NO_PR
         assert store.get_subtask("st-1", "room-1").state == "verify_pending"
@@ -145,7 +150,7 @@ class TestVerifyFromInProgress:
         project_dir, store = _project(tmp_path, verify_command="exit 1")
         _seed_in_progress(store)
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _stub_pr_snapshot(monkeypatch, repo)
 
         assert _run_verify(project_dir, repo) == handoff.EXIT_VERIFY_FAILED
         assert store.get_subtask("st-1", "room-1").state == "verify_pending"
@@ -158,8 +163,7 @@ class TestVerifyFromReviewFailed:
         project_dir, store = _project(tmp_path, verify_command="exit 0")
         _seed_review_failed(store)
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
-        _match_pr_head(monkeypatch, repo)
+        _stub_pr_snapshot(monkeypatch, repo)
 
         assert _run_verify(project_dir, repo) == 0
         assert store.get_subtask("st-1", "room-1").state == "review_pending"
@@ -181,7 +185,7 @@ class TestVerifyAttemptCapFromInProgress:
         project_dir, store = _project(tmp_path, verify_command="exit 0")
         _seed_in_progress(store)
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _stub_pr_snapshot(monkeypatch, repo)
         monkeypatch.setattr(handoff, "_max_verify_attempts", lambda project_dir: 3)
 
         for _ in range(3):
@@ -197,7 +201,7 @@ class TestReviewRoundCapEscalation:
     def test_review_cap_escalates_to_blocked(self, tmp_path, monkeypatch, capsys):
         project_dir, store = _project(tmp_path, verify_command="exit 0")
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _stub_pr_snapshot(monkeypatch, repo)
 
         _seed_review_failed(store)
         for _ in range(MAX_REVIEW_ROUNDS - 1):
@@ -222,7 +226,7 @@ class TestVerifyCountDurability:
         project_dir, store = _project(tmp_path, verify_command="exit 1")
         _seed_in_progress(store)
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _stub_pr_snapshot(monkeypatch, repo)
 
         assert _run_verify(project_dir, repo) != 0
         assert store.get_subtask("st-1", "room-1").verify_attempts == 1
@@ -246,7 +250,7 @@ class TestNonCapTransitionErrorNotMisclassified:
         project_dir, store = _project(tmp_path, verify_command="exit 0")
         _seed_review_failed(store)
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _stub_pr_snapshot(monkeypatch, repo)
 
         assert store.get_subtask("st-1", "room-1").review_round == 1
         assert store.get_subtask("st-1", "room-1").review_round < MAX_REVIEW_ROUNDS
@@ -304,8 +308,7 @@ class TestStartSeedsLifecycle:
         # start (pickup) → clean tree + open PR + passing verify → review_pending.
         project_dir, store = _project(tmp_path, verify_command="exit 0")
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
-        _match_pr_head(monkeypatch, repo)
+        _stub_pr_snapshot(monkeypatch, repo)
 
         assert _run_start(project_dir, repo) == 0
         assert store.get_subtask("st-1", "room-1").state == "in_progress"
@@ -326,8 +329,7 @@ class TestVerifySelfSeedsFromMissingOrPlanned:
     ):
         project_dir, store = _project(tmp_path, verify_command="exit 0")
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
-        _match_pr_head(monkeypatch, repo)
+        _stub_pr_snapshot(monkeypatch, repo)
         assert store.get_subtask("st-1", "room-1") is None  # nothing ran start
 
         assert _run_verify(project_dir, repo) == 0
@@ -339,7 +341,7 @@ class TestVerifySelfSeedsFromMissingOrPlanned:
         project_dir, store = _project(tmp_path)
         store.ensure_subtask("st-1", "room-1")  # row exists at 'planned'
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: False)
+        _stub_pr_snapshot(monkeypatch, repo, state="CLOSED")
 
         # Self-seeds past planned, runs the gate, lands at verify_pending — the
         # gate's no_pr rejection, NOT the old "not a valid entry state" exit.
@@ -350,8 +352,7 @@ class TestVerifySelfSeedsFromMissingOrPlanned:
         project_dir, store = _project(tmp_path, verify_command="exit 0")
         transition("st-1", "room-1", "assigned", caller_role="conductor", store=store)
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
-        _match_pr_head(monkeypatch, repo)
+        _stub_pr_snapshot(monkeypatch, repo)
 
         assert _run_verify(project_dir, repo) == 0
         assert store.get_subtask("st-1", "room-1").state == "review_pending"

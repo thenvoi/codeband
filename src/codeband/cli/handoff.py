@@ -8,8 +8,10 @@ if every gate passes, regardless of what the Conductor intended.
 
 The authoritative ``task_id`` (the FK target of every subtask row) is *not*
 taken from the command line: it is resolved from the active-room pointer
-``<project_dir>/.codeband_room`` that ``kickoff.send_task`` writes (where
-``tasks.task_id == room_id``). The ``--task`` flag is accepted for readability
+``{workspace}/state/.codeband_room`` that task registration writes next to
+the state DB (legacy ``<project_dir>/.codeband_room`` is read as a
+fallback — see ``state/registration.py``), where ``tasks.task_id ==
+room_id``. The ``--task`` flag is accepted for readability
 but is a non-authoritative label only — agents pass the semantic ``task_key``
 there, which would FK-fail if trusted (see :func:`_resolve_task_id`).
 
@@ -29,16 +31,28 @@ Gate sequence:
    before running any gate, so the escalating call writes nothing but the
    ``blocked`` transition.
 1. ``git -C <worktree> status --porcelain`` must be empty (clean tree).
-2. ``gh pr view <n> --json state`` must report ``OPEN``.
+2. **One PR snapshot** — ``gh pr view <n> --json
+   state,headRefName,headRefOid --repo <slug>`` (slug from config
+   ``repo.url``, cwd-independent) supplies every PR-derived input, so the
+   gates cannot contradict each other mid-run. An infra failure (non-zero
+   exit / unparseable output) → ``REJECTED [pr_query_failed]`` WITHOUT
+   burning a verify attempt (infra never burns durable budget — the
+   ``head_unresolved`` precedent). From the snapshot: ``state != OPEN`` →
+   the ``no_pr`` rejection (burns — coder error); ``headRefName`` not equal
+   to the worktree's branch → ``REJECTED [wrong_pr]`` (burns) — closes the
+   any-open-PR-number gate hole.
 3. If ``agents.handoff_verify_command`` is configured, run it in the worktree;
    exit 0 is required.
-4. The worktree HEAD must equal the PR head (resolved via ``gh`` with
-   ``--repo`` from config, cwd-independent). Either side unresolvable →
-   ``REJECTED [head_unresolved]`` and nothing recorded; a mismatch →
-   ``REJECTED [head_mismatch]`` (push your commits) — so a recorded verify
-   outcome always pins the exact commit the PR delivers, never ``NULL``.
+4. The worktree HEAD must equal the snapshot's PR head. The worktree side
+   unresolvable → ``REJECTED [head_unresolved]`` and nothing recorded; a
+   mismatch → ``REJECTED [head_mismatch]`` (push your commits) — so a
+   recorded verify outcome always pins the exact commit the PR delivers,
+   never ``NULL``.
 5. On success, ``fsm.transition(..., "review_pending", caller_role="coder")``
-   with ``head_sha`` pinned to that commit.
+   with ``head_sha`` pinned to that commit — and the subtask↔PR binding is
+   persisted via ``store.set_pr_number``: created here, by the coder who
+   knows the PR, not first at merge time. (The merge leg keeps its
+   bind-if-unbound; its rebind guard protects conflicts.)
 
 Any failed gate increments the subtask's durable ``verify_attempts`` count,
 prints a clear message and exits non-zero; a *success* never increments. The
@@ -54,13 +68,15 @@ on them: every failure prints a stable, machine-greppable tag plus a concrete
 next step, and each failure mode exits with a distinct code.
 
     REJECTED [dirty_tree]: <n> uncommitted files. Commit or stash, then re-run …
+    REJECTED [pr_query_failed]: could not query PR #<n> via gh — … (no burn)
     REJECTED [no_pr]: no open PR for branch <b>. Push and open a PR, then re-run.
+    REJECTED [wrong_pr]: PR #<n> head branch is <X>, worktree branch is <Y>. …
     REJECTED [verify_failed] (exit <code>): <last ~20 lines>. Fix and re-run.
     BLOCKED [cap_reached]: <n> verify attempts. Escalated to human; stop and await.
 
-The tags (``dirty_tree`` / ``no_pr`` / ``verify_failed`` / ``cap_reached``) are
-part of the contract — they feed the verify-gate activation's telemetry later —
-so keep them stable. The machine-greppable contract extends to config/IO
+The tags (``dirty_tree`` / ``pr_query_failed`` / ``no_pr`` / ``wrong_pr`` /
+``verify_failed`` / ``cap_reached``) are part of the contract — they feed the
+verify-gate activation's telemetry later — so keep them stable. The machine-greppable contract extends to config/IO
 failures too: :func:`main` catches anything the legs raise and prints a
 single tagged line instead of a traceback —
 
@@ -130,8 +146,9 @@ EXIT_DIRTY_TREE = 2
 EXIT_NO_PR = 3
 EXIT_VERIFY_FAILED = 4
 EXIT_CAP_REACHED = 5
-# No active task could be resolved from ``<project_dir>/.codeband_room`` (the
-# pointer is missing/empty, or names a room with no matching ``tasks`` row).
+# No active task could be resolved from the active-room pointer
+# ``{workspace}/state/.codeband_room`` (or its legacy project-dir fallback) —
+# the pointer is missing/empty, or names a room with no matching ``tasks`` row.
 # Distinct from the gate rejections above: nothing was attempted and nothing
 # written — the caller cannot proceed because the authoritative task_id (the FK
 # target of every subtask row) is unknown.
@@ -148,6 +165,17 @@ EXIT_HEAD_UNRESOLVED = 13
 # Verify's worktree HEAD differs from the PR head — the coder forgot to push.
 # A legitimate coder error: counts as one rejected verify attempt.
 EXIT_HEAD_MISMATCH = 14
+# Verify's single PR snapshot could not be taken at all (gh non-zero exit or
+# unparseable output) — an infra failure, not a coder error: nothing is
+# attempted, nothing written, no verify attempt burned. Same tag as the merge
+# leg's snapshot failure (``pr_query_failed``, exit 8 over there — exit codes
+# are leg-scoped, tags are shared).
+EXIT_PR_QUERY_FAILED = 15
+# The PR exists and is OPEN but its head branch is not the worktree's branch —
+# the coder passed some other PR's number. Closes the any-open-PR-number gate
+# hole: before this gate any open PR satisfied the "PR is open" check. A
+# legitimate coder error: counts as one rejected verify attempt.
+EXIT_WRONG_PR = 16
 
 # How many trailing lines of a failing verify command's output to surface in
 # the ``REJECTED [verify_failed]`` message — enough to see the failure without
@@ -197,13 +225,16 @@ def _resolve_task_id(
 ) -> tuple[str | None, int | None]:
     """Resolve the authoritative ``task_id`` from the active-room pointer.
 
-    ``kickoff.send_task`` sets ``tasks.task_id == room_id`` and writes that room
-    UUID to ``<project_dir>/.codeband_room``. Every ``subtask_states`` row FKs to
+    ``kickoff.send_task`` sets ``tasks.task_id == room_id`` and registers that
+    room UUID in the active-room pointer ``{workspace}/state/.codeband_room``
+    — next to the DB it names a row in (legacy
+    ``<project_dir>/.codeband_room`` is still read as a fallback; see
+    ``state/registration.py``). Every ``subtask_states`` row FKs to
     ``tasks.task_id``, so the room UUID — not whatever label an agent passes — is
     the only value that satisfies the constraint. Agents are trained on the
     semantic ``task_key`` (e.g. ``add-redact-helper``) and pass *that* to
     ``--task``; using it for the FK is exactly the bug this resolves. So the
-    authoritative id is read from ``.codeband_room`` and ``--task`` is treated as
+    authoritative id is read from the pointer and ``--task`` is treated as
     a non-authoritative label only.
 
     Returns ``(task_id, None)`` on success. On failure returns
@@ -212,10 +243,12 @@ def _resolve_task_id(
     or a pointer with no matching ``tasks`` row) both mean the same thing to the
     caller: there is no seeded task to attach work to.
     """
-    room_file = project_dir / ".codeband_room"
-    room_id = ""
-    if room_file.is_file():
-        room_id = room_file.read_text(encoding="utf-8").strip()
+    from codeband.state.registration import read_room_pointer, state_pointer_path
+
+    # The store IS the resolution authority: the pointer lives next to its DB.
+    state_dir = Path(store.db_path).parent
+    room_file = state_pointer_path(state_dir)
+    room_id = read_room_pointer(project_dir, state_dir) or ""
 
     if not room_id:
         print(
@@ -228,7 +261,8 @@ def _resolve_task_id(
     if store.get_task(room_id) is None:
         print(
             f"cb-phase: no active task — no tasks row matches active room "
-            f"{room_id} (from {room_file}); was the task seeded via `cb task`?",
+            f"{room_id} (from {room_file} or its legacy fallback); was the "
+            "task seeded via `cb task`?",
             file=sys.stderr,
         )
         return None, EXIT_NO_ACTIVE_TASK
@@ -348,19 +382,39 @@ def _current_branch(worktree: Path) -> str | None:
     return result.stdout.strip() or None
 
 
-def _pr_is_open(pr_number: int) -> bool:
-    """Return ``True`` if ``gh pr view <n>`` reports state ``OPEN``."""
+def _verify_pr_snapshot(project_dir: Path, pr_number: int) -> dict | None:
+    """Return verify's ONE ``gh pr view`` snapshot: state, head branch, head SHA.
+
+    A single ``gh pr view <n> --json state,headRefName,headRefOid --repo
+    <slug>`` (slug from the loaded config's ``repo.url`` — cwd-independent,
+    like the review leg's resolver) supplies every PR-derived decision input
+    of the verify gate, so the open-check, the wrong-PR check and the
+    head-pinning can never disagree about which PR state they saw. Returns
+    ``None`` on any infra failure (bad URL, gh error, unparseable output) —
+    the caller rejects ``[pr_query_failed]`` without burning an attempt.
+    """
+    from codeband.github.prs import repo_slug
+
+    try:
+        slug = repo_slug(load_config(project_dir).repo.url)
+    except ValueError:
+        return None
     result = subprocess.run(
-        ["gh", "pr", "view", str(pr_number), "--json", "state"],
+        ["gh", "pr", "view", str(pr_number),
+         "--json", "state,headRefName,headRefOid", "--repo", slug],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
-        return False
+        logger.debug(
+            "gh pr view %s --repo %s failed: %s", pr_number, slug, result.stderr,
+        )
+        return None
     try:
-        return json.loads(result.stdout).get("state") == "OPEN"
-    except (ValueError, AttributeError):
-        return False
+        data = json.loads(result.stdout)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _run_verify_command(command: str, cwd: Path) -> tuple[int, str]:
@@ -662,15 +716,54 @@ def _cmd_verify(args: argparse.Namespace) -> int:
             EXIT_DIRTY_TREE,
         )
 
-    if not _pr_is_open(args.pr):
-        branch = _current_branch(worktree) or f"PR #{args.pr}"
+    # ONE PR snapshot drives every PR-derived gate below (open-check,
+    # wrong-PR check, head pinning) — the gates cannot contradict each other
+    # mid-run, and gh is queried exactly once.
+    pr = _verify_pr_snapshot(project_dir, args.pr)
+    if pr is None:
+        # Infra failure, not a coder error: nothing attempted, nothing
+        # written, no verify attempt burned (the head_unresolved precedent —
+        # infra never burns durable budget).
+        print(
+            f"REJECTED [pr_query_failed]: could not query PR #{args.pr} via "
+            "gh — verify outcome NOT recorded and no attempt burned. Check "
+            "gh auth/network, then re-run.",
+            file=sys.stderr,
+        )
+        return EXIT_PR_QUERY_FAILED
+
+    branch = _current_branch(worktree)
+    if pr.get("state") != "OPEN":
         return _reject(
             store,
             args.subtask_id,
             task_id,
-            f"REJECTED [no_pr]: no open PR for branch {branch}. "
+            f"REJECTED [no_pr]: no open PR for branch {branch or f'PR #{args.pr}'}. "
             "Push and open a PR, then re-run.",
             EXIT_NO_PR,
+        )
+
+    # The PR must actually be THIS worktree's PR — any open PR number used to
+    # satisfy the gate. An unresolvable worktree branch is an infra failure
+    # (detached/broken worktree): fail loud without burning an attempt.
+    pr_branch = pr.get("headRefName") or None
+    if branch is None:
+        print(
+            f"REJECTED [head_unresolved]: cannot resolve the worktree branch "
+            f"at {worktree} — verify outcome NOT recorded. Check the "
+            "worktree and re-run.",
+            file=sys.stderr,
+        )
+        return EXIT_HEAD_UNRESOLVED
+    if pr_branch != branch:
+        return _reject(
+            store,
+            args.subtask_id,
+            task_id,
+            f"REJECTED [wrong_pr]: PR #{args.pr} head branch is {pr_branch}, "
+            f"worktree branch is {branch}. Pass the PR opened from this "
+            "worktree's branch, then re-run.",
+            EXIT_WRONG_PR,
         )
 
     verify_command = _verify_command(project_dir)
@@ -690,7 +783,8 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     # prove that commit is what the PR actually contains. Both ends must
     # resolve, loudly: a verify outcome that pins nothing (NULL) silently
     # poisons the merge gate (every gated merge rejects ``not_eligible``).
-    pr_head = _pr_head_sha(project_dir, args.pr)
+    # The PR side comes from the snapshot above — no second gh query.
+    pr_head = pr.get("headRefOid") or None
     if pr_head is None:
         print(
             f"REJECTED [head_unresolved]: cannot resolve PR #{args.pr} head — "
@@ -733,6 +827,14 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     except InvalidTransitionError as exc:
         print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
         return 1
+
+    # Persist the subtask↔PR binding at the moment it is PROVEN (head equals
+    # the PR head, gates passed) — by the coder who knows the PR, not first
+    # at merge time. Overwriting is correct here: a re-verify with a new PR
+    # (the old one closed, a fresh one opened) just proved the new binding.
+    # The merge leg keeps its bind-if-unbound; its rebind guard protects
+    # conflicts there.
+    store.set_pr_number(args.subtask_id, task_id, args.pr)
 
     print(
         f"cb-phase: subtask {args.subtask_id} → review_pending "

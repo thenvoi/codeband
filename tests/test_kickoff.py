@@ -503,6 +503,38 @@ class TestResetActiveRoom:
             )
 
     @pytest.mark.asyncio
+    async def test_reset_clears_both_pointer_locations(
+        self, sample_config, sample_agent_config, tmp_path,
+    ):
+        """Transition-era state: pointer present at BOTH the canonical
+        (workspace/state/) and legacy (project-dir) locations — reset must
+        clear both so neither can resurrect a dead room."""
+        from codeband.orchestration import kickoff
+
+        sample_agent_config.to_yaml(tmp_path / "agent_config.yaml")
+        canonical = tmp_path / "workspace" / "state" / ".codeband_room"
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text("stale-room-id", encoding="utf-8")
+        (tmp_path / ".codeband_room").write_text("stale-room-id", encoding="utf-8")
+
+        factory = _make_clients(AsyncMock(), {
+            creds.api_key: (creds.agent_id, key)
+            for key, creds in sample_agent_config.agents.items()
+        })
+
+        import thenvoi_rest
+        original = thenvoi_rest.AsyncRestClient
+        thenvoi_rest.AsyncRestClient = factory
+        try:
+            result = await kickoff.reset_active_room(sample_config, tmp_path)
+        finally:
+            thenvoi_rest.AsyncRestClient = original
+
+        assert result == "stale-room-id"
+        assert not canonical.exists()
+        assert not (tmp_path / ".codeband_room").exists()
+
+    @pytest.mark.asyncio
     async def test_agent_removal_errors_are_swallowed(
         self, sample_config, sample_agent_config, tmp_path,
     ):

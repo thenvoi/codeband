@@ -91,6 +91,7 @@ from codeband.cli.handoff import (
     _resolve_task_id,
     resolve_project_dir,
 )
+from codeband.config import load_config
 from codeband.state.fsm import (
     InvalidTransitionError,
     MergeNotEligibleError,
@@ -119,6 +120,16 @@ EXIT_PR_REBIND = 12
 # is no path that re-merges a ``merged`` subtask or revives a ``blocked`` one.
 _ENTRY_STATES = frozenset({"review_passed", "merge_pending"})
 
+class NoActiveTaskError(RuntimeError):
+    """``cb approve``'s grant half could not resolve the active task.
+
+    Distinct type so the command layer can append a UI-appropriate "start a
+    task" hint (``cb task`` vs ``/task``) without string-matching the
+    message. Still a loud failure either way — an "approval" recorded
+    against nothing must never look like success.
+    """
+
+
 # Classifies a failed ``gh pr merge`` as a conflict (→ ``needs_rebase``)
 # rather than a residual failure (→ ``blocked``). GitHub phrases conflicts as
 # "Pull request ... is not mergeable: the merge commit cannot be cleanly
@@ -126,19 +137,25 @@ _ENTRY_STATES = frozenset({"review_passed", "merge_pending"})
 _CONFLICT_RE = re.compile(r"conflict|not mergeable", re.IGNORECASE)
 
 
-def _pr_snapshot(pr_number: int, cwd: Path) -> dict | None:
+def _pr_snapshot(pr_number: int, cwd: Path, repo: str | None = None) -> dict | None:
     """Return one ``gh pr view`` snapshot: state, mergeable, head SHA + branch.
 
     A single query per invocation supplies every PR-derived decision input
     (reconcile state, mergeability, execution-time SHA, the head branch name
     for the post-merge remote cleanup), so the leg cannot contradict itself
-    mid-run. Returns ``None`` when ``gh`` fails or returns unparseable
-    output — callers fail closed.
+    mid-run. ``repo`` (an ``owner/repo`` slug) pins the query with
+    ``--repo``, dropping the cwd dependence for repo identity — used by
+    ``cb approve``'s grant half, which may run from any cwd; the merge leg
+    itself runs in a real worktree and keeps cwd resolution. Returns
+    ``None`` when ``gh`` fails or returns unparseable output — callers fail
+    closed.
     """
+    cmd = ["gh", "pr", "view", str(pr_number),
+           "--json", "state,mergeable,headRefOid,headRefName"]
+    if repo is not None:
+        cmd += ["--repo", repo]
     result = subprocess.run(
-        ["gh", "pr", "view", str(pr_number),
-         "--json", "state,mergeable,headRefOid,headRefName"],
-        capture_output=True, text=True, cwd=str(cwd),
+        cmd, capture_output=True, text=True, cwd=str(cwd),
     )
     if result.returncode != 0:
         logger.debug("gh pr view %s failed: %s", pr_number, result.stderr)
@@ -693,28 +710,52 @@ def record_approval_grant(project_dir: Path | str, pr_number: int) -> list[str]:
     ``$CODEBAND_PROJECT_DIR`` > cwd), the same contract as every ``cb-phase``
     leg, so ``cb approve`` works from any cwd when the env var is set.
 
-    Raises :class:`RuntimeError` when a bound subtask exists but the PR head
-    cannot be read — a grant that silently pins nothing would strand the
-    merge leg in awaiting-approval forever.
+    Raises :class:`RuntimeError` when the active task cannot be resolved
+    (an "approval" recorded against nothing is indistinguishable from a
+    success to the human who ran it — fail loud instead), and when a bound
+    subtask exists but the PR head cannot be read — a grant that silently
+    pins nothing would strand the merge leg in awaiting-approval forever.
+    A PR with no bound subtask is NOT an error (the legacy chat-only flow),
+    but it prints a loud stderr note that no durable grant was recorded.
     """
     project_dir = resolve_project_dir(project_dir)
     store = _resolve_store(project_dir)
     task_id, error_code = _resolve_task_id(project_dir, store, None)
     if error_code is not None:
-        return []
+        # _resolve_task_id already printed the specific cause to stderr.
+        raise NoActiveTaskError(
+            "cb approve: no active task — grant not recorded."
+        )
 
     subtasks = [
         s for s in store.find_subtasks_by_pr(task_id, pr_number)
         if s.state not in {"merged", "abandoned"}
     ]
     if not subtasks:
-        logger.debug(
-            "cb approve: no subtask bound to PR #%s — no grant recorded",
-            pr_number,
+        # Approve-before-binding: the verify/merge legs haven't bound this PR
+        # to a subtask yet, so there is nothing durable to pin a grant to.
+        # The chat half still goes out, but the human must know this recorded
+        # NOTHING — silently looking successful is how approvals got lost.
+        print(
+            f"cb approve: NO durable merge grant was recorded — no subtask "
+            f"is bound to PR #{pr_number} yet. Re-run `cb approve "
+            f"{pr_number}` after the merge leg requests approval.",
+            file=sys.stderr,
         )
         return []
 
-    pr = _pr_snapshot(pr_number, project_dir)
+    # Repo identity comes from config (--repo <slug>), never from whatever
+    # repo the current cwd happens to be in.
+    from codeband.github.prs import repo_slug
+
+    try:
+        slug = repo_slug(load_config(project_dir).repo.url)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"cb approve: cannot derive the GitHub repo slug from config "
+            f"repo.url ({exc}) — approval grant not recorded."
+        ) from None
+    pr = _pr_snapshot(pr_number, project_dir, repo=slug)
     head_sha = (pr or {}).get("headRefOid") or None
     if head_sha is None:
         raise RuntimeError(

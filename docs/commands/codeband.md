@@ -88,6 +88,8 @@ if [ -n "$REPO_URL" ]; then
     ( cd "$CB_HOME" && codeband reset --dir . >/dev/null 2>&1 || true )
     rm -rf "$CB_HOME/.codeband/repo.git" "$CB_HOME/.codeband/worktrees/"* \
            "$CB_HOME/.codeband/state/"*.jsonl "$CB_HOME/.codeband/state/coder-"*.json \
+           "$CB_HOME/.codeband/state/orchestration.db" \
+           "$CB_HOME/.codeband/state/.codeband_room" "$CB_HOME/.codeband_room" \
            "$CB_HOME/.codeband/scratch/"* 2>/dev/null || true
     sed -i '' -E "s|^  url:.*|  url: $REPO_URL|"   "$CB_HOME/codeband.yaml"
     sed -i '' -E "s|^  branch:.*|  branch: $BRANCH|" "$CB_HOME/codeband.yaml"
@@ -176,7 +178,7 @@ async def main():
     cond_name = (await AsyncRestClient(api_key=cond_key, base_url=rest).agent_api_identity.get_agent_me()).data.name
     room = await cc.agent_api_chats.create_agent_chat(chat=ChatRoomRequest())
     rid = room.data.id
-    # Register the task (tasks row + .codeband_room pointer, atomically) BEFORE any agent hears about it.
+    # Register the task (tasks row + .codeband/state/.codeband_room pointer, atomically) BEFORE any agent hears about it.
     reg_cmd = ["cb", "register-task", "--room", rid, "--owner", cc_id, "--description", task, "--dir", cb_home]
     if handle:
         reg_cmd += ["--owner-handle", handle]

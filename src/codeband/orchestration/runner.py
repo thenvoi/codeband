@@ -359,6 +359,21 @@ def _build_watchdog_memory_store(memory_mode: str, workspace_path: Path) -> Any:
     return LocalMemoryStore(workspace_path / "state" / "memories.jsonl")
 
 
+def _watchdog_repo_slug(config: CodebandConfig) -> str | None:
+    """Resolve the ``owner/repo`` slug for the watchdog's gh probes.
+
+    From config ``repo.url`` — cwd-independent (S9-1). ``None`` for
+    non-GitHub URLs: the watchdog's PR probe then degrades to the historical
+    cwd-based resolution rather than blocking startup.
+    """
+    try:
+        from codeband.github.prs import repo_slug
+
+        return repo_slug(config.repo.url)
+    except ValueError:
+        return None
+
+
 def _build_watchdog_state_store(workspace_path: Path) -> Any:
     """Construct the durable ``StateStore`` for the watchdog (RFC WS4).
 
@@ -748,6 +763,11 @@ async def run_local(
         state_store=_build_watchdog_state_store(
             Path(resolved_config.workspace.path),
         ),
+        # Repo context for the mechanical-progress probes (S9-1): the
+        # workspace's bare clone + the config-derived slug, so git/gh probes
+        # are cwd-independent.
+        bare_repo=layout.bare_repo,
+        repo_slug=_watchdog_repo_slug(resolved_config),
     )
     logger.info("Created Watchdog daemon")
 
@@ -1045,6 +1065,9 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
             state_store=_build_watchdog_state_store(
                 Path(resolved_config.workspace.path),
             ),
+            # Same repo context as run_local (S9-1): cwd-independent probes.
+            bare_repo=layout.bare_repo,
+            repo_slug=_watchdog_repo_slug(resolved_config),
         )
         try:
             await _run_until_shutdown(watchdog.run())

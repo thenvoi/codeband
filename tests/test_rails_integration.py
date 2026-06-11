@@ -25,7 +25,7 @@ Coverage map:
 * ``TestCbPhaseGate`` — the three ``cb-phase verify`` gate rejections (dirty
   tree, no open PR, verify command non-zero) plus the happy advance, on real
   git with a real verify subprocess; only the ``gh`` PR-state call is isolated
-  behind ``handoff._pr_is_open`` (see the ``gh`` seam note on each test).
+  behind ``handoff._verify_pr_snapshot`` (the one-snapshot ``gh`` seam).
 * ``TestKillAndRehydrate`` — non-terminal subtasks in the store; each role's
   recovery context.
 * ``TestFanoutInvariants`` — N concurrent FSM instances: no double-merge, no
@@ -96,15 +96,21 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _match_pr_head(monkeypatch, repo: Path) -> None:
-    """Stub the PR-head seam (gh) to track the repo's real HEAD.
+def _stub_pr_snapshot(monkeypatch, repo: Path, *, state: str = "OPEN") -> None:
+    """Stub verify's ONE PR snapshot (gh) to track the repo's real state.
 
-    PR-pinned verify outcomes require worktree HEAD == PR head; these tests
-    exercise the real git side, so the gh side is made to agree.
+    PR-pinned verify outcomes require worktree HEAD == PR head and the PR's
+    head branch == the worktree branch; these tests exercise the real git
+    side, so the gh side is made to agree (lazily — evaluated per call, so a
+    commit or checkout made mid-test moves the stubbed PR side too).
     """
     monkeypatch.setattr(
-        handoff, "_pr_head_sha",
-        lambda project_dir, pr: _git(repo, "rev-parse", "HEAD"),
+        handoff, "_verify_pr_snapshot",
+        lambda project_dir, pr: {
+            "state": state,
+            "headRefName": _git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
+            "headRefOid": _git(repo, "rev-parse", "HEAD"),
+        },
     )
 
 
@@ -285,9 +291,9 @@ class TestCbPhaseGate:
     """``cb-phase verify`` gate, composed against a real git worktree.
 
     The clean-tree gate and (when configured) the verify command run as real
-    subprocesses. The PR-state gate calls ``gh pr view`` which cannot run
-    hermetically in CI, so it is isolated behind ``handoff._pr_is_open`` — the
-    single documented ``gh`` seam. Everything else (git status, the verify
+    subprocesses. The PR gates call ``gh pr view`` which cannot run
+    hermetically in CI, so they are isolated behind
+    ``handoff._verify_pr_snapshot`` — the single documented ``gh`` seam. Everything else (git status, the verify
     command, the FSM transition, the SQLite write) is real.
     """
 
@@ -345,7 +351,7 @@ class TestCbPhaseGate:
         # gh seam: PR reported not-OPEN. Tree is real and clean.
         project_dir, store = self._project(tmp_path)
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: False)
+        _stub_pr_snapshot(monkeypatch, repo, state="CLOSED")
         before = _log_count(store, "st-1")
 
         assert self._run(project_dir, repo) != 0
@@ -357,7 +363,7 @@ class TestCbPhaseGate:
         # exits non-zero, so the gate must reject and write nothing.
         project_dir, store = self._project(tmp_path, verify_command="exit 7")
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _stub_pr_snapshot(monkeypatch, repo)
         before = _log_count(store, "st-1")
 
         assert self._run(project_dir, repo) != 0
@@ -369,8 +375,7 @@ class TestCbPhaseGate:
         # The subtask advances and a real transition_log row is appended.
         project_dir, store = self._project(tmp_path, verify_command="exit 0")
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
-        _match_pr_head(monkeypatch, repo)
+        _stub_pr_snapshot(monkeypatch, repo)
         before = _log_count(store, "st-1")
 
         assert self._run(project_dir, repo) == 0
@@ -1116,7 +1121,7 @@ class TestVerifyAttemptCap:
         _commit_on(repo, "feat-v", "seed")          # create the subtask's branch
         _git(repo, "checkout", "main")
         monkeypatch.chdir(repo)                      # watchdog runs git here
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)  # PR OPEN
+        _stub_pr_snapshot(monkeypatch, repo)  # gh seam: PR OPEN, tracking the repo
 
         # Default cap (20). verify_command 'exit 1' rejects every attempt.
         project_dir, store = self._project(tmp_path, verify_command="exit 1")
@@ -1165,7 +1170,7 @@ class TestVerifyAttemptCap:
         """The cap is configurable: ``max_verify_attempts=2`` bounds the loop
         after two rejected attempts; the third call escalates to ``blocked``."""
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _stub_pr_snapshot(monkeypatch, repo)
         project_dir, store = self._project(
             tmp_path, verify_command="exit 1", max_verify_attempts=2,
         )
@@ -1192,7 +1197,7 @@ class TestVerifyAttemptCap:
         across a fresh ``StateStore`` on the same DB file, and the cap still
         fires after reopen."""
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _stub_pr_snapshot(monkeypatch, repo)
         project_dir, store = self._project(
             tmp_path, verify_command="exit 1", max_verify_attempts=3,
         )
@@ -1225,7 +1230,7 @@ class TestVerifyAttemptCap:
         """N concurrent subtasks each carry their own ``verify_attempts``: one
         hitting the cap leaves the others' attempts and state untouched."""
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
+        _stub_pr_snapshot(monkeypatch, repo)
         project_dir, store = self._project(
             tmp_path, verify_command="exit 1", max_verify_attempts=3,
         )
@@ -1265,8 +1270,7 @@ class TestVerifyAttemptCap:
         either, and a failed review never touches the verify counter. A subtask
         can approach one cap without affecting the other."""
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
-        _match_pr_head(monkeypatch, repo)
+        _stub_pr_snapshot(monkeypatch, repo)
         # Cap high enough that nothing blocks during this test.
         project_dir, store = self._project(
             tmp_path, verify_command="exit 1", max_verify_attempts=20,
@@ -1371,8 +1375,7 @@ class TestActiveRoomResolution:
         # git tree + real passing verify command; only the gh PR call is stubbed.
         project_dir, store = self._project(tmp_path, verify_command="exit 0")
         repo = _init_repo(tmp_path / "repo")
-        monkeypatch.setattr(handoff, "_pr_is_open", lambda pr: True)
-        _match_pr_head(monkeypatch, repo)
+        _stub_pr_snapshot(monkeypatch, repo)
 
         rc = handoff.main([
             "verify", "st-1", "--task", self.BOGUS, "--pr", "42",
