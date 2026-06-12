@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from codeband.workspace.git import (
+    WorkspaceError,
     branch_name,
     clone_bare,
     commit_and_push,
@@ -16,6 +17,7 @@ from codeband.workspace.git import (
     list_worktrees,
     pin_gh_default_repo,
     prepare_task_branch,
+    refresh_worktree,
     remove_worktree,
 )
 from codeband.workspace.init import (
@@ -239,6 +241,110 @@ class TestGitOperations:
         _recreate_worktree(wt, base_branch=default)
         assert wt.exists()
         assert (wt / "README.md").exists()
+
+    @staticmethod
+    def _default_branch(repo: Path) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), "symbolic-ref", "--short", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    @staticmethod
+    def _commit_upstream(repo: Path, name: str) -> None:
+        (repo / name).write_text("x")
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "."], check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", f"add {name}"],
+            check=True, capture_output=True,
+        )
+
+    def test_refresh_fast_forwards_stale_detached_worktree(
+        self, source_repo: Path, tmp_path: Path,
+    ):
+        """Finding 16: a reused planner worktree (create_worktree no-ops on
+        existing) must fast-forward to origin/<branch> at session start."""
+        branch = self._default_branch(source_repo)
+        bare = tmp_path / "bare.git"
+        clone_bare(str(source_repo), bare)
+        wt = tmp_path / "wt" / "planner-0"
+        create_worktree(bare, wt, branch, detach=True)
+
+        self._commit_upstream(source_repo, "new-upstream-file.txt")
+
+        # "Next session": create is a no-op, so the worktree is stale…
+        create_worktree(bare, wt, branch, detach=True)
+        assert not (wt / "new-upstream-file.txt").exists()
+        # …until the session-start refresh fast-forwards it.
+        refresh_worktree(bare, wt, branch, detach=True)
+        assert (wt / "new-upstream-file.txt").exists()
+
+    def test_refresh_fast_forwards_branch_worktree(
+        self, source_repo: Path, tmp_path: Path,
+    ):
+        """The mergemaster shape: a branch (non-detached) worktree ffs and
+        stays on its branch."""
+        branch = self._default_branch(source_repo)
+        bare = tmp_path / "bare.git"
+        clone_bare(str(source_repo), bare)
+        wt = tmp_path / "wt" / "mergemaster"
+        create_worktree(bare, wt, branch)
+
+        self._commit_upstream(source_repo, "post-session-file.txt")
+        refresh_worktree(bare, wt, branch)
+
+        assert (wt / "post-session-file.txt").exists()
+        head_branch = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "--abbrev-ref", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert head_branch == branch  # still ON the branch, not detached
+
+    def test_refresh_fails_loud_on_dirty_worktree(
+        self, source_repo: Path, tmp_path: Path,
+    ):
+        """Local state that prevents the ff must fail loud — never silently
+        plan against a stale base."""
+        branch = self._default_branch(source_repo)
+        bare = tmp_path / "bare.git"
+        clone_bare(str(source_repo), bare)
+        wt = tmp_path / "wt" / "planner-0"
+        create_worktree(bare, wt, branch, detach=True)
+
+        (wt / "README.md").write_text("local edit")
+        self._commit_upstream(source_repo, "newer.txt")
+
+        with pytest.raises(WorkspaceError, match="local changes"):
+            refresh_worktree(bare, wt, branch, detach=True)
+        # The dirty state is left intact for the human to inspect.
+        assert (wt / "README.md").read_text() == "local edit"
+        assert not (wt / "newer.txt").exists()
+
+    def test_refresh_fails_loud_on_diverged_branch(
+        self, source_repo: Path, tmp_path: Path,
+    ):
+        """A branch worktree whose local branch diverged cannot ff — loud."""
+        branch = self._default_branch(source_repo)
+        bare = tmp_path / "bare.git"
+        clone_bare(str(source_repo), bare)
+        wt = tmp_path / "wt" / "mergemaster"
+        create_worktree(bare, wt, branch)
+
+        # Local commit on the branch…
+        (wt / "local.txt").write_text("local")
+        subprocess.run(
+            ["git", "-C", str(wt), "add", "."], check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(wt), "commit", "-m", "local commit"],
+            check=True, capture_output=True,
+        )
+        # …and a different upstream commit: diverged.
+        self._commit_upstream(source_repo, "upstream.txt")
+
+        with pytest.raises(WorkspaceError, match="fast-forward"):
+            refresh_worktree(bare, wt, branch)
 
     def test_commit_no_changes(self, source_repo: Path, tmp_path: Path):
         """Commit with no changes is a no-op."""

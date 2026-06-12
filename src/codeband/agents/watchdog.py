@@ -61,6 +61,15 @@ def _mention_patterns(
     )
 
 
+# Band chat inline-markup mentions: ``@[[<participant-uuid>]]``. Some send
+# paths deliver mentions ONLY as this markup — no structured ``mentions``
+# list and no ``@DisplayName`` text — which made a re-dispatch invisible to
+# the fallback scan: the mentioned agent's staleness clock never started,
+# and a terminal-shaped *older* own-message then untracked it entirely
+# (finding 17, both halves).
+_UUID_MENTION_RE = re.compile(r"@\[\[([0-9a-f-]{36})\]\]", re.IGNORECASE)
+
+
 def _mentioned_participant_ids(
     msg: Any, participant_names: dict[str, str],
 ) -> set[str]:
@@ -68,10 +77,11 @@ def _mentioned_participant_ids(
 
     Tries structured ``msg.mentions`` first (Band.ai chat messages carry
     mentions as a list of items with ``.id``); falls back to scanning the
-    message content with the cached per-participant-set patterns from
-    :func:`_mention_patterns`. Test mocks that don't set these fields are
-    silently ignored — the isinstance checks reject MagicMock-typed
-    sentinels.
+    message content — BOTH the ``@[[uuid]]`` inline markup (matched against
+    the participant id set; finding 17) and the ``@DisplayName`` form via the
+    cached per-participant-set patterns from :func:`_mention_patterns`. Test
+    mocks that don't set these fields are silently ignored — the isinstance
+    checks reject MagicMock-typed sentinels.
     """
     found: set[str] = set()
 
@@ -84,6 +94,11 @@ def _mentioned_participant_ids(
 
     content = getattr(msg, "content", None)
     if isinstance(content, str):
+        for uid in _UUID_MENTION_RE.findall(content):
+            if uid in participant_names:
+                found.add(uid)
+            elif uid.lower() in participant_names:
+                found.add(uid.lower())
         for pid, pattern in _mention_patterns(frozenset(participant_names.items())):
             if pattern.search(content):
                 found.add(pid)
@@ -618,6 +633,13 @@ class WatchdogDaemon:
                 last_mention_ts = last_mentioned.get(agent_id)
                 if last_msg_ts is None and last_mention_ts is None:
                     continue
+                # Terminal-shaped untrack ONLY when the agent's own message is
+                # the newest signal: an UNANSWERED inbound mention newer than
+                # the agent's last own-message means dispatched work is
+                # pending, and untracking would blind the patrol to the very
+                # agent most likely to be dormant (finding 17 — this guard is
+                # only as good as the mention scan above, which is why the
+                # @[[uuid]] markup form must be parsed too).
                 if (
                     last_msg_ts is not None
                     and (last_mention_ts is None or last_msg_ts >= last_mention_ts)

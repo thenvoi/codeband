@@ -138,6 +138,75 @@ def create_worktree(
         _run_git(cmd, cwd=bare_repo)
 
 
+def refresh_worktree(
+    bare_repo: Path,
+    worktree_path: Path,
+    branch: str,
+    *,
+    detach: bool = False,
+) -> None:
+    """Fast-forward an existing worktree to ``origin/<branch>`` at session start.
+
+    ``create_worktree`` deliberately no-ops on an existing worktree, and the
+    bare repo only fetches at clone time — so across sessions every reused
+    planner / plan-reviewer / mergemaster worktree silently aged (finding 16:
+    planning and integration-testing against a stale base). This is the
+    session-start refresh:
+
+    * ``git fetch origin`` in the bare repo first. A fetch *failure* (network
+      down) is a WARNING and the refresh proceeds on cached refs — infra
+      flakiness must not block startup, matching ``_recreate_worktree``.
+    * A dirty worktree **fails loud** (:class:`WorkspaceError` naming the
+      paths): local state that prevents the fast-forward means the session
+      would otherwise silently plan against a stale base.
+    * ``detach=True`` (planner / plan-reviewer, read-only): re-detach at the
+      refreshed ref. Otherwise (mergemaster): ``merge --ff-only`` — a
+      diverged local branch fails loud the same way.
+
+    Falls back from ``origin/<branch>`` to ``<branch>`` when no remote ref
+    exists (offline/bare-only test repos), mirroring ``prepare_task_branch``.
+    Coder worktrees are deliberately NOT refreshed here: their workspace
+    branches are reset by ``prepare_task_branch`` at task assignment, and a
+    session-start reset would clobber the crash-recovery state the supervisor
+    rebuilds from uncommitted changes.
+    """
+    try:
+        _run_git(["fetch", "origin"], cwd=bare_repo)
+    except WorkspaceError as exc:
+        logger.warning(
+            "fetch failed during session-start refresh of %s (%s); "
+            "refreshing from cached refs", worktree_path, exc,
+        )
+
+    status = _run_git(["status", "--porcelain"], cwd=worktree_path).strip()
+    if status:
+        raise WorkspaceError(
+            f"Worktree {worktree_path} has local changes that prevent the "
+            f"session-start fast-forward to origin/{branch}:\n{status}\n"
+            "Refusing to start on a stale base — clean or remove the "
+            "worktree, then restart."
+        )
+
+    try:
+        _run_git(["rev-parse", "--verify", f"origin/{branch}"], cwd=worktree_path)
+        ref = f"origin/{branch}"
+    except WorkspaceError:
+        ref = branch
+
+    if detach:
+        _run_git(["checkout", "--detach", ref], cwd=worktree_path)
+        return
+    _run_git(["checkout", branch], cwd=worktree_path)
+    try:
+        _run_git(["merge", "--ff-only", ref], cwd=worktree_path)
+    except WorkspaceError as exc:
+        raise WorkspaceError(
+            f"Worktree {worktree_path} branch {branch!r} cannot fast-forward "
+            f"to {ref} (diverged?). Refusing to start on a stale base — "
+            f"reset or remove the worktree, then restart. {exc}"
+        ) from None
+
+
 def branch_exists(bare_repo: Path, branch: str) -> bool:
     """True if ``branch`` resolves to a ref (local head or remote-tracking)."""
     try:

@@ -363,7 +363,10 @@ class StateStore:
         so a crash between them cannot leave two active tasks or none:
 
         * If ``supersede_task_id`` is given, that row's status is set to
-          ``'superseded'`` (idempotent UPDATE; a missing row is a no-op).
+          ``'superseded'`` — but only while it is still ``'active'``
+          (idempotent UPDATE; a missing row is a no-op, and a terminal row
+          — ``completed``/``superseded`` — is never rewritten: a task that
+          genuinely completed must not be retroactively relabeled).
         * If a row for ``task_id`` already exists, ``owner_id`` /
           ``owner_handle`` / ``required_verdicts`` / ``merge_approval`` are
           updated AND ``status`` is restored to ``'active'`` — description and
@@ -389,8 +392,15 @@ class StateStore:
         verdicts_json = json.dumps(required_verdicts)
         with self._transaction() as conn:
             if supersede_task_id is not None:
+                # Only an ACTIVE task can be superseded. Terminal rows
+                # (completed/superseded) are never rewritten — without the
+                # status guard, registering a new task while pointing at a
+                # finished one falsified the ledger: a task that genuinely
+                # COMPLETED was retroactively relabeled 'superseded'
+                # (finding 19 / triage annex A6).
                 conn.execute(
-                    "UPDATE tasks SET status = 'superseded' WHERE task_id = ?",
+                    "UPDATE tasks SET status = 'superseded' "
+                    "WHERE task_id = ? AND status = 'active'",
                     (supersede_task_id,),
                 )
             existing = conn.execute(

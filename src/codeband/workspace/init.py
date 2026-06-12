@@ -25,6 +25,7 @@ from codeband.workspace.git import (
     create_worktree,
     list_known_branches,
     pin_gh_default_repo,
+    refresh_worktree,
 )
 
 logger = logging.getLogger(__name__)
@@ -162,16 +163,25 @@ def initialize_workspace(config: CodebandConfig) -> WorkspaceLayout:
         )
         pin_gh_default_repo(wt_path, config.repo.url)
 
-    # Planner worktrees — detached HEAD (read-only)
+    # Planner worktrees — detached HEAD (read-only), fast-forwarded to
+    # origin/<branch> every session start (finding 16: create_worktree no-ops
+    # on an existing worktree, so a reused planner otherwise plans on a
+    # stale base; a dirty worktree fails loud instead of planning stale).
     for wt_path in layout.planner_worktrees.values():
         create_worktree(
             layout.bare_repo, wt_path, config.repo.branch, detach=True,
         )
+        refresh_worktree(
+            layout.bare_repo, wt_path, config.repo.branch, detach=True,
+        )
         pin_gh_default_repo(wt_path, config.repo.url)
 
-    # Plan-reviewer worktrees — detached HEAD (read-only)
+    # Plan-reviewer worktrees — detached HEAD (read-only), same refresh
     for wt_path in layout.plan_reviewer_worktrees.values():
         create_worktree(
+            layout.bare_repo, wt_path, config.repo.branch, detach=True,
+        )
+        refresh_worktree(
             layout.bare_repo, wt_path, config.repo.branch, detach=True,
         )
         pin_gh_default_repo(wt_path, config.repo.url)
@@ -180,9 +190,16 @@ def initialize_workspace(config: CodebandConfig) -> WorkspaceLayout:
     for scratch_path in layout.reviewer_scratch.values():
         scratch_path.mkdir(parents=True, exist_ok=True)
 
-    # Mergemaster worktree on main branch
+    # Mergemaster worktree on main branch — ff-only refreshed at session
+    # start; coder worktrees are deliberately NOT refreshed here (their
+    # workspace branches are reset by prepare_task_branch at task
+    # assignment, and the supervisor's crash recovery depends on their
+    # uncommitted state surviving a restart).
     if layout.mergemaster_worktree is not None:
         create_worktree(
+            layout.bare_repo, layout.mergemaster_worktree, config.repo.branch,
+        )
+        refresh_worktree(
             layout.bare_repo, layout.mergemaster_worktree, config.repo.branch,
         )
         pin_gh_default_repo(layout.mergemaster_worktree, config.repo.url)
@@ -248,6 +265,9 @@ def initialize_agent_workspace(
         worktree = root / "worktrees" / worker_id
         worktree.parent.mkdir(parents=True, exist_ok=True)
         create_worktree(bare_repo, worktree, config.repo.branch, detach=True)
+        # Session-start fast-forward (finding 16) — same rationale as the
+        # local-mode path in initialize_workspace.
+        refresh_worktree(bare_repo, worktree, config.repo.branch, detach=True)
         pin_gh_default_repo(worktree, config.repo.url)
         notes_dir = root / "notes"
         notes_dir.mkdir(parents=True, exist_ok=True)
@@ -256,6 +276,7 @@ def initialize_agent_workspace(
         worktree = root / "worktrees" / worker_id
         worktree.parent.mkdir(parents=True, exist_ok=True)
         create_worktree(bare_repo, worktree, config.repo.branch, detach=True)
+        refresh_worktree(bare_repo, worktree, config.repo.branch, detach=True)
         pin_gh_default_repo(worktree, config.repo.url)
     elif agent_role == "conductor":
         notes_dir = root / "notes"
@@ -276,6 +297,7 @@ def initialize_agent_workspace(
         worktree = root / "worktrees" / "mergemaster"
         worktree.parent.mkdir(parents=True, exist_ok=True)
         create_worktree(bare_repo, worktree, config.repo.branch)
+        refresh_worktree(bare_repo, worktree, config.repo.branch)
         pin_gh_default_repo(worktree, config.repo.url)
     # watchdog needs no repo or worktree
 

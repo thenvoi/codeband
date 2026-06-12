@@ -1058,6 +1058,149 @@ class TestMentionPatternCache:
         assert [pid for pid, _ in patterns] == ["p2"]
 
 
+# ── @[[uuid]] inline-markup mentions (finding 17) ───────────────────────────
+
+class TestUuidMentionMarkup:
+    UUID = "0c69793a-58c8-4f6e-b167-2eb6cb2ad2e3"
+
+    def _msg(self, content):
+        class _Msg:
+            mentions = None
+        m = _Msg()
+        m.content = content
+        return m
+
+    def test_uuid_markup_resolves_against_participant_set(self):
+        from codeband.agents.watchdog import _mentioned_participant_ids
+
+        names = {self.UUID: "Coder-Codex-0", "p2": "Reviewer-Claude-0"}
+        msg = self._msg(f"please pick this back up @[[{self.UUID}]]")
+        assert _mentioned_participant_ids(msg, names) == {self.UUID}
+
+    def test_unknown_uuid_markup_is_ignored(self):
+        from codeband.agents.watchdog import _mentioned_participant_ids
+
+        names = {self.UUID: "Coder-Codex-0"}
+        msg = self._msg("@[[11111111-2222-3333-4444-555555555555]] hello")
+        assert _mentioned_participant_ids(msg, names) == set()
+
+    def test_uuid_markup_is_case_insensitive(self):
+        from codeband.agents.watchdog import _mentioned_participant_ids
+
+        names = {self.UUID: "Coder-Codex-0"}
+        msg = self._msg(f"@[[{self.UUID.upper()}]] re-dispatch")
+        assert _mentioned_participant_ids(msg, names) == {self.UUID}
+
+    def test_uuid_markup_combines_with_display_name_form(self):
+        from codeband.agents.watchdog import _mentioned_participant_ids
+
+        names = {self.UUID: "Coder-Codex-0", "p2": "Reviewer-Claude-0"}
+        msg = self._msg(f"@Reviewer-Claude-0 and @[[{self.UUID}]] — sync up")
+        assert _mentioned_participant_ids(msg, names) == {self.UUID, "p2"}
+
+
+@pytest.mark.asyncio
+async def test_terminal_message_does_not_untrack_agent_with_newer_uuid_mention(
+    tmp_path, monkeypatch,
+):
+    """The compounding half of finding 17: an agent whose last own message is
+    terminal-shaped but that has an UNANSWERED @[[uuid]] re-dispatch newer
+    than it must stay tracked — and get nudged when the mention goes stale."""
+    agent_uuid = "0c69793a-58c8-4f6e-b167-2eb6cb2ad2e3"
+    store = _seed_store(tmp_path, state="merged")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: None)
+
+    room = MagicMock()
+    room.id = ROOM_ID
+
+    done = _msg(agent_uuid, minutes_ago=60)
+    done.content = "Review PASSED — risk low. Merged PR #12."  # terminal-shaped
+    redispatch = _msg("agent-cond", minutes_ago=10)  # stale vs 300s threshold
+    redispatch.content = f"@[[{agent_uuid}]] please pick up subtask st-9"
+
+    rest = _mock_rest()
+    rest.agent_api_chats = MagicMock()
+    rest.agent_api_chats.list_agent_chats = AsyncMock(
+        return_value=_chats_resp([room]),
+    )
+    rest.agent_api_messages.list_agent_messages = AsyncMock(
+        return_value=MagicMock(data=[done, redispatch]),
+    )
+    parts = MagicMock()
+    parts.data = [
+        _participant("agent-cond", "Conductor"),
+        _participant(agent_uuid, "Coder-Codex-0"),
+    ]
+    rest.agent_api_participants = MagicMock()
+    rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+        return_value=parts,
+    )
+
+    from codeband.agents.watchdog import WatchdogDaemon
+
+    daemon = WatchdogDaemon(
+        config=WatchdogConfig(stale_threshold_seconds=300),
+        rest_client=rest,
+        agent_id="agent-cond",
+        conductor_id="agent-cond",
+        state_store=store,
+    )
+    await daemon._patrol()
+
+    # The agent was NOT untracked: the unanswered re-dispatch keeps it on the
+    # clock, and 10 minutes of silence after the mention earns a nudge.
+    rest.agent_api_messages.create_agent_chat_message.assert_awaited()
+    sent = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
+    assert "Status check" in sent.content
+
+
+@pytest.mark.asyncio
+async def test_terminal_message_still_untracks_without_newer_mention(
+    tmp_path, monkeypatch,
+):
+    """Control: the same terminal-shaped last message with NO newer inbound
+    mention keeps the historical untrack behavior — no nudge."""
+    store = _seed_store(tmp_path, state="merged")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: None)
+
+    room = MagicMock()
+    room.id = ROOM_ID
+
+    done = _msg("agent-p0", minutes_ago=60)
+    done.content = "Review PASSED — risk low. Merged PR #12."
+
+    rest = _mock_rest()
+    rest.agent_api_chats = MagicMock()
+    rest.agent_api_chats.list_agent_chats = AsyncMock(
+        return_value=_chats_resp([room]),
+    )
+    rest.agent_api_messages.list_agent_messages = AsyncMock(
+        return_value=MagicMock(data=[done]),
+    )
+    parts = MagicMock()
+    parts.data = [
+        _participant("agent-cond", "Conductor"),
+        _participant("agent-p0", "Coder-Claude-0"),
+    ]
+    rest.agent_api_participants = MagicMock()
+    rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+        return_value=parts,
+    )
+
+    from codeband.agents.watchdog import WatchdogDaemon
+
+    daemon = WatchdogDaemon(
+        config=WatchdogConfig(stale_threshold_seconds=300),
+        rest_client=rest,
+        agent_id="agent-cond",
+        conductor_id="agent-cond",
+        state_store=store,
+    )
+    await daemon._patrol()
+
+    rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_agent_api_messages_bounded_client_side(tmp_path):
     """The free-tier agent-API path has no server-side `since` param, so the

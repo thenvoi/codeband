@@ -326,6 +326,28 @@ def test_reregistration_restores_superseded_task_to_active(store: StateStore) ->
     assert _active_task_ids(store) == ["room-a"]  # exactly one active task
 
 
+def test_supersede_never_rewrites_terminal_rows(store: StateStore) -> None:
+    """Finding 19 (triage annex A6): the supersede UPDATE is scoped
+    WHERE status='active' — a task that genuinely COMPLETED must never be
+    retroactively relabeled 'superseded' by a later registration that still
+    points at it."""
+    _register(store, "room-a")
+    conn = sqlite3.connect(store.db_path)
+    try:
+        conn.execute(
+            "UPDATE tasks SET status = 'completed' WHERE task_id = 'room-a'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    _register(store, "room-b", supersede="room-a")
+
+    assert store.get_task("room-a").status == "completed"  # ledger intact
+    assert store.get_task("room-b").status == "active"
+    assert _active_task_ids(store) == ["room-b"]
+
+
 def test_reregistration_reactivates_completed_task(store: StateStore) -> None:
     """Re-registering a 'completed' task's room reactivates it — intended
     continue-work semantics: the owner is deliberately pointing new work at
