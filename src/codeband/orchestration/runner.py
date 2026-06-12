@@ -550,10 +550,21 @@ def _export_project_dir_env(project_dir: Path) -> None:
     so prompts pass no new flags and agents stop depending on their cwd
     happening to be the project dir. Docker sets the same variable to
     ``/app/config`` in the compose env block.
+
+    ``CODEBAND_AGENT_SESSION`` rides the same seam: every spawned agent
+    session inherits it, and ``cb approve`` refuses to record a grant when it
+    is set. This is an ACCIDENT GUARD, not authentication — it stops an agent
+    from reflexively shelling out to the human-approval primitive (finding
+    18); a motivated process can trivially unset it. Real identity binding is
+    a design-session concern. The interactive shell's ``/approve`` runs in
+    this same process (bare ``cb`` hosts the orchestrator in-process), so the
+    guard exempts ``command_style="slash"`` — that path is only reachable
+    from the human at the REPL prompt.
     """
     import os
 
     os.environ["CODEBAND_PROJECT_DIR"] = str(Path(project_dir).resolve())
+    os.environ["CODEBAND_AGENT_SESSION"] = "1"
 
 
 def _resolve_workspace_config(config: CodebandConfig, project_dir: Path) -> CodebandConfig:

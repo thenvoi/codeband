@@ -798,10 +798,23 @@ def record_approval_grant(project_dir: Path | str, pr_number: int) -> list[str]:
 
     The store half of ``cb approve <pr>`` (the chat half is unchanged):
     resolves the active task, finds the subtask(s) bound to the PR (bound by
-    ``cb-phase merge`` persisting ``--pr``), reads the PR's current head SHA,
-    and writes the grant. Returns a human-readable line per grant recorded —
-    empty when no subtask is bound to the PR (the legacy chat-only flow,
-    which records nothing and changes nothing).
+    ``cb-phase merge`` persisting ``--pr``), and writes the grant **at the
+    SHA the approval request named** (``merge_approval_requested_sha``) —
+    never at whatever the live head happens to be. A grant can only ever
+    exist for a SHA a request named, so the merge leg's granted==pending
+    check keeps its intended meaning. Concretely, per bound subtask:
+
+    - request marker matches the live PR head → grant AT the requested SHA;
+    - request marker set but the head moved → **refuse** (raises, exit
+      nonzero, nothing recorded — the chat half never goes out): the human
+      approved a commit that is no longer what would merge; the merge leg's
+      re-queue will send a fresh request;
+    - no request marker (no request ever sent) → no grant, loud stderr note —
+      a grant is never recorded speculatively.
+
+    Returns a human-readable line per grant recorded — empty when no subtask
+    is bound to the PR (the legacy chat-only flow, which records nothing and
+    changes nothing) or when no bound subtask has requested approval yet.
 
     ``project_dir`` is the raw ``--dir`` flag value: it goes through
     :func:`~codeband.cli.handoff.resolve_project_dir` (explicit flag >
@@ -842,6 +855,22 @@ def record_approval_grant(project_dir: Path | str, pr_number: int) -> list[str]:
         )
         return []
 
+    # Grants are scoped to the rows that REQUESTED approval (the merge leg's
+    # marker-after-send wrote merge_approval_requested_sha) — never to every
+    # row that merely references the PR. No request ever sent → nothing to
+    # grant against; a speculative grant at the live head is exactly the hole
+    # that let a moved branch merge with a stale-looking approval.
+    requested = [s for s in subtasks if s.merge_approval_requested_sha is not None]
+    if not requested:
+        print(
+            f"cb approve: NO durable merge grant was recorded — no approval "
+            f"request has been sent for PR #{pr_number} yet (no requested "
+            f"SHA on record). Re-run `cb approve {pr_number}` after the "
+            "merge leg requests approval.",
+            file=sys.stderr,
+        )
+        return []
+
     # Repo identity comes from config (--repo <slug>), never from whatever
     # repo the current cwd happens to be in.
     from codeband.github.prs import repo_slug
@@ -861,17 +890,42 @@ def record_approval_grant(project_dir: Path | str, pr_number: int) -> list[str]:
             "approval grant not recorded. Check gh auth/network and re-run."
         )
 
+    # The grant goes to the requested SHA, and only when the live head still
+    # IS that SHA. A moved head means the human would be approving a commit
+    # that is no longer what would merge — refuse outright (exit nonzero, no
+    # grant, no chat half); the merge leg's re-queue sends a fresh request.
+    matching = [s for s in requested if s.merge_approval_requested_sha == head_sha]
+    stale = [s for s in requested if s.merge_approval_requested_sha != head_sha]
+    if not matching:
+        stale_shas = ", ".join(sorted({s.merge_approval_requested_sha for s in stale}))
+        raise RuntimeError(
+            f"cb approve: PR #{pr_number} head is {head_sha} but the "
+            f"approval request was for {stale_shas} — the branch moved. "
+            "Wait for the re-queue and the fresh request."
+        )
+    for sub in stale:
+        # Mixed multi-row PR: grant the current-head rows below, but never
+        # the rows whose request a push has already invalidated.
+        print(
+            f"cb approve: subtask {sub.subtask_id} NOT granted — its "
+            f"approval request was for {sub.merge_approval_requested_sha}, "
+            f"but PR #{pr_number} head is {head_sha}. Wait for its re-queue "
+            "and fresh request.",
+            file=sys.stderr,
+        )
+
     task = store.get_task(task_id)
     approved_by = (task.merge_approval if task is not None else None) or "owner"
 
     recorded = []
-    for sub in subtasks:
+    for sub in matching:
         store.record_merge_approval(
             sub.subtask_id, task_id,
-            approved_by=approved_by, approved_sha=head_sha,
+            approved_by=approved_by,
+            approved_sha=sub.merge_approval_requested_sha,
         )
         recorded.append(
             f"Merge approval recorded for subtask {sub.subtask_id} "
-            f"at {head_sha} (approver: {approved_by})."
+            f"at {sub.merge_approval_requested_sha} (approver: {approved_by})."
         )
     return recorded

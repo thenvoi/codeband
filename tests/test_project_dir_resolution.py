@@ -128,14 +128,18 @@ def test_runner_exports_project_dir_into_process_env(monkeypatch, tmp_path):
     coder/reviewer/mergemaster session'."""
     from codeband.orchestration.runner import _export_project_dir_env
 
-    # setenv registers the teardown that undoes the direct os.environ write
+    # setenv registers the teardown that undoes the direct os.environ writes
     # _export_project_dir_env performs below.
     monkeypatch.setenv("CODEBAND_PROJECT_DIR", "stale-value")
+    monkeypatch.setenv("CODEBAND_AGENT_SESSION", "stale-value")
     _export_project_dir_env(tmp_path)
     assert os.environ["CODEBAND_PROJECT_DIR"] == str(tmp_path.resolve())
     # The export FORCES the resolved dir — a stale ambient value never wins.
     _export_project_dir_env(tmp_path / "other")
     assert os.environ["CODEBAND_PROJECT_DIR"] == str((tmp_path / "other").resolve())
+    # The agent-session marker rides the same seam (cb approve's accident
+    # guard, finding 18): every spawned agent session inherits it.
+    assert os.environ["CODEBAND_AGENT_SESSION"] == "1"
 
 
 def test_record_approval_grant_resolves_project_dir_via_env(monkeypatch, tmp_path):

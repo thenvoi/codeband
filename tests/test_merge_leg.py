@@ -609,21 +609,78 @@ def test_ungated_task_merges_vacuously_but_approval_still_applies(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_record_approval_grant_pins_pr_head_sha(env):
+def test_record_approval_grant_grants_at_requested_sha_only(env):
+    """The grant is pinned to the SHA the approval REQUEST named — a grant
+    can only ever exist for a SHA a request named (finding 21)."""
     env.store.set_pr_number("st-1", TASK, 42)
+    env.store.mark_merge_approval_requested("st-1", TASK, SHA)
 
     lines = merge.record_approval_grant(Path("."), 42)
 
     assert len(lines) == 1 and "st-1" in lines[0]
     sub = env.store.get_subtask("st-1", TASK)
-    assert sub.merge_approved_sha == SHA  # pinned to the PR head at approval
+    assert sub.merge_approved_sha == SHA  # the requested SHA, not "live head"
     assert sub.merge_approved_by == "owner"  # the task's snapshotted approver
+
+
+def test_record_approval_grant_refuses_when_head_moved_past_request(env, capsys):
+    """The failed C1 probe as a regression test: request sent at SHA, branch
+    pushed since — cb approve must REFUSE, not grant at the moved head."""
+    env.store.set_pr_number("st-1", TASK, 42)
+    env.store.mark_merge_approval_requested("st-1", TASK, "sha-old")
+    # live PR head is SHA ("sha-1") — the request named "sha-old".
+
+    with pytest.raises(RuntimeError, match="the branch moved"):
+        merge.record_approval_grant(Path("."), 42)
+
+    sub = env.store.get_subtask("st-1", TASK)
+    assert sub.merge_approved_sha is None  # nothing recorded
+    # untouched marker: the merge leg's re-queue owns the fresh request
+    assert sub.merge_approval_requested_sha == "sha-old"
+
+
+def test_record_approval_grant_never_grants_without_a_request(env, capsys):
+    """Bound subtask but no approval request ever sent → no speculative
+    grant. This kills the second-order path: granted==pending can only be
+    satisfied by a SHA a request named."""
+    env.store.set_pr_number("st-1", TASK, 42)
+
+    assert merge.record_approval_grant(Path("."), 42) == []
+
+    assert env.store.get_subtask("st-1", TASK).merge_approved_sha is None
+    err = capsys.readouterr().err
+    assert "NO durable merge grant was recorded" in err
+    assert "no approval request has been sent" in err
+    assert "cb approve 42" in err  # tells the human exactly what to re-run
+
+
+def test_record_approval_grant_scopes_to_requesting_rows_only(env, capsys):
+    """Multi-row PR (campaign Observation C): the grant write targets only
+    the rows whose request matches the head — never every row referencing
+    the PR."""
+    for sid in ("st-2", "st-3"):
+        _drive_to_review_passed(env.store, sid)
+    for sid in ("st-1", "st-2", "st-3"):
+        env.store.set_pr_number(sid, TASK, 42)
+    env.store.mark_merge_approval_requested("st-1", TASK, SHA)  # matches head
+    env.store.mark_merge_approval_requested("st-2", TASK, "sha-old")  # stale
+    # st-3 never requested approval at all.
+
+    lines = merge.record_approval_grant(Path("."), 42)
+
+    assert len(lines) == 1 and "st-1" in lines[0]
+    assert env.store.get_subtask("st-1", TASK).merge_approved_sha == SHA
+    assert env.store.get_subtask("st-2", TASK).merge_approved_sha is None
+    assert env.store.get_subtask("st-3", TASK).merge_approved_sha is None
+    err = capsys.readouterr().err
+    assert "st-2" in err and "NOT granted" in err  # the stale row is named
 
 
 def test_record_approval_grant_pins_repo_via_config_slug(env):
     """The grant's PR snapshot carries --repo <slug> from config repo.url —
     repo identity never depends on what repo the cwd happens to be in."""
     env.store.set_pr_number("st-1", TASK, 42)
+    env.store.mark_merge_approval_requested("st-1", TASK, SHA)
     merge.record_approval_grant(Path("."), 42)
     assert env.snapshot_repos == ["acme/widgets"]
 
@@ -653,6 +710,7 @@ def test_record_approval_grant_raises_when_no_active_task(env, monkeypatch):
 
 def test_record_approval_grant_fails_loud_when_head_unreadable(env, monkeypatch):
     env.store.set_pr_number("st-1", TASK, 42)
+    env.store.mark_merge_approval_requested("st-1", TASK, SHA)
     monkeypatch.setattr(
         merge, "_pr_snapshot", lambda pr_number, cwd, repo=None: None,
     )
@@ -664,6 +722,7 @@ def test_record_approval_grant_fails_loud_when_head_unreadable(env, monkeypatch)
 
 def test_record_approval_grant_fails_loud_on_unresolvable_slug(env, monkeypatch):
     env.store.set_pr_number("st-1", TASK, 42)
+    env.store.mark_merge_approval_requested("st-1", TASK, SHA)
     monkeypatch.setattr(
         merge, "load_config",
         lambda project_dir: SimpleNamespace(
@@ -673,6 +732,99 @@ def test_record_approval_grant_fails_loud_on_unresolvable_slug(env, monkeypatch)
     with pytest.raises(RuntimeError, match="repo slug"):
         merge.record_approval_grant(Path("."), 42)
     assert env.store.get_subtask("st-1", TASK).merge_approved_sha is None
+
+
+def test_second_order_pre_push_grant_refused_then_fresh_request_still_sent(
+    env, capsys,
+):
+    """The full second-order scenario: a grant attempted after a push is
+    refused; the merge leg re-queues; the fresh request still goes out; the
+    grant then lands at the freshly requested SHA and the merge executes."""
+    from codeband.cli import merge as merge_mod
+
+    # Round 1: queue at SHA, approval request sent (marker burns at SHA).
+    assert _run() == 0
+    assert len(env.sends) == 1 and env.sends[0][2] == SHA
+
+    # A push moves the head before the human approves.
+    env.pr["headRefOid"] = "sha-2"
+
+    # Pre-push grant attempt → refused, nothing recorded.
+    with pytest.raises(RuntimeError, match="the branch moved"):
+        merge.record_approval_grant(Path("."), 42)
+    assert env.store.get_subtask("st-1", TASK).merge_approved_sha is None
+
+    # Re-queue: the merge leg detects the drift and sends the subtask back.
+    assert _run("st-1") == merge_mod.EXIT_NEEDS_REBASE
+
+    # Rework re-earns both verdicts at the new SHA.
+    for new_state, role, sha in [
+        ("in_progress", "coder", None),
+        ("verify_pending", "coder", None),
+        ("review_pending", "coder", "sha-2"),
+        ("review_passed", "reviewer", "sha-2"),
+    ]:
+        transition(
+            "st-1", TASK, new_state, caller_role=role,
+            store=env.store, head_sha=sha,
+        )
+
+    # Fresh queue at sha-2 → a FRESH request goes out (new marker SHA).
+    assert _run("st-1") == 0
+    assert len(env.sends) == 2 and env.sends[1][2] == "sha-2"
+
+    # The grant now lands, pinned to the requested sha-2 — and the merge runs.
+    assert len(merge.record_approval_grant(Path("."), 42)) == 1
+    assert env.store.get_subtask("st-1", TASK).merge_approved_sha == "sha-2"
+    assert _run("st-1") == 0
+    assert env.store.get_subtask("st-1", TASK).state == "merged"
+
+
+def test_cb_approve_refuses_inside_agent_sessions(tmp_path):
+    """Finding 18 accident guard: the runner marks every spawned agent
+    session's env; cb approve refuses before any work (note: no codeband.yaml
+    exists here — the guard fires before config is even loaded)."""
+    from click.testing import CliRunner
+
+    from codeband.cli import cli as cb_cli
+
+    result = CliRunner(env={"CODEBAND_AGENT_SESSION": "1"}).invoke(
+        cb_cli, ["approve", "42", "--dir", str(tmp_path)],
+    )
+    assert result.exit_code != 0
+    combined = result.output + result.stderr
+    assert "human-approval primitive" in combined
+    assert "merge leg" in combined
+
+
+def test_shell_slash_approve_is_exempt_from_the_agent_guard(tmp_path, monkeypatch):
+    """The interactive shell's /approve runs inside the orchestrator process
+    (which sets the marker for its spawned agents); command_style="slash" is
+    only reachable from the human at the REPL prompt, so it bypasses."""
+    import codeband.cli.merge as merge_mod
+    import codeband.orchestration.kickoff as kickoff_mod
+    from codeband.cli import approve as approve_cmd
+
+    monkeypatch.setenv("CODEBAND_AGENT_SESSION", "1")
+    calls: list = []
+    monkeypatch.setattr(
+        merge_mod, "record_approval_grant",
+        lambda project_dir, number: calls.append(number) or [],
+    )
+
+    async def _fake_send(config, project, message, command_style="cli"):
+        calls.append("sent")
+
+    monkeypatch.setattr(kickoff_mod, "send_room_message", _fake_send)
+    (tmp_path / "codeband.yaml").write_text(
+        "repo:\n  url: https://github.com/acme/widgets\n", encoding="utf-8",
+    )
+
+    approve_cmd.callback(
+        number=42, project_dir=str(tmp_path), command_style="slash",
+    )
+
+    assert calls == [42, "sent"]
 
 
 def test_cb_approve_command_renders_grant_failures_as_clean_errors(tmp_path):

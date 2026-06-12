@@ -1008,7 +1008,26 @@ def pending(project_dir: str, command_style: str = "cli") -> None:
 @click.option("--dir", "project_dir", default=".", help="Project directory")
 @_project_aware
 def approve(number: int, project_dir: str, command_style: str = "cli") -> None:
-    """Approve a PR for merge (sends approval to Conductor in existing task room)."""
+    """Approve a PR for merge (records the durable grant + notifies the room).
+
+    Human-approval primitive: refuses to run inside an agent session
+    (CODEBAND_AGENT_SESSION is set by the runner for every spawned agent).
+    This is an accident guard, not authentication — agents request approval
+    via the merge leg, and a human grants it from their own shell or the
+    interactive shell's /approve.
+    """
+    # Accident guard (finding 18) before any work — including the chat half.
+    # The interactive shell's /approve shares the orchestrator process (and
+    # so its environment); command_style="slash" is only reachable from the
+    # human at the REPL prompt, so it is exempt.
+    import os
+
+    if command_style != "slash" and os.environ.get("CODEBAND_AGENT_SESSION"):
+        raise click.ClickException(
+            "cb approve is a human-approval primitive; agents request "
+            "approval via the merge leg."
+        )
+
     # Resolved through the shared cb-phase contract (explicit --dir >
     # $CODEBAND_PROJECT_DIR > cwd) — without this, the config load below
     # would fail on cwd before the env-var-resolving grant half ever ran.
