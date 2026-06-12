@@ -291,6 +291,127 @@ def _patch_band_local_runtime() -> None:
     RoomPresence._subscribe_to_existing_rooms = _codeband_subscribe_to_existing_rooms
 
 
+def _reset_dead_codex_client(adapter: object) -> None:
+    """Reset a Codex adapter whose subprocess died BETWEEN turns (finding 22).
+
+    The SDK only notices a dead ``codex app-server`` mid-turn: the
+    ``transport/closed`` sentinel that ``_fail_pending`` enqueues
+    (thenvoi/integrations/codex/stdio_client.py:119-133,
+    rpc_base.py:227-245) is consumed exclusively inside
+    ``_process_turn_events`` (thenvoi/adapters/codex.py:895-916), and
+    ``_ensure_client_ready`` (codex.py:1011-1024) checks only
+    ``_client is None`` / ``_initialized``. A between-turns death therefore
+    either raises at the next ``turn/start`` or — worse — hangs forever,
+    because ``BaseJsonRpcClient.request()`` has no timeout
+    (rpc_base.py:199-225) and the reader loop that would resolve the future
+    is gone, wedging the adapter-wide ``_rpc_lock``.
+
+    Detection is shape-tolerant (unknown shapes do nothing): a recorded
+    subprocess ``returncode`` or a queued ``transport/closed`` sentinel
+    means dead. The reset mirrors what the SDK's own mid-turn handler does
+    (codex.py:898-910): drop ``_client`` / ``_initialized`` /
+    ``_room_threads`` so the next ``_ensure_client_ready`` rebuilds a fresh
+    subprocess (thread continuity is re-established via the bootstrap
+    ``thread/resume`` path where room history carries a thread id).
+    """
+    client = getattr(adapter, "_client", None)
+    if client is None:
+        return
+
+    dead = getattr(getattr(client, "_proc", None), "returncode", None) is not None
+    if not dead:
+        # asyncio.Queue has no peek; inspect its internal deque read-only.
+        queue = getattr(getattr(client, "_events", None), "_queue", None)
+        if queue is not None:
+            try:
+                dead = any(
+                    getattr(event, "method", None) == "transport/closed"
+                    for event in list(queue)
+                )
+            except TypeError:
+                dead = False
+    if not dead:
+        return
+
+    logger.error(
+        "Codex subprocess found dead between turns — resetting the adapter "
+        "client state so the next turn rebuilds it",
+    )
+    close = getattr(client, "close", None)
+    if callable(close):
+        try:
+            result = close()
+            if asyncio.iscoroutine(result):
+                asyncio.get_running_loop().create_task(result)
+        except Exception:  # noqa: BLE001 - the old client is already dead
+            logger.debug("Closing the dead Codex client failed", exc_info=True)
+    adapter._client = None
+    adapter._initialized = False
+    room_threads = getattr(adapter, "_room_threads", None)
+    if isinstance(room_threads, dict):
+        room_threads.clear()
+
+
+def _wrap_codex_on_message(original: Callable) -> Callable:
+    """Wrap ``CodexAdapter.on_message`` with liveness + visible-error handling.
+
+    Two seams, both finding-22 mitigations:
+
+    * before the turn: :func:`_reset_dead_codex_client` — a dead subprocess
+      is rebuilt instead of raising (or hanging) at ``turn/start``;
+    * around the turn: ``turn/start`` runs BEFORE any chat output exists
+      (thenvoi/adapters/codex.py:568 sits outside the try block at :629),
+      so a failure there was previously invisible — the room saw nothing
+      while the message was retired. A pre-output exception now posts a
+      visible chat error, then re-raises so the SDK's retry accounting
+      (``max_message_retries``) still applies.
+    """
+
+    async def _codeband_on_message(self, msg, tools, *args, **kwargs):
+        _reset_dead_codex_client(self)
+        try:
+            return await original(self, msg, tools, *args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            try:
+                await tools.send_message(
+                    content=(
+                        "⚠️ Codex turn could not start: "
+                        f"{type(exc).__name__}: {exc}. The triggering message "
+                        "was NOT processed — re-send it after the Codex "
+                        "session recovers."
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - the error report must not mask the error
+                logger.debug(
+                    "Could not post the Codex turn-failure notice", exc_info=True,
+                )
+            raise
+
+    _codeband_on_message._codeband_codex_resilience = True  # type: ignore[attr-defined]
+    return _codeband_on_message
+
+
+def _patch_codex_adapter_resilience() -> None:
+    """Wrap the Codex adapter's message entry point (finding 22 mitigations).
+
+    ``_patch_band_local_runtime``-style, but applied in BOTH local and
+    distributed modes: the dormancy defect lives in the adapter itself, not
+    in the lifecycle ownership that keeps the PHX patch local-only. Codex
+    extras absent (Claude-only install) → nothing to patch. Idempotent.
+    """
+    try:
+        from thenvoi.adapters import CodexAdapter
+    except ImportError:
+        logger.debug("Codex adapter not importable — resilience patch skipped")
+        return
+    if getattr(CodexAdapter.on_message, "_codeband_codex_resilience", False):
+        return
+    CodexAdapter.on_message = _wrap_codex_on_message(CodexAdapter.on_message)
+    logger.debug("Codex adapter resilience patch installed")
+
+
 def _log_activity_safe(
     activity: object, event_type: str, name: str, summary: str,
 ) -> None:
@@ -593,6 +714,12 @@ def _create_band_agent(adapter, creds: AgentCredentials, config: CodebandConfig)
     idle agent re-polls its pending queue. It is the delivery backstop for
     missed websocket pushes and applies to every role uniformly (all roles
     funnel through this factory, local and distributed alike).
+
+    ``max_message_retries`` (finding 22 mitigation 4b) rides the same seam:
+    the SDK default of 1 means a single transient turn failure permanently
+    retires an @mention client-side AND pins the room's resync backstop on
+    the poisoned head-of-queue. Raising it reduces how often that upstream
+    defect fires; it does not eliminate it (see ``config.AgentsConfig``).
     """
     from thenvoi import Agent
     from thenvoi.runtime.types import SessionConfig
@@ -605,6 +732,7 @@ def _create_band_agent(adapter, creds: AgentCredentials, config: CodebandConfig)
         rest_url=config.band.rest_url,
         session_config=SessionConfig(
             idle_resync_seconds=config.agents.idle_resync_seconds,
+            max_message_retries=config.agents.max_message_retries,
         ),
     )
 
@@ -755,6 +883,7 @@ async def run_local(
     )
     _local_sweep_settings.fresh = fresh
     _patch_band_local_runtime()
+    _patch_codex_adapter_resilience()
     # Every agent session spawned below inherits the resolved project dir so
     # cb-phase / cb approve resolve config + state from any cwd.
     _export_project_dir_env(project_dir)
@@ -1031,6 +1160,10 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
     - `{role}-{framework}-{index}` — pool workers (e.g., `coder-claude_sdk-0`)
     - `watchdog` — in-process daemon (reuses Conductor creds)
     """
+    # Adapter-defect mitigation (finding 22), NOT a lifecycle patch: unlike
+    # _patch_band_local_runtime, this applies in distributed mode too.
+    _patch_codex_adapter_resilience()
+
     agent_config = await _ensure_agents_registered(config, project_dir)
 
     if agent_key == "watchdog":
@@ -1304,6 +1437,7 @@ def _create_planner(
 
     if framework == Framework.CODEX:
         from codeband.agents.planner import CodexPlannerRunner
+        kwargs["turn_timeout_seconds"] = config.agents.codex_turn_timeout_seconds
         return CodexPlannerRunner(**kwargs).adapter
 
     from codeband.agents.planner import ClaudePlannerRunner
@@ -1366,6 +1500,7 @@ def _create_conductor(
 
     if config.agents.conductor.framework == Framework.CODEX:
         from codeband.agents.conductor import CodexConductorRunner
+        kwargs["turn_timeout_seconds"] = config.agents.codex_turn_timeout_seconds
         return CodexConductorRunner(**kwargs).adapter
 
     from codeband.agents.conductor import ClaudeConductorRunner
@@ -1392,6 +1527,7 @@ def _create_code_reviewer(
 
     if framework == Framework.CODEX:
         from codeband.agents.code_reviewer import CodexCodeReviewerRunner
+        kwargs["turn_timeout_seconds"] = config.agents.codex_turn_timeout_seconds
         return CodexCodeReviewerRunner(**kwargs).adapter
 
     from codeband.agents.code_reviewer import ClaudeCodeReviewerRunner
@@ -1418,6 +1554,7 @@ def _create_plan_reviewer(
 
     if framework == Framework.CODEX:
         from codeband.agents.plan_reviewer import CodexPlanReviewerRunner
+        kwargs["turn_timeout_seconds"] = config.agents.codex_turn_timeout_seconds
         return CodexPlanReviewerRunner(**kwargs).adapter
 
     from codeband.agents.plan_reviewer import ClaudePlanReviewerRunner
@@ -1470,6 +1607,7 @@ def _create_coder(
         )
         if entry.model:
             kwargs["model"] = entry.model
+        kwargs["turn_timeout_seconds"] = config.agents.codex_turn_timeout_seconds
         runner = CodexPlayerRunner(**kwargs)
         return runner.adapter
 
@@ -1493,6 +1631,7 @@ def _create_mergemaster(
 
     if config.agents.mergemaster.framework == Framework.CODEX:
         from codeband.agents.mergemaster import CodexMergemasterRunner
+        kwargs["turn_timeout_seconds"] = config.agents.codex_turn_timeout_seconds
         return CodexMergemasterRunner(**kwargs).adapter
 
     from codeband.agents.mergemaster import ClaudeMergemasterRunner

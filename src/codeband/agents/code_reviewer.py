@@ -26,6 +26,10 @@ class CodexCodeReviewerRunner:
         review_guidelines: str | None = None,
         workspace: str | None = None,
         recovery_context: str | None = None,
+        # Whole-turn budget (finding 22 / shakedown finding 4): the SDK's
+        # 180s default abandons any longer turn mid-flight while the Codex
+        # CLI keeps working. Wired from agents.codex_turn_timeout_seconds.
+        turn_timeout_seconds: int = 3600,
     ):
         try:
             from thenvoi.adapters import CodexAdapter
@@ -50,6 +54,7 @@ class CodexCodeReviewerRunner:
             approval_mode=None,
             cwd=workspace,
             sandbox="danger-full-access",
+            turn_timeout_s=float(turn_timeout_seconds),
         )
         self._adapter = CodexAdapter(config=config)
 
