@@ -338,6 +338,31 @@ class AgentsConfig(_StrictModel):
     # (they would turn the resync into a REST hot loop).
     idle_resync_seconds: int = Field(default=30, ge=1)
 
+    # Whole-turn budget for every Codex role (finding 22 mitigation 4a; also
+    # the root of the original shakedown finding 4). band-sdk's
+    # ``CodexAdapterConfig.turn_timeout_s`` defaults to 180s and is NOT
+    # activity-extended — the remaining budget shrinks from turn start no
+    # matter how much real work streams by — so every coding turn longer
+    # than 3 minutes was abandoned mid-flight: the adapter sends
+    # turn/interrupt and stops listening while the Codex CLI keeps working,
+    # the primary desync behind dormant Codex threads. Wired into
+    # ``CodexAdapterConfig(turn_timeout_s=...)`` at every Codex
+    # role-constructor seam (all six runners). ge=60: anything shorter
+    # cannot fit even a trivial tool-using turn.
+    codex_turn_timeout_seconds: int = Field(default=3600, ge=60)
+
+    # Per-message retry budget for the SDK session
+    # (``SessionConfig.max_message_retries``, SDK default 1) — same plumbing
+    # as ``idle_resync_seconds`` at ``runner._create_band_agent``. With the
+    # SDK default, ONE transient turn failure permanently retires an
+    # @mention: the client-side retry tracker marks it failed with no
+    # server-side resolution, and the room's idle-resync backstop then
+    # re-fetches the same poisoned head and stops cold (upstream band-sdk
+    # defect, reported separately). Honest scope: raising this REDUCES the
+    # frequency of that silent-permafail/head-of-line failure; it does not
+    # eliminate it. ge=1: the SDK needs at least one attempt.
+    max_message_retries: int = Field(default=3, ge=1)
+
     def total_agent_count(self) -> int:
         """Band.ai seats used (excluding Watchdog — reuses Conductor creds)."""
         return (
