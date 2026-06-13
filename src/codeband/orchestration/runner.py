@@ -1013,6 +1013,22 @@ async def run_local(
         unsupervised.append((_band_agent_factory(make_adapter, creds), key))
         logger.info("Created %s", key)
 
+    # --- Verifier pool (evidence-integrity acceptance gate) ---
+    # Mirrors the reviewer pool exactly: isolated scratch dir, no supervisor.
+    # INERT (no slots) when verifiers are count=0; the iterator yields nothing.
+    for wid, _entry in _iter_pool(resolved_config.agents.verifiers, WorkerRole.VERIFIER):
+        key = str(wid)
+        creds = agent_config.get(key)
+        scratch_path = layout.verifier_scratch.get(key)
+        make_adapter = partial(
+            _create_verifier,
+            resolved_config,
+            workspace=str(scratch_path) if scratch_path else None,
+            framework=wid.framework,
+        )
+        unsupervised.append((_band_agent_factory(make_adapter, creds), key))
+        logger.info("Created %s", key)
+
     # --- Watchdog (deterministic daemon, not a Band.ai Agent) ---
     from codeband.agents.watchdog import WatchdogDaemon
 
@@ -1249,7 +1265,9 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
     # failure falls back to None, identical to today's blank reconnect. The
     # coder path (handled below) rehydrates from git via WorkerSupervisor.
     recovery_context: str | None = None
-    if role in ("conductor", "mergemaster", "planner", "plan_reviewer", "reviewer"):
+    if role in (
+        "conductor", "mergemaster", "planner", "plan_reviewer", "reviewer", "verifier",
+    ):
         from codeband.state.rehydration import recover_for_reconnect
 
         recovery_context = await recover_for_reconnect(
@@ -1294,6 +1312,15 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
         framework = _framework_from_key(agent_key)
         workspace = str(layout.reviewer_workspace) if layout.reviewer_workspace else None
         adapter = _create_code_reviewer(
+            resolved_config, workspace=workspace, framework=framework,
+            recovery_context=recovery_context,
+        )
+        await _run_band_agent(adapter)
+
+    elif role == "verifier":
+        framework = _framework_from_key(agent_key)
+        workspace = str(layout.verifier_workspace) if layout.verifier_workspace else None
+        adapter = _create_verifier(
             resolved_config, workspace=workspace, framework=framework,
             recovery_context=recovery_context,
         )
@@ -1370,7 +1397,7 @@ def _role_from_key(key: str) -> str:
     parts = key.rsplit("-", 2)
     if len(parts) == 3:
         role = parts[0]
-        if role in {"planner", "plan_reviewer", "coder", "reviewer"}:
+        if role in {"planner", "plan_reviewer", "coder", "reviewer", "verifier"}:
             return role
     raise ValueError(f"Cannot derive role from agent key: {key}")
 
@@ -1548,6 +1575,38 @@ def _create_code_reviewer(
 
     from codeband.agents.code_reviewer import ClaudeCodeReviewerRunner
     return ClaudeCodeReviewerRunner(**kwargs).adapter
+
+
+def _create_verifier(
+    config: CodebandConfig,
+    workspace: str | None = None,
+    *,
+    framework: Framework = Framework.CLAUDE_SDK,
+    recovery_context: str | None = None,
+) -> "FrameworkAdapter":
+    """Create a verifier adapter for the given framework.
+
+    A clean mirror of :func:`_create_code_reviewer` — the Verifier is a
+    reviewer-shaped seat (isolated scratch dir + gh network) whose verdict is
+    the SHA-pinned ``verify_acceptance`` acceptance gate. ``VerifiersConfig``
+    carries no ``review_guidelines``, so the prompt is ``verifier.md`` verbatim.
+    """
+    verifiers = config.agents.verifiers
+    entry = verifiers.entry_for(framework)
+
+    kwargs = dict(
+        model=entry.model or "claude-sonnet-4-6",
+        workspace=workspace,
+        recovery_context=recovery_context,
+    )
+
+    if framework == Framework.CODEX:
+        from codeband.agents.verifier import CodexVerifierRunner
+        kwargs["turn_timeout_seconds"] = config.agents.codex_turn_timeout_seconds
+        return CodexVerifierRunner(**kwargs).adapter
+
+    from codeband.agents.verifier import ClaudeVerifierRunner
+    return ClaudeVerifierRunner(**kwargs).adapter
 
 
 def _create_plan_reviewer(

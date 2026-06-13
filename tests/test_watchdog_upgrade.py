@@ -739,13 +739,14 @@ async def test_full_history_runs_only_every_n_patrols(tmp_path):
 @pytest.mark.asyncio
 async def test_full_history_runs_independent_of_verifier_seat(tmp_path):
     """The sweep is code-driven: it escalates even with the verifier LLM seat
-    INERT (the default), because integrity is a safety sweep, not an LLM
-    behavior. The watchdog takes no verifier-pool argument at all, so it cannot
-    structurally depend on seat allocation."""
-    from codeband.config import AgentsConfig
+    INERT, because integrity is a safety sweep, not an LLM behavior. The
+    watchdog takes no verifier-pool argument at all, so it cannot structurally
+    depend on seat allocation — demonstrated here with the seat explicitly
+    disabled (the product default activates it)."""
+    from codeband.config import AgentsConfig, VerifiersConfig
 
-    # Default config: the verifier seat is INERT (no allocated worker).
-    assert AgentsConfig().verifiers.total_count() == 0
+    # Seat explicitly INERT (no allocated worker) — the sweep must still fire.
+    assert AgentsConfig(verifiers=VerifiersConfig()).verifiers.total_count() == 0
 
     store = _seed_chain(tmp_path)
     rest = _mock_rest()

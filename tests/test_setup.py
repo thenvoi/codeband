@@ -17,6 +17,7 @@ from codeband.config import (
     PoolEntry,
     RepoConfig,
     ReviewersConfig,
+    VerifiersConfig,
 )
 
 
@@ -70,6 +71,11 @@ def _make_config(
         agents=AgentsConfig(
             planners=FrameworkPool(claude_sdk=PoolEntry(count=1)),
             plan_reviewers=PlanReviewersConfig(codex=PoolEntry(count=1)),
+            # Verifiers pinned INERT: these tests exercise the registration /
+            # drift / delete *machinery* against a known 8-agent world, not the
+            # verifier feature (the active product default activates 2 verifiers
+            # → 10 agents; verifier registration is covered in test_verifier.py).
+            verifiers=VerifiersConfig(),
             coders=FrameworkPool(
                 claude_sdk=PoolEntry(count=claude_coders),
                 codex=PoolEntry(count=codex_coders),
@@ -82,9 +88,10 @@ def _make_config(
     )
 
 
-# The default cross-model config has 8 agents:
+# The `_make_config()` helper (verifiers pinned INERT) has 8 agents:
 # conductor, mergemaster, planner-claude_sdk-0, plan_reviewer-codex-0,
 # coder-claude_sdk-0, coder-codex-0, reviewer-claude_sdk-0, reviewer-codex-0.
+# (The product default activates 2 verifiers on top of these → 10.)
 #
 # Build the platform-side fakes with the **expected** descriptions so drift
 # detection does not see spurious drift in tests that exercise the happy path.
@@ -513,7 +520,7 @@ class TestSetupFreshInstall:
 
         await register_all_agents(config, tmp_path, client=client)
 
-        # Default config has 8 agents total.
+        # The `_make_config()` helper pins verifiers inert → 8 agents total.
         assert client.human_api_agents.register_my_agent.call_count == 8
 
         result = AgentConfigFile.from_yaml(tmp_path / "agent_config.yaml")

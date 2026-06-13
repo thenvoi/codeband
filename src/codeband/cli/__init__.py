@@ -359,8 +359,9 @@ def scale(spec: str, project_dir: str) -> None:
       cb scale coders.claude_sdk=4        # 4 Claude coders
       cb scale coders.codex=0             # opt out of Codex coders
       cb scale reviewers.claude_sdk=2     # 2 Claude reviewers
+      cb scale verifiers.codex=0          # opt out of the Codex verifier
 
-    Valid pools: planners, plan_reviewers, coders, reviewers.
+    Valid pools: planners, plan_reviewers, coders, reviewers, verifiers.
     Valid frameworks: claude_sdk, codex. Then run `cb setup-agents` to
     register any new pool identities.
     """

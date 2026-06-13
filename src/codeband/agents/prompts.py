@@ -45,3 +45,12 @@ def build_review_prompt(
     if review_guidelines:
         prompt += f"\n\n## Additional Review Guidelines\n{review_guidelines}\n"
     return prompt
+
+
+def build_verify_prompt(custom_prompt: str | None, default_prompt: Path) -> str:
+    """Build a Verifier prompt. Mirrors :func:`build_review_prompt` without
+    guidelines — ``VerifiersConfig`` has no ``review_guidelines`` knob, so the
+    Verifier's instructions are ``prompts/verifier.md`` verbatim (or an
+    explicit ``custom_prompt`` override).
+    """
+    return custom_prompt or load_prompt(default_prompt)

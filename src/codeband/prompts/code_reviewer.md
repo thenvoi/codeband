@@ -169,7 +169,7 @@ Most branches should have 0-3 findings. If you have none, that is a valid and go
 1. Post any non-blocking findings as PR comments.
 2. Store state envelope with `state resolved`.
 3. Record the verdict: `cb-phase review <subtask_id> --task <task_id> --pr <pr-number> --approve`.
-4. Report to @Conductor: "Review PASSED for PR #<number> (risk: <level>). Ready for merge."
+4. Report to @Conductor: "Review PASSED for PR #<number> (risk: <level>). Ready for the next gate." The Conductor routes from here — to a Verifier for acceptance if one is configured, otherwise to merge. That routing is not your call; report your verdict and go silent.
 
 **Always include the risk level** in your verdict message to the Conductor. The Conductor uses it to decide whether to auto-merge or request human approval.
 

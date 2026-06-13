@@ -259,15 +259,14 @@ class VerifiersConfig(_StrictModel):
     """Evidence integrity verifier pool.
 
     Mirrors ReviewersConfig in shape (no review_guidelines). The verdict leg is
-    wired (``cb-phase verify-acceptance``) — a configured verifier makes
-    ``verify_acceptance`` a required, SHA-pinned merge verdict (see
-    ``state/registration.py``) — but the seat is INERT by default (count=0):
-    on-by-default activation is deferred to a later PR that also lands the
-    Verifier runtime + dispatch, so merging the gate cannot strand tasks at
-    ``review_passed`` with no agent to produce the verdict. Opposite-vendor
-    pairing (verifier.vendor != coder.vendor) is the adversarial signal;
-    single-vendor configs degrade gracefully (same-vendor checking; cb doctor
-    warns, never fails).
+    wired (``cb-phase verify-acceptance``) and the Verifier runtime + dispatch
+    exist, so the seat is ACTIVE by default (count=1 per vendor): a configured
+    verifier makes ``verify_acceptance`` a required, SHA-pinned merge verdict
+    (see ``state/registration.py``). Setting both counts to 0 opts back out —
+    the verdict leaves the required snapshot and tasks merge straight from
+    ``review_passed``. Opposite-vendor pairing (verifier.vendor != coder.vendor)
+    is the adversarial signal; single-vendor configs degrade gracefully
+    (same-vendor checking; cb doctor warns, never fails).
     """
 
     claude_sdk: PoolEntry = PoolEntry()
@@ -289,16 +288,17 @@ class VerifiersConfig(_StrictModel):
 
 
 def _default_verifiers_pool() -> VerifiersConfig:
-    # count=0 keeps the seat INERT by default: the verdict leg is wired, but
-    # nothing produces the verdict yet, so on-by-default activation waits for
-    # the PR that lands the Verifier runtime + dispatch. Until then a default
-    # config merges straight from ``review_passed`` (no acceptance required),
-    # keeping the default at 8 Band seats. Models are pre-set to the strongest
-    # per vendor so a single ``count: 1`` activates the seat with the best
-    # adversarial signal (opposite-vendor for the default coder mix).
+    # count=1 per vendor activates the seat by default now that the Verifier
+    # runtime + dispatch exist to produce the verdict. One Claude + one Codex
+    # verifier gives every default coder (Claude + Codex) an opposite-vendor
+    # acceptance checker — the adversarial signal — and lands the default swarm
+    # at exactly 10 Band seats (the free-tier cap). The iff-configured coupling
+    # in ``state/registration.py`` makes ``verify_acceptance`` a required,
+    # SHA-pinned merge verdict for this default; a user who sets both counts to
+    # 0 opts back out (merges straight from ``review_passed``, no acceptance).
     return VerifiersConfig(
-        claude_sdk=PoolEntry(count=0, model="claude-opus-4-7"),
-        codex=PoolEntry(count=0, model="gpt-5.4"),
+        claude_sdk=PoolEntry(count=1, model="claude-opus-4-7"),
+        codex=PoolEntry(count=1, model="gpt-5.4"),
     )
 
 
@@ -583,7 +583,7 @@ def load_agent_config(project_dir: Path | None = None) -> AgentConfigFile:
     return AgentConfigFile.from_yaml(config_path)
 
 
-_SCALABLE_POOLS = {"planners", "plan_reviewers", "coders", "reviewers"}
+_SCALABLE_POOLS = {"planners", "plan_reviewers", "coders", "reviewers", "verifiers"}
 
 
 def scale_pool(
@@ -591,9 +591,9 @@ def scale_pool(
 ) -> CodebandConfig:
     """Set the capacity of a (pool, framework) entry in an existing config.
 
-    `pool` must be one of "planners" / "plan_reviewers" / "coders" / "reviewers".
-    Preserves model/restart settings on the pool entry. Saves the updated
-    config back to disk and returns it.
+    `pool` must be one of "planners" / "plan_reviewers" / "coders" /
+    "reviewers" / "verifiers". Preserves model/restart settings on the pool
+    entry. Saves the updated config back to disk and returns it.
     """
     if count < 0:
         raise ValueError("count must be >= 0")

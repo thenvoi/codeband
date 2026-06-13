@@ -49,6 +49,7 @@ class WorkspaceLayout:
     plan_reviewer_worktrees: dict[str, Path] = field(default_factory=dict)
     coder_worktrees: dict[str, Path] = field(default_factory=dict)
     reviewer_scratch: dict[str, Path] = field(default_factory=dict)
+    verifier_scratch: dict[str, Path] = field(default_factory=dict)
 
     # Single-instance coordinator
     mergemaster_worktree: Path | None = None
@@ -99,6 +100,8 @@ def resolve_layout(config: CodebandConfig) -> WorkspaceLayout:
         layout.coder_worktrees[str(wid)] = worktrees_dir / str(wid)
     for wid in _iter_pool_worker_ids(WorkerRole.REVIEWER, agents.reviewers):
         layout.reviewer_scratch[str(wid)] = root / "scratch" / str(wid)
+    for wid in _iter_pool_worker_ids(WorkerRole.VERIFIER, agents.verifiers):
+        layout.verifier_scratch[str(wid)] = root / "scratch" / str(wid)
 
     return layout
 
@@ -186,8 +189,11 @@ def initialize_workspace(config: CodebandConfig) -> WorkspaceLayout:
         )
         pin_gh_default_repo(wt_path, config.repo.url)
 
-    # Reviewer scratch directories — no repo, just a workspace for gh calls
+    # Reviewer + verifier scratch directories — no repo, just a workspace for
+    # gh calls (the Verifier's acceptance gate uses gh exactly like review).
     for scratch_path in layout.reviewer_scratch.values():
+        scratch_path.mkdir(parents=True, exist_ok=True)
+    for scratch_path in layout.verifier_scratch.values():
         scratch_path.mkdir(parents=True, exist_ok=True)
 
     # Mergemaster worktree on main branch — ff-only refreshed at session
@@ -213,6 +219,8 @@ def initialize_workspace(config: CodebandConfig) -> WorkspaceLayout:
         write_claude_settings(wt_path, profile="plan_reviewer")
     for scratch_path in layout.reviewer_scratch.values():
         write_claude_settings(scratch_path, profile="coding")
+    for scratch_path in layout.verifier_scratch.values():
+        write_claude_settings(scratch_path, profile="coding")
     if layout.mergemaster_worktree is not None:
         write_claude_settings(layout.mergemaster_worktree, profile="coding")
 
@@ -228,6 +236,7 @@ class AgentWorkspaceLayout:
     bare_repo: Path
     worktree: Path | None
     reviewer_workspace: Path | None
+    verifier_workspace: Path | None
     state_dir: Path
     notes_dir: Path | None
 
@@ -245,7 +254,7 @@ def initialize_agent_workspace(
     `worker_id` is the full `{role}-{framework}-{index}` string for
     pool workers, or the plain role name ("conductor", "mergemaster")
     for singletons. `agent_role` is one of: planner, plan_reviewer,
-    coder, reviewer, conductor, mergemaster, watchdog.
+    coder, reviewer, verifier, conductor, mergemaster, watchdog.
 
     Each agent gets its own independent clone and worktree — no shared
     volumes required.
@@ -259,6 +268,7 @@ def initialize_agent_workspace(
     notes_dir: Path | None = None
     worktree: Path | None = None
     reviewer_workspace: Path | None = None
+    verifier_workspace: Path | None = None
 
     if agent_role == "planner":
         clone_bare(config.repo.url, bare_repo)
@@ -284,6 +294,9 @@ def initialize_agent_workspace(
     elif agent_role == "reviewer":
         reviewer_workspace = root / "scratch" / worker_id
         reviewer_workspace.mkdir(parents=True, exist_ok=True)
+    elif agent_role == "verifier":
+        verifier_workspace = root / "scratch" / worker_id
+        verifier_workspace.mkdir(parents=True, exist_ok=True)
     elif agent_role == "coder":
         clone_bare(config.repo.url, bare_repo)
         prefix = config.workspace.worktree_prefix
@@ -307,6 +320,8 @@ def initialize_agent_workspace(
             write_claude_settings(worktree, profile=profile)
     if reviewer_workspace:
         write_claude_settings(reviewer_workspace, profile="coding")
+    if verifier_workspace:
+        write_claude_settings(verifier_workspace, profile="coding")
 
     logger.info("Agent workspace initialized for %s at %s", worker_id, root)
     return AgentWorkspaceLayout(
@@ -314,6 +329,7 @@ def initialize_agent_workspace(
         bare_repo=bare_repo,
         worktree=worktree,
         reviewer_workspace=reviewer_workspace,
+        verifier_workspace=verifier_workspace,
         state_dir=state_dir,
         notes_dir=notes_dir,
     )

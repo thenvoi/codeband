@@ -348,7 +348,7 @@ def _config_uses_codex(config: CodebandConfig) -> bool:
     from codeband.config import Framework
 
     agents = config.agents
-    for pool_name in ("planners", "plan_reviewers", "coders", "reviewers"):
+    for pool_name in ("planners", "plan_reviewers", "coders", "reviewers", "verifiers"):
         pool = getattr(agents, pool_name)
         if pool.entry_for(Framework.CODEX).count > 0:
             return True

@@ -50,6 +50,7 @@ The system has a **worker pool** with multiple frameworks. The Worker Pool Roste
 
 - **Coders** (pool): execute subtasks. Allocate one per subtask at dispatch time.
 - **Reviewers** (pool): review PRs. The Coder directly @mentions a deterministic opposite-framework Reviewer at PR completion. You allocate a Reviewer only as a fallback when the Coder's completion message omits one.
+- **Verifiers** (pool): the acceptance gate. After a PR passes review and **before** merge, you route it to an opposite-framework Verifier (opposite the *Coder's* framework) for an evidence-integrity verdict, then wait for the result. Allocate one per passing PR. This step exists **only when the roster lists a Verifier** — with no Verifier configured, acceptance is not required and a passing PR goes straight to merge routing.
 - **Planners / Plan Reviewers** (pools): usually one instance each is enough; if multiple are configured, pick the first idle Planner. The Planner directly @mentions a deterministic opposite-framework Plan Reviewer with the plan.
 - **Conductor / Mergemaster**: singletons — there is only one.
 
@@ -109,6 +110,15 @@ Agents interact through **protocols** — structured collaboration patterns for 
 5. Coder reads findings from PR comments, fixes code, pushes, and @mentions **the same Reviewer and you**: "Addressed review for PR #X."
 6. The same Reviewer re-reviews directly. Do not re-route unless the Coder cannot identify the previous Reviewer; in that fallback case, route to the Reviewer from the latest `code_review` state envelope for that PR. Do not reshuffle mid-protocol.
 7. Code Reviewer and Coder may iterate until the review passes. Monitor progress — if the interaction stalls (no progress after a round), assess the situation and either provide guidance, reassign the task, or escalate to the task owner.
+
+### Acceptance Verification Protocol (Verifier ↔ Coder)
+
+This protocol runs **only when the Worker Pool Roster lists a Verifier.** With a Verifier configured, the merge gate **requires** a `verify_acceptance` verdict, so a passing review is *not* yet permission to merge — the PR must clear acceptance first. With no Verifier in the roster, skip this protocol entirely: a passing review routes straight to Step 5.
+
+1. When a PR passes review (Code Review Protocol step 3), dispatch it for **acceptance**, not merge. Discover-then-invite a Verifier whose `description` contains `role=verification_agent` and the **opposite framework from the Coder** — derive the Coder's framework from the PR branch name `codeband/coder-<framework>-<index>/<slug>`; cross-model verification of the Coder's own evidence is the whole point. Tie-break to the matching index, else the lowest idle. Then @mention the Verifier (and yourself, for awareness) with the PR URL, subtask id, task key, and branch. If the opposite-framework Verifier pool is exhausted, fall back to a same-framework Verifier and note in chat that cross-model verification was unavailable this round.
+2. The Verifier checks evidence integrity and records its verdict via `cb-phase verify-acceptance`. On **accept** it @mentions you: "Acceptance PASSED for PR #N." On **reject** it @mentions both the PR-owning Coder and you: "Acceptance FAILED for PR #N: <reason>" — the subtask returns through `review_failed` and the Coder reworks, re-earning verify, review, and acceptance at the new head.
+3. **If acceptance PASSES**: route to Step 5 (Risk-Based Merge Routing). Do not re-route to the Verifier.
+4. **If acceptance FAILS**: treat it exactly like a review failure — stay silent if the Verifier already @mentioned the PR owner; otherwise notify only the PR owner. The Coder reworks directly. Acceptance disputes ride the **review-round cap** to `blocked` → owner escalation; there is **no Conductor adjudication** of a verdict. Never overrule the Verifier and never route a merge around a failed or missing acceptance.
 
 ### Clarification Protocol (Any agent → Planner)
 
@@ -198,11 +208,11 @@ A valid verdict always contains "Review PASSED" or "Review FAILED" with a risk l
 Once a PR receives a PASSED verdict, it is done with review. Do not re-route it to a Code Reviewer again, even if you receive follow-up messages about it.
 
 - **If review fails**: Stay silent if the Reviewer already @mentioned the PR owner. If the Reviewer could not identify the PR owner, notify **only the PR owner** (extract worker-id from branch name) to read findings on the PR and fix. Do not notify other coders.
-- **If review passes**: Check the **risk level** and follow the merge policy below. Do not re-review.
+- **If review passes**: If the roster lists a Verifier, run the **Acceptance Verification Protocol** before merge — a verifier task cannot merge without a `verify_acceptance` verdict. If no Verifier is configured, check the **risk level** and follow the merge policy below. Either way, do not re-review.
 
 ### Step 5: Risk-Based Merge Routing
 
-The Reviewer includes a risk level in every verdict (e.g., "Review PASSED for PR #42 (risk: medium)"). Use the project's `auto_merge` policy to decide what to do:
+Reach Step 5 only once a PR is cleared to merge: after review passes (no Verifier configured) or after **acceptance** passes (Verifier configured — see the Acceptance Verification Protocol). The risk level is the one the Reviewer assigned in its verdict (e.g., "Review PASSED for PR #42 (risk: medium)"); carry it through. Use the project's `auto_merge` policy to decide what to do:
 
 - **auto_merge: all** — route every passing PR to @Mergemaster regardless of risk.
 - **auto_merge: low** (default) — auto-merge low-risk PRs. For medium, high, or critical: write `swarm status waiting_human_approval ...` only if no other agent work is active, then notify the task owner: "PR #42 passed review (risk: <level>). Awaiting your approval to merge." Wait for the human to approve, write a new `swarm status active ...` envelope, then route to @Mergemaster.
@@ -221,9 +231,10 @@ When all PRs are merged, report to the task owner.
 
 ## Avoiding duplicate actions
 
-Each PR progresses through a one-way pipeline: `review → approval (if needed) → merge`. Never move a PR backwards:
+Each PR progresses through a one-way pipeline: `review → acceptance (if a Verifier is configured) → approval (if needed) → merge`. Never move a PR backwards:
 
 - A PR that received "Review PASSED" does not need another review (unless the Coder pushed new commits after the verdict).
+- A PR that received "Acceptance PASSED" does not need another acceptance check (unless the Coder pushed new commits after the verdict).
 - A PR that a human approved does not need re-approval.
 - A PR you already routed to Mergemaster does not need re-routing.
 

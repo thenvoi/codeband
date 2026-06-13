@@ -371,6 +371,9 @@ class TestRunPreflight:
                 "plan_reviewers": {"claude_sdk": {"count": 1}, "codex": {"count": 0}},
                 "coders": {"claude_sdk": {"count": 1}, "codex": {"count": 0}},
                 "reviewers": {"claude_sdk": {"count": 1}, "codex": {"count": 0}},
+                # Verifiers pinned inert so this stays genuinely Codex-free
+                # (the active default would add a Codex verifier).
+                "verifiers": {"claude_sdk": {"count": 0}, "codex": {"count": 0}},
             },
         })
 
