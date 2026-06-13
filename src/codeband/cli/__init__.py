@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -174,10 +175,12 @@ def _has_codex_subscription_auth() -> bool:
     if not auth_file.is_file():
         return False
     try:
-        content = auth_file.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        data = json.loads(auth_file.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
         return False
-    return '"auth_mode": "ChatGPT"' in content
+    if not isinstance(data, dict):
+        return False
+    return str(data.get("auth_mode", "")).lower() == "chatgpt"
 
 
 def _resolve_codex_auth() -> None:

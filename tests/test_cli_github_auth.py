@@ -129,7 +129,7 @@ class TestResolveCodexAuth:
         codex_home = tmp_path / ".codex"
         codex_home.mkdir()
         (codex_home / "auth.json").write_text(
-            '{"auth_mode": "ChatGPT", "tokens": {}}',
+            '{"auth_mode": "chatgpt", "tokens": {}}',
             encoding="utf-8",
         )
         monkeypatch.setenv("CODEX_HOME", str(codex_home))
@@ -157,16 +157,80 @@ class TestResolveCodexAuth:
         assert os.environ["OPENAI_API_KEY"] == "sk-test"
         assert "CODEBAND_FALLBACK_OPENAI_API_KEY" not in os.environ
 
-    def test_detects_codex_subscription_auth(self, monkeypatch, tmp_path):
+    def test_detects_codex_subscription_auth_lowercase(self, monkeypatch, tmp_path):
+        # The real Codex CLI writes lowercase "chatgpt" — this is the load-bearing case.
         codex_home = tmp_path / ".codex"
         codex_home.mkdir()
         (codex_home / "auth.json").write_text(
-            '{"auth_mode": "ChatGPT"}',
+            '{"auth_mode": "chatgpt"}',
             encoding="utf-8",
         )
         monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
         assert _has_codex_subscription_auth() is True
+
+    def test_detects_codex_subscription_auth_mixed_case(self, monkeypatch, tmp_path):
+        # Robustness: accept any capitalisation variation.
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        for variant in ("ChatGPT", "CHATGPT"):
+            (codex_home / "auth.json").write_text(
+                f'{{"auth_mode": "{variant}"}}',
+                encoding="utf-8",
+            )
+            assert _has_codex_subscription_auth() is True
+
+    def test_apikey_auth_mode_does_not_match(self, monkeypatch, tmp_path):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text(
+            '{"auth_mode": "apikey"}',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        assert _has_codex_subscription_auth() is False
+
+    def test_missing_auth_json_returns_false(self, monkeypatch, tmp_path):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        assert _has_codex_subscription_auth() is False
+
+    def test_malformed_json_returns_false(self, monkeypatch, tmp_path):
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text("not json {{", encoding="utf-8")
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        assert _has_codex_subscription_auth() is False
+
+    def test_json_array_root_returns_false(self, monkeypatch, tmp_path):
+        # JSON is valid but not a dict — should not match.
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text('["chatgpt"]', encoding="utf-8")
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        assert _has_codex_subscription_auth() is False
+
+    def test_integration_resolve_codex_auth_lowercase(self, monkeypatch, tmp_path):
+        # Integration: OPENAI_API_KEY must be stripped when auth.json has lowercase "chatgpt".
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text(
+            '{"auth_mode": "chatgpt", "tokens": {}}',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.delenv("CODEBAND_FALLBACK_OPENAI_API_KEY", raising=False)
+
+        _resolve_codex_auth()
+
+        assert "OPENAI_API_KEY" not in os.environ
+        assert os.environ["CODEBAND_FALLBACK_OPENAI_API_KEY"] == "sk-test"
 
 
 class TestHasClaudeSubscriptionOAuth:
