@@ -593,6 +593,26 @@ class TestAgentWorkspaceInit:
         assert (layout.reviewer_workspace / ".claude" / "settings.json").exists()
         assert layout.notes_dir is None
 
+    def test_verifier_workspace(self, source_repo: Path, tmp_path: Path):
+        """Verifier gets isolated scratch space but no repo clone — a clean
+        mirror of the code reviewer (gh-only, repo-less)."""
+        from codeband.config import CodebandConfig, RepoConfig, WorkspaceConfig
+
+        ws_root = tmp_path / "workspace"
+        config = CodebandConfig(
+            repo=RepoConfig(url=str(source_repo), branch="main"),
+            workspace=WorkspaceConfig(path=str(ws_root)),
+        )
+        layout = initialize_agent_workspace(config, "verifier-codex-0", "verifier")
+
+        assert not layout.bare_repo.exists()
+        assert layout.worktree is None
+        assert layout.verifier_workspace is not None
+        assert layout.verifier_workspace.exists()
+        assert (layout.verifier_workspace / ".claude" / "settings.json").exists()
+        assert layout.reviewer_workspace is None
+        assert layout.notes_dir is None
+
     def test_mergemaster_workspace(self, source_repo: Path, tmp_path: Path):
         """Mergemaster gets a worktree on the main branch."""
         from codeband.config import CodebandConfig, RepoConfig, WorkspaceConfig
@@ -758,6 +778,35 @@ class TestResolveLayout:
         assert layout.mergemaster_worktree is not None
         assert layout.notes_dir.name == "notes"
         assert layout.state_dir.name == "state"
+        # sample_config pins verifiers inert → no verifier scratch slots.
+        assert layout.verifier_scratch == {}
+
+    def test_layout_includes_verifier_scratch_when_active(self, tmp_path: Path):
+        """An active verifier pool gets scratch dirs keyed by worker id —
+        mirroring the reviewer scratch layout."""
+        from codeband.config import (
+            AgentsConfig,
+            CodebandConfig,
+            PoolEntry,
+            RepoConfig,
+            VerifiersConfig,
+            WorkspaceConfig,
+        )
+
+        config = CodebandConfig(
+            repo=RepoConfig(url="https://github.com/example/repo.git", branch="main"),
+            agents=AgentsConfig(
+                verifiers=VerifiersConfig(
+                    claude_sdk=PoolEntry(count=1), codex=PoolEntry(count=1),
+                ),
+            ),
+            workspace=WorkspaceConfig(path=str(tmp_path / "workspace")),
+        )
+        layout = resolve_layout(config)
+        assert "verifier-claude_sdk-0" in layout.verifier_scratch
+        assert "verifier-codex-0" in layout.verifier_scratch
+        # Scratch lives under the shared scratch dir, like the reviewer's.
+        assert layout.verifier_scratch["verifier-codex-0"].parent.name == "scratch"
 
     def test_all_worktrees_includes_mergemaster(self, sample_config):
         """all_worktrees dict includes coders, planners, and mergemaster."""

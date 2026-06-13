@@ -3,8 +3,9 @@
 The activation of the Verifier seat: the ``cb-phase verify-acceptance`` leg, the
 ``verify_acceptance`` merge verdict, the broken-chain interlock, the
 claim-vs-store audit, the role gate, and the registration coupling that makes
-acceptance required exactly when a verifier is configured. The seat is INERT by
-default (count=0), so these tests configure a verifier explicitly.
+acceptance required exactly when a verifier is configured. These tests configure
+the verifier pool explicitly (active or inert) so each path is self-contained
+and independent of the product default.
 
 Deterministic throughout — real SQLite, real FSM, no network. The ``cb-phase``
 leg tests monkeypatch only the store/task/PR-head resolvers, exactly like the
@@ -19,7 +20,12 @@ import pytest
 
 from codeband.cli import handoff
 from codeband.config import AgentsConfig, Framework, PoolEntry, VerifiersConfig
-from codeband.state.fsm import check_merge_eligibility, transition
+from codeband.state.fsm import (
+    MAX_REVIEW_ROUNDS,
+    InvalidTransitionError,
+    check_merge_eligibility,
+    transition,
+)
 from codeband.state.registration import register_task, resolve_required_verdicts
 from codeband.state.store import StateStore
 from codeband.workers import WorkerPool, WorkerRole
@@ -31,10 +37,9 @@ from codeband.workers import WorkerPool, WorkerRole
 def _verifier_agents(**overrides) -> AgentsConfig:
     """AgentsConfig with an executable verify leg and an active verifier.
 
-    The verifier seat is INERT by default (count=0), so the acceptance gate is
-    exercised by configuring a verifier explicitly here rather than relying on
-    the default. Callers can override ``verifiers`` to drive the no-verifier
-    paths.
+    Pins the verifier pool explicitly (1 per vendor) so the acceptance gate is
+    exercised independently of the product default. Callers can override
+    ``verifiers`` to drive the no-verifier / single-vendor paths.
     """
     overrides.setdefault("handoff_verify_command", "true")
     overrides.setdefault(
@@ -358,3 +363,82 @@ def test_single_vendor_degrades_with_doctor_warn_not_failure(tmp_path):
         )
     )
     assert "verify_acceptance" in resolved
+
+
+# ─── end-to-end producer path: review_passed → verifier → acceptance → merge ──
+
+
+def test_acceptance_passed_to_merge_pending_edge_exists():
+    """The FSM edge acceptance_passed → merge_pending is defined for the
+    Mergemaster (the lane an accepted verifier task takes to merge), and the
+    review_passed → merge_pending edge remains intact as the no-verifier bypass.
+    """
+    from codeband.state.fsm import VALID_TRANSITIONS
+
+    assert "merge_pending" in VALID_TRANSITIONS[("acceptance_passed", "mergemaster")]
+    assert "merge_pending" in VALID_TRANSITIONS[("review_passed", "mergemaster")]
+
+
+def test_e2e_accept_path_review_passed_to_merge_pending(store, monkeypatch):
+    """Full producer path: a review_passed subtask is picked up by an
+    opposite-vendor verifier, the verifier accepts, and the now-acceptance_passed
+    subtask clears the merge gate into merge_pending (and on to merged). An
+    accepted task does NOT gate-stall under the active default — verify, review,
+    and verify_acceptance are all pinned to the same head.
+    """
+    # An opposite-vendor (Codex) verifier is acquired for the Claude coder.
+    pool = _pool(claude=1, codex=1)
+    vid = pool.acquire_verifier_for(Framework.CLAUDE_SDK)
+    assert vid is not None and vid.framework == Framework.CODEX
+
+    # That verifier renders --accept through the leg → acceptance_passed.
+    monkeypatch.setenv("CODEBAND_ROLE", "verifier")
+    assert _run_acceptance(monkeypatch, store, "--accept") == 0
+    assert store.get_subtask("st-1", "room-1").state == "acceptance_passed"
+
+    # The Mergemaster queues it: acceptance_passed → merge_pending passes the
+    # gate (all three verdicts pinned to sha-1) rather than stalling.
+    transition(
+        "st-1", "room-1", "merge_pending",
+        caller_role="mergemaster", store=store, head_sha="sha-1",
+    )
+    assert store.get_subtask("st-1", "room-1").state == "merge_pending"
+
+    # And it lands.
+    transition(
+        "st-1", "room-1", "merged",
+        caller_role="mergemaster", store=store, head_sha="sha-1",
+    )
+    assert store.get_subtask("st-1", "room-1").state == "merged"
+
+
+def test_e2e_reject_rides_review_round_cap_to_blocked(store, monkeypatch):
+    """Acceptance --reject reuses the review-round counter + cap: repeated
+    rejects bounce the subtask back through review_failed until the cap forces
+    blocked — no new dispute mechanism, no Conductor adjudication.
+    """
+    monkeypatch.setenv("CODEBAND_ROLE", "verifier")
+    for round_n in range(1, MAX_REVIEW_ROUNDS + 1):
+        # Rests at review_passed (the fixture for round 1; re-earned below).
+        assert store.get_subtask("st-1", "room-1").state == "review_passed"
+        assert _run_acceptance(monkeypatch, store, "--reject") == 0
+        sub = store.get_subtask("st-1", "room-1")
+        assert sub.state == "review_failed"
+        assert sub.review_round == round_n  # each reject is one review round
+        if round_n < MAX_REVIEW_ROUNDS:
+            # Coder reworks and re-earns verify + review at the head.
+            for ns, role, sha in [
+                ("in_progress", "coder", None),
+                ("verify_pending", "coder", None),
+                ("review_pending", "coder", "sha-1"),
+                ("review_passed", "reviewer", "sha-1"),
+            ]:
+                transition(
+                    "st-1", "room-1", ns, caller_role=role, store=store, head_sha=sha,
+                )
+
+    # At the cap, another rework is illegal — blocked is the only legal escape.
+    with pytest.raises(InvalidTransitionError):
+        transition("st-1", "room-1", "in_progress", caller_role="coder", store=store)
+    transition("st-1", "room-1", "blocked", caller_role="coder", store=store)
+    assert store.get_subtask("st-1", "room-1").state == "blocked"

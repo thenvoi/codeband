@@ -20,6 +20,7 @@ from codeband.config import (
     PoolEntry,
     RepoConfig,
     ReviewersConfig,
+    VerifiersConfig,
     WorkspaceConfig,
     load_config,
     scale_pool,
@@ -265,10 +266,11 @@ class TestReviewersConfig:
 class TestTotalAgentCount:
     """Tests for AgentsConfig.total_agent_count — drives tier-cap warnings."""
 
-    def test_default_is_eight(self):
-        """Default cross-model config uses exactly 8 agents (fits free-tier 10 cap)."""
+    def test_default_is_ten(self):
+        """Default cross-model config uses exactly 10 agents (the free-tier cap):
+        the 8 coordination/coder/reviewer seats plus a verifier per vendor."""
         config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
-        assert config.agents.total_agent_count() == 8
+        assert config.agents.total_agent_count() == 10
 
     def test_scales_with_pool_counts(self):
         agents = AgentsConfig(
@@ -281,8 +283,9 @@ class TestTotalAgentCount:
                 codex=PoolEntry(count=2),
             ),
         )
-        # 2 singletons + 1 Claude planner + 1 Codex plan-reviewer + 6 coders + 4 reviewers
-        assert agents.total_agent_count() == 2 + 1 + 1 + 6 + 4
+        # 2 singletons + 1 Claude planner + 1 Codex plan-reviewer + 6 coders
+        # + 4 reviewers + 2 default verifiers (one per vendor)
+        assert agents.total_agent_count() == 2 + 1 + 1 + 6 + 4 + 2
 
     def test_zero_count_reduces_total(self):
         agents = AgentsConfig(
@@ -298,9 +301,13 @@ class TestTotalAgentCount:
                 claude_sdk=PoolEntry(count=1),
                 codex=PoolEntry(count=0),
             ),
+            verifiers=VerifiersConfig(
+                claude_sdk=PoolEntry(count=1),
+                codex=PoolEntry(count=0),
+            ),
         )
-        # 2 singletons + 1 planner + 1 plan_reviewer + 1 coder + 1 reviewer
-        assert agents.total_agent_count() == 6
+        # 2 singletons + 1 planner + 1 plan_reviewer + 1 coder + 1 reviewer + 1 verifier
+        assert agents.total_agent_count() == 7
 
 
 class TestScalePool:
@@ -327,6 +334,16 @@ class TestScalePool:
         updated = scale_pool(path, "coders", Framework.CODEX, 0)
         assert updated.agents.coders.codex.count == 0
         assert updated.agents.coders.active_frameworks() == [Framework.CLAUDE_SDK]
+
+    def test_scale_verifiers_opts_out_of_codex(self, tmp_path: Path):
+        """Verifiers are a first-class scalable pool — `cb scale verifiers.codex=0`
+        opts the default Codex verifier out, dropping acceptance to single-vendor."""
+        path = self._fresh(tmp_path)
+        updated = scale_pool(path, "verifiers", Framework.CODEX, 0)
+        assert updated.agents.verifiers.codex.count == 0
+        assert updated.agents.verifiers.active_frameworks() == [Framework.CLAUDE_SDK]
+        reloaded = CodebandConfig.from_yaml(path)
+        assert reloaded.agents.verifiers.codex.count == 0
 
     def test_preserves_model(self, tmp_path: Path):
         """Scaling keeps the existing entry's model setting."""
