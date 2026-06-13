@@ -18,7 +18,7 @@ import pytest
 from click.testing import CliRunner
 
 from codeband.cli import cli as cb_cli
-from codeband.config import AgentsConfig
+from codeband.config import AgentsConfig, PoolEntry, VerifiersConfig
 from codeband.state import StateStore
 from codeband.state.registration import register_task
 
@@ -30,7 +30,16 @@ def _gated_agents(**overrides) -> AgentsConfig:
     requires ``handoff_verify_command`` — fresh-install registration now fails
     loudly without one (that change is the point). Tests that just exercise
     the registration mechanics use this config so they pass the verdict gate.
+
+    Verifiers are explicitly disabled here so these mechanics tests stay scoped
+    to the ``verify`` / ``review`` pair; the on-by-default ``verify_acceptance``
+    coupling (active verifier → required acceptance verdict) has its own tests
+    in ``test_verifier_acceptance.py``. Callers can re-enable via overrides.
     """
+    overrides.setdefault(
+        "verifiers",
+        VerifiersConfig(claude_sdk=PoolEntry(count=0), codex=PoolEntry(count=0)),
+    )
     return AgentsConfig(handoff_verify_command="true", **overrides)
 
 

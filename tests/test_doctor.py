@@ -18,6 +18,7 @@ from codeband.config import (
     PoolEntry,
     RepoConfig,
     ReviewersConfig,
+    VerifiersConfig,
     WorkspaceConfig,
 )
 from codeband.doctor import (
@@ -75,6 +76,12 @@ def _make_config(tmp_path: Path, *, use_codex: bool = False) -> CodebandConfig:
             reviewers=ReviewersConfig(claude_sdk=PoolEntry(count=1)),
             plan_reviewers=PlanReviewersConfig(claude_sdk=PoolEntry(count=1)),
             planners=FrameworkPool(claude_sdk=PoolEntry(count=1)),
+            # Verifiers off here so the shared doctor config stays scoped to its
+            # explicit agent set; the verifier seat has dedicated doctor tests
+            # in test_verifier.py.
+            verifiers=VerifiersConfig(
+                claude_sdk=PoolEntry(count=0), codex=PoolEntry(count=0)
+            ),
         ),
     )
 

@@ -52,14 +52,24 @@ ROOM_POINTER_NAME = ".codeband_room"
 # The verdict legs registration understands. Anything else in
 # ``agents.required_verdicts`` is a typo and fails registration loudly —
 # a misspelled verdict must never silently become an ungated merge.
-KNOWN_VERDICTS: frozenset[str] = frozenset({"verify", "review"})
+# ``verify_acceptance`` is the Verifier's evidence-integrity gate
+# (``cb-phase verify-acceptance``, verifier-role) — recorded as the
+# ``acceptance_passed`` transition and checked by the merge-eligibility gate
+# exactly like ``verify`` / ``review``.
+KNOWN_VERDICTS: frozenset[str] = frozenset({"verify", "review", "verify_acceptance"})
 
 # What an absent / default ``agents.merge_approval`` resolves to: the task
 # owner approves every merge. Snapshotted onto the tasks row like
 # ``required_verdicts``.
 DEFAULT_MERGE_APPROVAL = "owner"
 
-# What an absent ``agents.required_verdicts`` key resolves to: both legs.
+# What an absent ``agents.required_verdicts`` key resolves to: the verify +
+# review pair, PLUS ``verify_acceptance`` whenever a verifier is configured
+# (resolved per-config in :func:`resolve_required_verdicts`). This base tuple
+# is also the NULL-snapshot fallback the merge-eligibility gate uses for tasks
+# registered before snapshots existed (state/fsm.py) — those predate verifiers
+# and must never retroactively require acceptance, so the verifier coupling
+# lives only in the resolver, not in this constant.
 DEFAULT_REQUIRED_VERDICTS: tuple[str, ...] = ("verify", "review")
 
 
@@ -81,7 +91,12 @@ def resolve_required_verdicts(agents: AgentsConfig) -> list[str]:
     Resolution happens at *registration* time — the result is snapshotted onto
     the tasks row so later config edits cannot change an in-flight task:
 
-    * key absent (``None``) → the default ``["verify", "review"]``
+    * key absent (``None``) → the default ``["verify", "review"]``, PLUS
+      ``"verify_acceptance"`` whenever a verifier is configured
+      (``agents.verifiers.total_count() > 0``). This is the coupling that makes
+      acceptance on-by-default exactly when there is a verifier to produce the
+      verdict — and a no-op for verifier-less configs, so activation never
+      fail-louds an existing one.
     * present and non-empty → taken verbatim
     * explicitly ``[]`` → :class:`ValueError`, unless
       ``agents.allow_ungated_merge`` is also set (the deliberately ugly
@@ -94,6 +109,14 @@ def resolve_required_verdicts(agents: AgentsConfig) -> list[str]:
     * ``verify`` requires ``agents.handoff_verify_command`` to be set; this
       intentionally turns a fresh install's silent verify-skip into a loud
       fail-at-seed
+    * ``verify_acceptance`` requires at least one configured verifier
+      (``agents.verifiers.total_count() > 0``) — otherwise nothing could ever
+      run ``cb-phase verify-acceptance`` and every merge would dead-end on a
+      verdict that can never be produced. The default path can never trip this
+      (it only adds ``verify_acceptance`` when verifiers exist); only an
+      *explicit* ``verify_acceptance`` against a verifier-less pool does, and
+      that is a config error worth failing loud — the verifier-less /
+      single-vendor *degradation* path is the doctor's WARN, never a hard fail.
     * ``review`` has no precondition
 
     Raises :class:`ValueError` with an actionable message; returns the
@@ -102,6 +125,8 @@ def resolve_required_verdicts(agents: AgentsConfig) -> list[str]:
     configured = agents.required_verdicts
     if configured is None:
         resolved = list(DEFAULT_REQUIRED_VERDICTS)
+        if agents.verifiers.total_count() > 0:
+            resolved.append("verify_acceptance")
     elif not configured:
         if not agents.allow_ungated_merge:
             raise ValueError(
@@ -130,6 +155,19 @@ def resolve_required_verdicts(agents: AgentsConfig) -> list[str]:
             "be unexecutable. Set your test command (agents."
             "handoff_verify_command in codeband.yaml) or remove 'verify' "
             "from required_verdicts."
+        )
+
+    if "verify_acceptance" in resolved and agents.verifiers.total_count() == 0:
+        raise ValueError(
+            "register_task: agents.required_verdicts includes "
+            "'verify_acceptance' but no verifier is configured "
+            "(agents.verifiers.{claude_sdk,codex}.count are all 0) — nothing "
+            "could ever run `cb-phase verify-acceptance`, so every merge would "
+            "dead-end on a verdict that can never be produced. Enable a "
+            "verifier (e.g. verifiers.codex: {count: 1}) or remove "
+            "'verify_acceptance' from required_verdicts. A single-vendor "
+            "verifier is fine — it degrades to same-vendor checking (cb doctor "
+            "warns), it does not fail."
         )
 
     return resolved

@@ -202,6 +202,15 @@ EXIT_WRONG_PR = 16
 # Trivially bypassable (a process can unset the env var) — NOT authentication.
 # Unset role (the human-operator path) is always allowed.
 EXIT_ROLE_MISMATCH = 18
+# verify-acceptance broken-chain interlock: the ``transition_log`` hash chain
+# does not verify, so the ledger this verdict would attest is compromised. The
+# acceptance verdict is NOT issued (nothing written) — a passing verdict over a
+# tampered log would launder the very evidence it claims to vouch for.
+EXIT_CHAIN_BROKEN = 19
+# verify-acceptance claim-vs-store audit: the agent's claimed terminal state
+# diverges from the store's FSM state + grants for this subtask. The acceptance
+# verdict is NOT issued — acceptance must never rubber-stamp a false claim.
+EXIT_CLAIM_MISMATCH = 20
 
 # Per-subcommand allowed roles for the accident-guard role gate (Stage-3). The
 # role string is ``$CODEBAND_ROLE`` as exported by the runner's spawn seam
@@ -210,6 +219,7 @@ _ROLE_ALLOWED: dict[str, frozenset[str]] = {
     "start": frozenset({"conductor", "coder"}),
     "verify": frozenset({"coder"}),
     "review": frozenset({"reviewer"}),
+    "verify-acceptance": frozenset({"verifier"}),
     "merge": frozenset({"mergemaster"}),
     "abandon": frozenset({"conductor"}),
     "resume": frozenset({"conductor"}),
@@ -1101,6 +1111,174 @@ def _cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _transition_chain_intact(store: StateStore):
+    """Verify the ``transition_log`` hash chain; return its ``ChainVerifyResult``.
+
+    The broken-chain interlock for ``cb-phase verify-acceptance``: before the
+    Verifier issues a *passing* acceptance verdict, the ledger that verdict
+    attests must itself be intact. ``transition_log`` is a single GLOBAL hash
+    chain (every row links to the previous by ``prev_hash``), so this task's
+    segment cannot be verified in isolation — a full walk is the bounded,
+    deterministic way to confirm it, and a break ANYWHERE means the ledger is
+    compromised and no acceptance verdict should rest on it. Read-only; reuses
+    the same :func:`~codeband.state.store.verify_chain` the ``cb verify-log``
+    command and the watchdog use, over :data:`TRANSITION_HASH_COLS`.
+    """
+    import sqlite3
+
+    from codeband.state import TRANSITION_HASH_COLS, verify_chain
+
+    conn = sqlite3.connect(store.db_path, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        return verify_chain(conn, "transition_log", TRANSITION_HASH_COLS)
+    finally:
+        conn.close()
+
+
+def _claim_vs_store_finding(subtask, claim: str | None) -> str | None:
+    """Return a divergence finding when ``--claim`` disagrees with the store.
+
+    The per-task claim-vs-store audit: the Verifier asserts the terminal state
+    an agent CLAIMED (in chat) for this subtask via ``--claim``; this confirms
+    it against the durable FSM state + grants, which are authoritative. A
+    divergence is a finding — acceptance must never pass on a false claim.
+
+    * no ``--claim`` → nothing to audit (``None``);
+    * ``--claim approved`` is not an FSM state — it asserts a SHA-pinned merge
+      grant exists (``merge_approved_sha``); absent → finding;
+    * any other ``--claim`` names an FSM state and must equal the subtask's
+      stored ``state``; otherwise → finding.
+
+    Deterministic and cheap (the single subtask row already in hand), scoped to
+    THIS subtask only.
+    """
+    if claim is None:
+        return None
+    actual = subtask.state if subtask is not None else "planned"
+    if claim == "approved":
+        if subtask is None or subtask.merge_approved_sha is None:
+            return (
+                f"claim 'approved' but no SHA-pinned merge grant is recorded "
+                f"for this subtask (store FSM state {actual!r})"
+            )
+        return None
+    if claim != actual:
+        return (
+            f"claim {claim!r} does not match the store's FSM state {actual!r} "
+            "for this subtask"
+        )
+    return None
+
+
+def _cmd_verify_acceptance(args: argparse.Namespace) -> int:
+    """Record the Verifier's evidence-integrity verdict on a ``review_passed`` subtask.
+
+    The activation of the Verifier seat: ``--accept`` drives
+    ``review_passed → acceptance_passed`` (the ``verify_acceptance`` verdict's
+    SHA-pinned pass-state, checked by the merge-eligibility gate exactly like
+    ``verify`` / ``review``); ``--reject`` drives ``review_passed →
+    review_failed``, reusing the review-round counter + cap so an acceptance
+    dispute "rides the existing review-round-cap → blocked → owner escalation"
+    with no new mechanism and no Conductor adjudication. The verdict is only
+    legal from ``review_passed`` — from any other state the FSM raises
+    :class:`InvalidTransitionError` and writes nothing.
+
+    The verdict's ``head_sha`` is the **PR head** (``--pr``, via ``gh`` with
+    ``--repo`` from config — cwd-independent), never the invoker's cwd HEAD,
+    exactly like the review leg: the Verifier works from a repo-less scratch
+    directory. An unresolvable head records nothing.
+
+    Before a *passing* verdict is issued, two gates run (a passing verdict must
+    never launder bad evidence):
+
+    1. **Broken-chain interlock** — the ``transition_log`` hash chain must
+       verify (:func:`_transition_chain_intact`). A break means the ledger this
+       verdict would attest is compromised; the verdict is NOT issued.
+    2. **Claim-vs-store audit** — when ``--claim`` is given, the asserted
+       terminal state must match the store's FSM state + grants for this
+       subtask (:func:`_claim_vs_store_finding`); a divergence is a finding and
+       the verdict is NOT issued.
+
+    A *room-vs-log* audit (chat-claimed protocol effects vs transition-log/store
+    facts) is intentionally NOT implemented here: bounding it would mean
+    re-reading whole task rooms over the network, which this fast, Band-free
+    subprocess must not do. It lives in ``prompts/verifier.md`` as the
+    Verifier's own bounded duty over the messages already in its context.
+    """
+    project_dir = resolve_project_dir(args.project_dir)
+    store = _resolve_store(project_dir)
+
+    task_id, error_code = _resolve_task_id(project_dir, store, args.task)
+    if error_code is not None:
+        return error_code
+
+    head_sha = _pr_head_sha(project_dir, args.pr)
+    if head_sha is None:
+        print(
+            f"REJECTED [head_unresolved]: cannot resolve PR #{args.pr} head — "
+            "acceptance verdict NOT recorded. Check gh auth/network and re-run.",
+            file=sys.stderr,
+        )
+        return EXIT_HEAD_UNRESOLVED
+
+    if args.accept:
+        # Gate 1 — broken-chain interlock. A passing verdict over a tampered
+        # ledger would launder the evidence it claims to vouch for: refuse.
+        chain = _transition_chain_intact(store)
+        if not chain.ok:
+            print(
+                f"REJECTED [chain_broken]: the transition_log hash chain is "
+                f"broken at row id={chain.broken_id} (expected row_hash "
+                f"{chain.expected_hash}, stored {chain.actual_hash}) — "
+                "acceptance verdict NOT issued. The ledger this verdict would "
+                "attest is compromised; run `cb verify-log` and escalate.",
+                file=sys.stderr,
+            )
+            return EXIT_CHAIN_BROKEN
+
+        # Gate 2 — claim-vs-store audit. A false claim must never be passed.
+        subtask = store.get_subtask(args.subtask_id, task_id)
+        finding = _claim_vs_store_finding(subtask, args.claim)
+        if finding is not None:
+            print(
+                f"REJECTED [claim_divergence]: {finding} — acceptance verdict "
+                "NOT issued. The claim does not match durable state; reconcile "
+                "the claim or send the subtask back.",
+                file=sys.stderr,
+            )
+            return EXIT_CLAIM_MISMATCH
+
+    new_state = "acceptance_passed" if args.accept else "review_failed"
+
+    try:
+        transition(
+            args.subtask_id,
+            task_id,
+            new_state,
+            caller_role="verifier",
+            reason=(
+                "cb-phase verify-acceptance --accept"
+                if args.accept
+                else "cb-phase verify-acceptance --reject"
+            ),
+            store=store,
+            # Pin the verdict to the commit it was rendered against — the head
+            # of the reviewed PR, exactly like the review leg.
+            head_sha=head_sha,
+        )
+    except InvalidTransitionError as exc:
+        print(
+            f"cb-phase: acceptance verdict rejected — {exc}", file=sys.stderr,
+        )
+        return 1
+
+    print(
+        f"cb-phase: subtask {args.subtask_id} → {new_state} (task {task_id})."
+    )
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cb-phase",
@@ -1199,6 +1377,57 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Project directory containing codeband.yaml (default: cwd).",
     )
     review.set_defaults(func=_cmd_review)
+
+    accept = sub.add_parser(
+        "verify-acceptance",
+        help="Record the Verifier's acceptance verdict "
+        "(review_passed → acceptance_passed/review_failed).",
+    )
+    accept.add_argument("subtask_id", help="Subtask identifier.")
+    accept.add_argument(
+        "--task",
+        required=False,
+        help="Task label (non-authoritative; active room resolved from "
+        ".codeband_room).",
+    )
+    accept.add_argument(
+        "--pr",
+        type=int,
+        required=True,
+        help="Pull request number under verification — its head SHA is what "
+        "the verdict pins (resolved via gh, cwd-independent).",
+    )
+    accept_verdict = accept.add_mutually_exclusive_group(required=True)
+    accept_verdict.add_argument(
+        "--accept", action="store_true",
+        help="Pass acceptance → acceptance_passed (broken-chain interlock and "
+        "claim-vs-store audit run first).",
+    )
+    accept_verdict.add_argument(
+        "--reject", action="store_true",
+        help="Fail acceptance → review_failed (rides the review-round cap).",
+    )
+    accept.add_argument(
+        "--claim",
+        required=False,
+        default=None,
+        help="The terminal state an agent claimed for this subtask "
+        "(merged/approved/blocked/...). Audited against the store's FSM state "
+        "+ grants before a passing verdict is issued; a divergence is a "
+        "finding.",
+    )
+    accept.add_argument(
+        "--worktree",
+        default=".",
+        help="Accepted for compatibility; ignored — the verdict SHA is the "
+        "PR head, never a local checkout's HEAD.",
+    )
+    accept.add_argument(
+        "--project-dir",
+        default=".",
+        help="Project directory containing codeband.yaml (default: cwd).",
+    )
+    accept.set_defaults(func=_cmd_verify_acceptance)
 
     abandon = sub.add_parser(
         "abandon",

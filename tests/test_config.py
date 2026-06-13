@@ -20,6 +20,7 @@ from codeband.config import (
     PoolEntry,
     RepoConfig,
     ReviewersConfig,
+    VerifiersConfig,
     WorkspaceConfig,
     load_config,
     scale_pool,
@@ -265,10 +266,14 @@ class TestReviewersConfig:
 class TestTotalAgentCount:
     """Tests for AgentsConfig.total_agent_count — drives tier-cap warnings."""
 
-    def test_default_is_eight(self):
-        """Default cross-model config uses exactly 8 agents (fits free-tier 10 cap)."""
+    def test_default_is_ten(self):
+        """Default cross-model config uses exactly 10 agents (the free-tier cap).
+
+        PR2 activated the verifier seat (1 per vendor) — +2 over the prior 8,
+        landing exactly on Band's free-tier 10-agent cap.
+        """
         config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
-        assert config.agents.total_agent_count() == 8
+        assert config.agents.total_agent_count() == 10
 
     def test_scales_with_pool_counts(self):
         agents = AgentsConfig(
@@ -281,8 +286,9 @@ class TestTotalAgentCount:
                 codex=PoolEntry(count=2),
             ),
         )
-        # 2 singletons + 1 Claude planner + 1 Codex plan-reviewer + 6 coders + 4 reviewers
-        assert agents.total_agent_count() == 2 + 1 + 1 + 6 + 4
+        # 2 singletons + 1 Claude planner + 1 Codex plan-reviewer + 6 coders
+        # + 4 reviewers + 2 default verifiers (1 per vendor)
+        assert agents.total_agent_count() == 2 + 1 + 1 + 6 + 4 + 2
 
     def test_zero_count_reduces_total(self):
         agents = AgentsConfig(
@@ -298,9 +304,14 @@ class TestTotalAgentCount:
                 claude_sdk=PoolEntry(count=1),
                 codex=PoolEntry(count=0),
             ),
+            verifiers=VerifiersConfig(
+                claude_sdk=PoolEntry(count=1),
+                codex=PoolEntry(count=0),
+            ),
         )
         # 2 singletons + 1 planner + 1 plan_reviewer + 1 coder + 1 reviewer
-        assert agents.total_agent_count() == 6
+        # + 1 verifier
+        assert agents.total_agent_count() == 7
 
 
 class TestScalePool:

@@ -258,9 +258,12 @@ def cli(
 def init(repo: str, branch: str, project_dir: str) -> None:
     """Initialize a Codeband project.
 
-    The default config uses 8 Band.ai agents (fits the free-tier 10-cap):
+    The default config uses 10 Band.ai agents (exactly the free-tier 10-cap):
     1 Claude coder + 1 Codex coder + 1 reviewer of each framework +
-    1 Claude planner + 1 Codex plan-reviewer + conductor + mergemaster.
+    1 verifier of each framework + 1 Claude planner + 1 Codex plan-reviewer +
+    conductor + mergemaster. The verifiers make `verify_acceptance` a required,
+    SHA-pinned merge verdict; drop a verifier vendor to `count: 0` to reclaim a
+    seat (acceptance still gates via the remaining vendor; cb doctor warns).
 
     To scale up on paid tier: edit `codeband.yaml` or use `cb scale`.
     """

@@ -4,7 +4,7 @@
 :class:`~codeband.state.store.StateStore` and produces a per-role markdown
 recovery prompt that is prepended to a reconnecting agent's system prompt —
 the same convention the coder path already uses
-(``session/context.py:build_recovery_context``). Only the five non-coder
+(``session/context.py:build_recovery_context``). Only the non-coder
 coordination roles use this module; coders rehydrate from git state, which
 this module never touches.
 
@@ -12,8 +12,9 @@ Per-role content:
 
 * **conductor** → a table of *all* non-terminal subtasks (id, state, worker, PR).
 * **mergemaster** → subtasks in ``merge_pending`` / ``review_passed`` /
-  ``needs_rebase``.
+  ``acceptance_passed`` / ``needs_rebase``.
 * **reviewer** (code reviewer) → subtasks in ``review_pending``.
+* **verifier** → subtasks in ``review_passed`` (awaiting the acceptance verdict).
 * **planner** → the active task description(s).
 * **plan_reviewer** → active task description(s) + in-flight subtask count.
 
@@ -37,7 +38,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SINGLETON_ROLES = frozenset({"conductor", "mergemaster"})
-_POOL_ROLES = frozenset({"planner", "plan_reviewer", "coder", "reviewer"})
+_POOL_ROLES = frozenset({"planner", "plan_reviewer", "coder", "reviewer", "verifier"})
 
 _HEADER = "## Recovery context (from durable state)"
 _TABLE_HEAD = "| Subtask | State | Worker | PR |\n|---------|-------|--------|----|"
@@ -131,10 +132,15 @@ async def build_agent_recovery_context(
     if role == "mergemaster":
         # ``needs_rebase`` rests with the coder, but the Mergemaster queued the
         # merge that was sent back — it must see the state to avoid re-queueing
-        # or treating the subtask as lost.
+        # or treating the subtask as lost. ``acceptance_passed`` is the
+        # ready-to-queue state once a Verifier is configured (the
+        # verify_acceptance gate sits between review and merge).
         pending = [
             st for st in active
-            if st.state in ("merge_pending", "review_passed", "needs_rebase")
+            if st.state in (
+                "merge_pending", "review_passed", "acceptance_passed",
+                "needs_rebase",
+            )
         ]
         return _table_context(
             "You reconnected as Mergemaster. Subtasks awaiting integration:",
@@ -145,6 +151,17 @@ async def build_agent_recovery_context(
         pending = [st for st in active if st.state == "review_pending"]
         return _table_context(
             "You reconnected as Code Reviewer. Subtasks awaiting review:",
+            pending,
+            None,
+        )
+    if role == "verifier":
+        # The Verifier checks evidence integrity once review passes: subtasks
+        # resting at ``review_passed`` await its ``cb-phase verify-acceptance``
+        # verdict (the last gate before merge).
+        pending = [st for st in active if st.state == "review_passed"]
+        return _table_context(
+            "You reconnected as Verifier. Subtasks awaiting acceptance "
+            "verification:",
             pending,
             None,
         )

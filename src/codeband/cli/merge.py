@@ -28,8 +28,9 @@ b. **Reconcile first** (idempotency, grant-gated [S11-1.2]): a subtask already
    and record). With the grant absent or mismatched the PR was merged OUT OF
    BAND, so the subtask goes to ``blocked`` with the ``ungated_external_merge``
    tag + an ``audit_log`` event instead of laundering it into ``merged``.
-c. From ``review_passed``: attempt the gated
-   ``review_passed → merge_pending`` transition at the PR head SHA. The 2a
+c. From ``review_passed`` (verifier-less) or ``acceptance_passed`` (once a
+   Verifier is configured): attempt the gated
+   ``→ merge_pending`` transition at the PR head SHA. The 2a
    eligibility check runs *inside* the transition; a rejection exits non-zero
    echoing every machine-readable reason. This leg never duplicates the check.
    **SHA-shaped ineligibility is auto-routed**: when every reason is a
@@ -142,10 +143,17 @@ EXIT_PR_REBIND = 12
 EXIT_REBASE_CAP_REACHED = 17
 
 # Entry states this leg accepts. ``review_passed`` is the normal first
-# invocation; ``merge_pending`` is the resting/awaiting-approval state and the
-# crash-reconcile entry. Anything else is a clear error — in particular there
-# is no path that re-merges a ``merged`` subtask or revives a ``blocked`` one.
-_ENTRY_STATES = frozenset({"review_passed", "merge_pending"})
+# invocation for a verifier-less task; ``acceptance_passed`` is the normal
+# first invocation once a Verifier is configured (the verify_acceptance gate
+# sits between review and merge); ``merge_pending`` is the
+# resting/awaiting-approval state and the crash-reconcile entry. Anything else
+# is a clear error — in particular there is no path that re-merges a ``merged``
+# subtask or revives a ``blocked`` one. The merge-eligibility gate, not this
+# set, decides which path a task's verdict snapshot actually permits: a
+# verifier task that reaches here at ``review_passed`` is rejected for the
+# missing ``verify_acceptance`` verdict until it advances to
+# ``acceptance_passed``.
+_ENTRY_STATES = frozenset({"review_passed", "acceptance_passed", "merge_pending"})
 
 class NoActiveTaskError(RuntimeError):
     """``cb approve``'s grant half could not resolve the active task.
@@ -473,7 +481,7 @@ def _cmd_merge(args: argparse.Namespace) -> int:
         print(
             f"cb-phase: subtask {args.subtask_id!r} is in state {current!r}, "
             "which is not a valid entry state for cb-phase merge. "
-            "Expected review_passed or merge_pending.",
+            "Expected review_passed, acceptance_passed, or merge_pending.",
             file=sys.stderr,
         )
         return 1
@@ -597,9 +605,11 @@ def _cmd_merge(args: argparse.Namespace) -> int:
             )
             return EXIT_MERGE_FAILED
     else:
-        # (c) The gated review_passed → merge_pending transition, at the PR
-        # head SHA. Eligibility (2a) is enforced INSIDE the transition — this
-        # leg never duplicates the check.
+        # (c) The gated → merge_pending transition, at the PR head SHA, from
+        # whichever pre-merge state the subtask rests in (``review_passed`` for
+        # a verifier-less task, ``acceptance_passed`` once a Verifier is
+        # configured). Eligibility (2a) is enforced INSIDE the transition —
+        # this leg never duplicates the check.
         try:
             transition(
                 args.subtask_id, task_id, "merge_pending",

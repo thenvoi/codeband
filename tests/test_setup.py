@@ -17,6 +17,7 @@ from codeband.config import (
     PoolEntry,
     RepoConfig,
     ReviewersConfig,
+    VerifiersConfig,
 )
 
 
@@ -77,6 +78,12 @@ def _make_config(
             reviewers=ReviewersConfig(
                 claude_sdk=PoolEntry(count=claude_reviewers),
                 codex=PoolEntry(count=codex_reviewers),
+            ),
+            # Verifiers off so these setup/drift tests stay scoped to the
+            # 8-agent set their fakes mirror; the verifier seat's expected-agent
+            # wiring has dedicated tests in test_verifier.py.
+            verifiers=VerifiersConfig(
+                claude_sdk=PoolEntry(count=0), codex=PoolEntry(count=0)
             ),
         ),
     )

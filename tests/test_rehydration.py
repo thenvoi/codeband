@@ -20,6 +20,7 @@ def _seed(tmp_path):
     store.ensure_subtask("st-plan", "task-1", state="planned", assigned_worker="coder-claude_sdk-0")
     store.ensure_subtask("st-rev", "task-1", state="review_pending", assigned_worker="coder-codex-0")
     store.ensure_subtask("st-pass", "task-1", state="review_passed", assigned_worker="coder-codex-1")
+    store.ensure_subtask("st-accept", "task-1", state="acceptance_passed", assigned_worker="coder-claude_sdk-0")
     store.ensure_subtask("st-merge", "task-1", state="merge_pending", assigned_worker="coder-claude_sdk-1")
     store.ensure_subtask("st-rebase", "task-1", state="needs_rebase", assigned_worker="coder-codex-0")
     # Terminal subtasks — must never appear in any recovery context.
@@ -33,8 +34,8 @@ def test_conductor_lists_all_non_terminal_as_table(tmp_path):
     ctx = asyncio.run(build_agent_recovery_context("conductor", store))
     assert ctx is not None
     assert "| Subtask | State | Worker | PR |" in ctx
-    # All five non-terminal subtasks present...
-    for sid in ("st-plan", "st-rev", "st-pass", "st-merge", "st-rebase"):
+    # All six non-terminal subtasks present...
+    for sid in ("st-plan", "st-rev", "st-pass", "st-accept", "st-merge", "st-rebase"):
         assert sid in ctx
     # ...and the two terminal ones excluded.
     assert "st-done" not in ctx
@@ -46,6 +47,7 @@ def test_mergemaster_shows_merge_states_only(tmp_path):
     ctx = asyncio.run(build_agent_recovery_context("mergemaster", store))
     assert ctx is not None
     assert "st-pass" in ctx  # review_passed
+    assert "st-accept" in ctx  # acceptance_passed — ready to queue
     assert "st-merge" in ctx  # merge_pending
     assert "st-rebase" in ctx  # needs_rebase — the merge gate's send-back
     assert "st-rev" not in ctx  # review_pending — not Mergemaster's concern
@@ -75,8 +77,18 @@ def test_plan_reviewer_shows_task_and_subtask_count(tmp_path):
     ctx = asyncio.run(build_agent_recovery_context("plan_reviewer-codex-0", store))
     assert ctx is not None
     assert "Build the widget pipeline" in ctx
-    # Five non-terminal subtasks reference task-1.
-    assert "subtasks in flight: 5" in ctx
+    # Six non-terminal subtasks reference task-1.
+    assert "subtasks in flight: 6" in ctx
+
+
+def test_verifier_shows_only_review_passed(tmp_path):
+    store = _seed(tmp_path)
+    ctx = asyncio.run(build_agent_recovery_context("verifier-codex-0", store))
+    assert ctx is not None
+    assert "st-pass" in ctx  # review_passed — awaiting the acceptance verdict
+    assert "st-rev" not in ctx  # review_pending — the reviewer's concern
+    assert "st-accept" not in ctx  # already accepted
+    assert "st-merge" not in ctx
 
 
 def test_returns_none_when_nothing_relevant(tmp_path):

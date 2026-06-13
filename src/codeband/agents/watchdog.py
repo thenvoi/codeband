@@ -133,14 +133,15 @@ def _is_terminal_protocol_message(content: Any) -> bool:
 # idempotent reconcile step; only the existing PR-activity progress signal
 # applies here, as it does to every patrolled state.
 #
-# ``review_pending`` / ``review_failed`` / ``review_passed`` / ``needs_rebase``
-# are the resting states where dispatched work can silently die: a reviewer
-# that never renders a verdict, a coder that never picks up the rework, a
-# Mergemaster that never queues the approved PR, a rebase nobody starts. The
-# mechanical signals are state-agnostic — transition recency applies to every
-# state (each of these is *entered* by a transition, so the row exists), and
-# the PR-activity signal applies wherever ``pr_number`` is set (it is, by the
-# verify leg, for everything at/past ``review_pending``).
+# ``review_pending`` / ``review_failed`` / ``review_passed`` /
+# ``acceptance_passed`` / ``needs_rebase`` are the resting states where
+# dispatched work can silently die: a reviewer that never renders a verdict, a
+# Verifier that never renders an acceptance verdict, a coder that never picks
+# up the rework, a Mergemaster that never queues the approved PR, a rebase
+# nobody starts. The mechanical signals are state-agnostic — transition recency
+# applies to every state (each of these is *entered* by a transition, so the
+# row exists), and the PR-activity signal applies wherever ``pr_number`` is set
+# (it is, by the verify leg, for everything at/past ``review_pending``).
 _PATROLLED_SUBTASK_STATES: frozenset[str] = frozenset(
     {
         "in_progress",
@@ -148,6 +149,7 @@ _PATROLLED_SUBTASK_STATES: frozenset[str] = frozenset(
         "review_pending",
         "review_failed",
         "review_passed",
+        "acceptance_passed",
         "merge_pending",
         "needs_rebase",
     }

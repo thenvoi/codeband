@@ -52,6 +52,17 @@ def test_valid_transitions_matches_rfc_table():
         ("review_passed", "mergemaster"): frozenset(
             {"merge_pending", "needs_rebase", "blocked"}
         ),
+        # Verifier acceptance gate (PR2): from review_passed the Verifier
+        # accepts (acceptance_passed, the verify_acceptance verdict pass-state)
+        # or rejects (review_failed, riding the review-round cap).
+        ("review_passed", "verifier"): frozenset(
+            {"acceptance_passed", "review_failed"}
+        ),
+        # From acceptance_passed the Mergemaster has the same three moves it has
+        # from review_passed — queue (gated), rebase send-back, or escalate.
+        ("acceptance_passed", "mergemaster"): frozenset(
+            {"merge_pending", "needs_rebase", "blocked"}
+        ),
         # Stage-2 merge execution (cb-phase merge): land the PR, send it back
         # on execution-time SHA drift / conflict, or record a residual merge
         # failure (blocked → owner escalation via the watchdog).

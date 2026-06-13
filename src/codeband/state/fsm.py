@@ -5,14 +5,20 @@ through a fixed lifecycle:
 
     planned → assigned → in_progress → verify_pending → review_pending
             → review_passed → merge_pending → merged
+                            ↘ acceptance_passed → merge_pending → merged
                             ↘ needs_rebase → in_progress (rebase rework)
                             ↘ review_failed → in_progress
                             ↘ blocked → in_progress (conductor resume)
                             ↘ abandoned
 
-    (``merge_pending`` may also exit to ``needs_rebase`` — execution-time SHA
-    drift or a conflicted PR — or to ``blocked`` on a residual merge failure;
-    both are driven by ``cb-phase merge``, the sole sanctioned merge path.)
+    (``review_passed`` exits to ``acceptance_passed`` via the Verifier's
+    ``cb-phase verify-acceptance`` gate — the last gate before merge when a
+    verifier is configured; a verifier-less task merges straight from
+    ``review_passed``, the merge-eligibility gate deciding which path a task's
+    verdict snapshot actually permits. ``merge_pending`` may also exit to
+    ``needs_rebase`` — execution-time SHA drift or a conflicted PR — or to
+    ``blocked`` on a residual merge failure; both are driven by ``cb-phase
+    merge``, the sole sanctioned merge path.)
 
 :data:`VALID_TRANSITIONS` encodes every legal edge keyed by
 ``(current_state, caller_role)`` — exactly the RFC table plus the Stage-2
@@ -112,13 +118,16 @@ class MergeNotEligibleError(InvalidTransitionError):
 
 # Maps each verdict leg name (as snapshotted in ``tasks.required_verdicts``)
 # to the ``transition_log.to_state`` that records its *pass*: the verify gate
-# is the only edge into ``review_pending`` (``cb-phase verify``, coder) and an
+# is the only edge into ``review_pending`` (``cb-phase verify``, coder), an
 # approving review verdict is the only edge into ``review_passed`` (``cb-phase
-# review --approve``, reviewer) — so a log row with that ``to_state`` and a
-# matching ``head_sha`` IS the SHA-pinned passing record for the leg.
+# review --approve``, reviewer), and an accepting verify-acceptance verdict is
+# the only edge into ``acceptance_passed`` (``cb-phase verify-acceptance
+# --accept``, verifier) — so a log row with that ``to_state`` and a matching
+# ``head_sha`` IS the SHA-pinned passing record for the leg.
 _VERDICT_PASS_STATES: dict[str, str] = {
     "verify": "review_pending",
     "review": "review_passed",
+    "verify_acceptance": "acceptance_passed",
 }
 
 
@@ -289,6 +298,28 @@ VALID_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
     # send-back is no longer legal — escalates it (``blocked``), mirroring
     # the ``merge_pending`` row below (the cap can fire at either gate).
     ("review_passed", "mergemaster"): frozenset(
+        {"merge_pending", "needs_rebase", "blocked"}
+    ),
+    # The Verifier's evidence-integrity gate (``cb-phase verify-acceptance``,
+    # verifier role) runs AFTER review passes, the last gate before merge.
+    # ``--accept`` records ``acceptance_passed`` (the verify_acceptance verdict
+    # pass-state); ``--reject`` sends the subtask back via ``review_failed`` —
+    # reusing the review-round counter + cap so an acceptance dispute "rides
+    # the existing review-round-cap → blocked → owner escalation" with no new
+    # mechanism and no Conductor adjudication. The edge into ``merge_pending``
+    # from ``review_passed`` (above) is left intact: a verifier-LESS config
+    # (no ``verify_acceptance`` in its snapshot) merges straight from
+    # ``review_passed``; a verifier config's merge-eligibility gate rejects
+    # that path (missing ``verify_acceptance``) until ``acceptance_passed`` is
+    # recorded, so the seat is a gate, not a re-route.
+    ("review_passed", "verifier"): frozenset(
+        {"acceptance_passed", "review_failed"}
+    ),
+    # From ``acceptance_passed`` the Mergemaster has the same three moves it
+    # has from ``review_passed`` — queue (gated), send back for rebase, or
+    # escalate — so acceptance slots in as a pre-merge state without changing
+    # the merge leg's behavior beyond its entry-state set.
+    ("acceptance_passed", "mergemaster"): frozenset(
         {"merge_pending", "needs_rebase", "blocked"}
     ),
     # From the merge queue the Mergemaster (via ``cb-phase merge``, the sole

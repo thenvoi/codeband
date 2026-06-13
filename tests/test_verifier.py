@@ -1,11 +1,14 @@
-"""Tests for the Verifier seat scaffolding (PR1 — INERT by default).
+"""Tests for the Verifier seat — config/pool/doctor wiring.
 
 Covers:
-- VerifiersConfig pool shape and INERT defaults
+- VerifiersConfig pool shape and ACTIVE-by-default counts (PR2)
 - WorkerRole.VERIFIER identity string
 - WorkerPool.acquire_verifier_for opposite-vendor pairing + fallback
 - cb doctor check_verifier_pairing
-- Required-verdicts snapshot unchanged (no new verdict leg in PR1)
+- verify_acceptance is a known, on-by-default verdict (PR2)
+
+The verdict leg, broken-chain interlock, claim-vs-store audit, merge gating,
+and role gate live in test_verifier_acceptance.py.
 """
 
 from __future__ import annotations
@@ -27,12 +30,12 @@ from codeband.workers import WorkerId, WorkerPool, WorkerRole
 # ─── VerifiersConfig ────────────────────────────────────────────────────────
 
 class TestVerifiersConfig:
-    def test_default_count_is_zero(self):
-        """Verifier seat is INERT by default — both framework counts are 0."""
+    def test_default_count_is_one_per_vendor(self):
+        """Verifier seat is ACTIVE by default (PR2) — one verifier per vendor."""
         config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
         v = config.agents.verifiers
-        assert v.claude_sdk.count == 0
-        assert v.codex.count == 0
+        assert v.claude_sdk.count == 1
+        assert v.codex.count == 1
 
     def test_default_models_are_set(self):
         """Default models are pre-configured for when the seat is activated."""
@@ -41,9 +44,18 @@ class TestVerifiersConfig:
         assert v.claude_sdk.model == "claude-opus-4-7"
         assert v.codex.model == "gpt-5.4"
 
-    def test_active_frameworks_empty_when_inert(self):
+    def test_active_frameworks_default_both_vendors(self):
         config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
-        assert config.agents.verifiers.active_frameworks() == []
+        assert config.agents.verifiers.active_frameworks() == [
+            Framework.CLAUDE_SDK,
+            Framework.CODEX,
+        ]
+
+    def test_active_frameworks_empty_when_disabled(self):
+        v = VerifiersConfig(
+            claude_sdk=PoolEntry(count=0), codex=PoolEntry(count=0)
+        )
+        assert v.active_frameworks() == []
 
     def test_active_frameworks_when_enabled(self):
         v = VerifiersConfig(
@@ -60,9 +72,9 @@ class TestVerifiersConfig:
         assert v.entry_for(Framework.CLAUDE_SDK).count == 2
         assert v.entry_for(Framework.CODEX).count == 3
 
-    def test_total_count_zero_by_default(self):
+    def test_total_count_two_by_default(self):
         config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
-        assert config.agents.verifiers.total_count() == 0
+        assert config.agents.verifiers.total_count() == 2
 
     def test_yaml_roundtrip(self, tmp_path: Path):
         """Verifier pool survives YAML serialization."""
@@ -85,13 +97,22 @@ class TestVerifiersConfig:
 
     def test_total_agent_count_includes_verifiers(self):
         """total_agent_count reflects active verifier seats."""
-        base = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
-        baseline = base.agents.total_agent_count()
+        no_verifiers = CodebandConfig(
+            repo=RepoConfig(url="https://github.com/a/b.git"),
+            agents=AgentsConfig(
+                verifiers=VerifiersConfig(
+                    claude_sdk=PoolEntry(count=0), codex=PoolEntry(count=0)
+                ),
+            ),
+        )
+        baseline = no_verifiers.agents.total_agent_count()
 
         with_verifiers = CodebandConfig(
             repo=RepoConfig(url="https://github.com/a/b.git"),
             agents=AgentsConfig(
-                verifiers=VerifiersConfig(codex=PoolEntry(count=2)),
+                verifiers=VerifiersConfig(
+                    claude_sdk=PoolEntry(count=0), codex=PoolEntry(count=2)
+                ),
             ),
         )
         assert with_verifiers.agents.total_agent_count() == baseline + 2
@@ -182,11 +203,27 @@ class TestAcquireVerifierFor:
 # ─── setup.py registration ───────────────────────────────────────────────────
 
 class TestVerifierAgentRegistration:
-    def test_verifier_absent_from_expected_agents_when_inert(self):
-        """With count=0 (default), no verifier keys appear in expected_agents."""
+    def test_verifier_present_in_expected_agents_by_default(self):
+        """The default config (PR2) registers a verifier per vendor."""
         from codeband.orchestration.setup import _expected_agents
 
         config = CodebandConfig(repo=RepoConfig(url="https://github.com/a/b.git"))
+        expected = _expected_agents(config)
+        assert "verifier-claude_sdk-0" in expected
+        assert "verifier-codex-0" in expected
+
+    def test_verifier_absent_from_expected_agents_when_disabled(self):
+        """With both counts 0, no verifier keys appear in expected_agents."""
+        from codeband.orchestration.setup import _expected_agents
+
+        config = CodebandConfig(
+            repo=RepoConfig(url="https://github.com/a/b.git"),
+            agents=AgentsConfig(
+                verifiers=VerifiersConfig(
+                    claude_sdk=PoolEntry(count=0), codex=PoolEntry(count=0)
+                ),
+            ),
+        )
         expected = _expected_agents(config)
         assert not any(k.startswith("verifier-") for k in expected)
 
@@ -223,10 +260,15 @@ class TestDoctorVerifierPairing:
         )
         return Context(project_dir=tmp_path, config=config)
 
-    def test_skips_when_verifiers_inert(self, tmp_path):
-        """No warning when verifier count=0 (default INERT state)."""
+    def test_skips_when_verifiers_disabled(self, tmp_path):
+        """No warning when both verifier counts are 0 (seat disabled)."""
         from codeband.doctor import Status, check_verifier_pairing
-        ctx = self._ctx(tmp_path)
+        ctx = self._ctx(
+            tmp_path,
+            verifiers=VerifiersConfig(
+                claude_sdk=PoolEntry(count=0), codex=PoolEntry(count=0)
+            ),
+        )
         result = check_verifier_pairing(ctx)
         assert result.status == Status.SKIP
 
@@ -281,22 +323,37 @@ class TestDoctorVerifierPairing:
         assert check_verifier_pairing in fns
 
 
-# ─── INERT: required verdicts unchanged ──────────────────────────────────────
+# ─── ACTIVE (PR2): verify_acceptance is a known, on-by-default verdict ────────
 
-class TestVerifierInert:
-    def test_known_verdicts_unchanged(self):
-        """KNOWN_VERDICTS must not include a new verifier verdict in PR1."""
+class TestVerifierVerdictActivation:
+    def test_known_verdicts_includes_verify_acceptance(self):
+        """PR2 wires the verdict leg → verify_acceptance is a known verdict."""
         from codeband.state.registration import KNOWN_VERDICTS
-        assert KNOWN_VERDICTS == frozenset({"verify", "review"})
+        assert KNOWN_VERDICTS == frozenset(
+            {"verify", "review", "verify_acceptance"}
+        )
 
-    def test_default_required_verdicts_unchanged(self):
-        """Default resolved verdicts are ['verify', 'review'] — no new verdict in PR1.
+    def test_default_required_verdicts_include_acceptance_when_active(self):
+        """Default resolved verdicts add verify_acceptance when a verifier is on.
 
         resolve_required_verdicts enforces that handoff_verify_command is set
         when 'verify' is in the list, so we supply one to isolate the verdict
         content check from the precondition check.
         """
         from codeband.state.registration import resolve_required_verdicts
+        # Default AgentsConfig has verifiers active (1 per vendor).
         agents = AgentsConfig(handoff_verify_command="make test")
+        result = resolve_required_verdicts(agents)
+        assert set(result) == {"verify", "review", "verify_acceptance"}
+
+    def test_default_required_verdicts_pair_when_verifiers_disabled(self):
+        """With no verifier configured, the default stays the verify/review pair."""
+        from codeband.state.registration import resolve_required_verdicts
+        agents = AgentsConfig(
+            handoff_verify_command="make test",
+            verifiers=VerifiersConfig(
+                claude_sdk=PoolEntry(count=0), codex=PoolEntry(count=0)
+            ),
+        )
         result = resolve_required_verdicts(agents)
         assert set(result) == {"verify", "review"}
