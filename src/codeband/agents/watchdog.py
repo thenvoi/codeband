@@ -1240,6 +1240,13 @@ class WatchdogDaemon:
         burning its escalate-once marker, so it can still escalate later if an
         owner appears. Guarded so a store read or a notify failure never breaks
         the patrol loop.
+
+        ``_owner_escalated`` is pruned on each call: markers for subtasks that
+        are no longer in ``blocked`` state (e.g. resumed to ``in_progress`` via
+        ``cb-phase resume``) are removed so the subtask can escalate again if
+        it re-blocks.  Sibling marker ``_integrity_alerted`` is keyed by
+        ``(room, chain, kind)`` — not by subtask — so it is intentionally NOT
+        cleared here.
         """
         import asyncio
 
@@ -1254,6 +1261,15 @@ class WatchdogDaemon:
                 exc_info=True,
             )
             return
+
+        # Prune stale escalation markers: remove keys for subtasks that are no
+        # longer blocked (resumed → in_progress, or otherwise left blocked) so
+        # they can re-escalate if they re-block.  Intentionally accepts a rare
+        # duplicate escalation over a silent-forever blocked subtask.
+        currently_blocked_keys = {
+            (s.task_id, s.subtask_id) for s in subtasks if s.state == "blocked"
+        }
+        self._owner_escalated &= currently_blocked_keys
 
         active_task_ids = await asyncio.to_thread(self._active_task_ids)
 

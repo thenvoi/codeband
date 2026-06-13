@@ -1660,3 +1660,74 @@ async def test_merge_pending_sha_stable_no_reroute(tmp_path, monkeypatch):
 
     sub = store.get_subtask(SUBTASK_ID, TASK_ID)
     assert sub.state == "merge_pending"
+
+
+# ── _owner_escalated marker resets after resume (batch4 adjacent finding #1) ─
+
+def _drive_to_blocked(store, *, reason: str = "cap reached") -> None:
+    """Advance the subtask through assigned→in_progress→blocked via real FSM."""
+    from codeband.state.fsm import transition
+    transition(SUBTASK_ID, TASK_ID, "assigned", caller_role="conductor", store=store)
+    transition(SUBTASK_ID, TASK_ID, "in_progress", caller_role="coder", store=store)
+    transition(SUBTASK_ID, TASK_ID, "blocked", caller_role="coder",
+               reason=reason, store=store)
+
+
+@pytest.mark.asyncio
+async def test_owner_escalated_marker_cleared_after_resume(tmp_path):
+    """After cb-phase resume (blocked → in_progress), the next patrol clears the
+    _owner_escalated marker so a subsequent re-block can escalate again."""
+    from codeband.state import StateStore
+    from codeband.state.fsm import transition
+
+    store = StateStore(tmp_path / "state" / "orchestration.db")
+    store.create_task(TASK_ID, "demo task", ROOM_ID, owner_id="owner-1")
+    _drive_to_blocked(store)
+
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest, owner_id="owner-1")
+
+    # First patrol: subtask is blocked → escalates and burns the marker.
+    await daemon._check_blocked_subtasks(datetime.now(UTC))
+    assert (TASK_ID, SUBTASK_ID) in daemon._owner_escalated
+
+    # Simulate cb-phase resume: drive blocked → in_progress.
+    transition(SUBTASK_ID, TASK_ID, "in_progress", caller_role="conductor",
+               store=store)
+
+    # Next patrol: subtask is no longer blocked → marker should be cleared.
+    await daemon._check_blocked_subtasks(datetime.now(UTC))
+    assert (TASK_ID, SUBTASK_ID) not in daemon._owner_escalated
+
+
+@pytest.mark.asyncio
+async def test_owner_reescalates_after_resume_and_reblock(tmp_path):
+    """After resume + re-block, a second escalation fires (marker was cleared)."""
+    from codeband.state import StateStore
+    from codeband.state.fsm import transition
+
+    store = StateStore(tmp_path / "state" / "orchestration.db")
+    store.create_task(TASK_ID, "demo task", ROOM_ID, owner_id="owner-1")
+    _drive_to_blocked(store)
+
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest, owner_id="owner-1")
+
+    # First block + escalation.
+    await daemon._check_blocked_subtasks(datetime.now(UTC))
+    assert rest.agent_api_messages.create_agent_chat_message.await_count == 1
+
+    # Resume to in_progress, then patrol — subtask not blocked, marker cleared.
+    transition(SUBTASK_ID, TASK_ID, "in_progress", caller_role="conductor",
+               store=store)
+    await daemon._check_blocked_subtasks(datetime.now(UTC))  # clears marker
+    assert (TASK_ID, SUBTASK_ID) not in daemon._owner_escalated
+
+    # Re-block.
+    transition(SUBTASK_ID, TASK_ID, "blocked", caller_role="coder",
+               reason="stalled again", store=store)
+
+    # Second escalation fires because the marker was cleared.
+    await daemon._check_blocked_subtasks(datetime.now(UTC))
+
+    assert rest.agent_api_messages.create_agent_chat_message.await_count == 2
