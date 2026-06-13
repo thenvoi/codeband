@@ -90,13 +90,14 @@ def _now_iso() -> str:
 GENESIS_PREV_HASH = hashlib.sha256(b"codeband-genesis-v1").hexdigest()
 
 # Business columns hashed for ``transition_log`` rows, in no particular order
-# (``sort_keys=True`` canonicalizes). ``head_sha`` is deliberately NOT part of
-# the chained business set — the chain attests the FSM-transition identity
-# (who moved what, when, why); SHA pinning is enforced by the merge-eligibility
-# gate, not the chain.
+# (``sort_keys=True`` canonicalizes). ``head_sha`` IS part of the chained set:
+# the merge-eligibility gate pins on it, so an in-place edit of ``head_sha``
+# alone must be tamper-evident — excluding it would let a forged SHA pass the
+# chain unbroken. Appended at the documented end; ordering is irrelevant to the
+# hash (``sort_keys=True``) but the literal stays append-only by convention.
 TRANSITION_HASH_COLS: tuple[str, ...] = (
     "id", "task_id", "subtask_id", "from_state", "to_state",
-    "caller_role", "reason", "timestamp",
+    "caller_role", "reason", "timestamp", "head_sha",
 )
 
 # Business columns hashed for ``audit_log`` rows (same scheme, own chain).
@@ -245,6 +246,7 @@ def write_chained_transition(
         "caller_role": caller_role,
         "reason": reason,
         "timestamp": timestamp,
+        "head_sha": head_sha,
     }
     row_hash = compute_row_hash(business, TRANSITION_HASH_COLS, prev_hash)
     conn.execute(

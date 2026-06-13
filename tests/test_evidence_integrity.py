@@ -22,6 +22,7 @@ from codeband.state import (
     verify_chain,
 )
 from codeband.state.fsm import transition
+from codeband.state.store import write_chained_transition
 
 TASK_ID = "task-1"
 ROOM_ID = "room-1"
@@ -109,6 +110,67 @@ def test_empty_chain_is_vacuously_ok(store: StateStore) -> None:
         conn.close()
     assert result.ok
     assert result.row_count == 0
+
+
+def test_head_sha_participates_in_row_hash(tmp_path: Path) -> None:
+    """Two rows identical in every column EXCEPT head_sha hash differently.
+
+    Proves head_sha is inside the hashed business set: same id (1), same genesis
+    prev_hash, same everything else — only head_sha varies, so an equal row_hash
+    would mean head_sha was not being hashed. Uses fresh isolated stores so each
+    is a genuine first/genesis row.
+    """
+    def _genesis_row_hash(head_sha: str, sub: str) -> str:
+        s = StateStore(tmp_path / sub / "orchestration.db")
+        conn = _open(s)
+        try:
+            write_chained_transition(
+                conn,
+                subtask_id=SUBTASK_ID,
+                task_id=TASK_ID,
+                from_state="review_pending",
+                to_state="merge_pending",
+                caller_role="coder",
+                timestamp="2026-01-01T00:00:00+00:00",
+                reason="ready to merge",
+                head_sha=head_sha,
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT row_hash FROM transition_log ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        return row["row_hash"]
+
+    assert _genesis_row_hash("sha-aaaa", "a") != _genesis_row_hash("sha-bbbb", "b")
+
+
+def test_in_place_head_sha_edit_breaks_chain(store: StateStore) -> None:
+    """Editing only head_sha out-of-band is tamper-evident via verify_chain.
+
+    The merge gate pins on head_sha, so a forged SHA must break the chain. _walk
+    writes head_sha='deadbeef' on the review_pending row; we mutate it in place
+    WITHOUT recomputing the hash (an out-of-band sqlite3 edit) and assert the
+    chain breaks at exactly that row.
+    """
+    _walk(store)
+    conn = _open(store)
+    try:
+        target = conn.execute(
+            "SELECT id FROM transition_log WHERE to_state = 'review_pending'"
+        ).fetchone()["id"]
+        conn.execute(
+            "UPDATE transition_log SET head_sha = 'forgedsha' WHERE id = ?",
+            (target,),
+        )
+        conn.commit()
+        result = verify_chain(conn, "transition_log", TRANSITION_HASH_COLS)
+    finally:
+        conn.close()
+    assert not result.ok
+    assert result.broken_id == target
+    assert result.expected_hash != result.actual_hash
 
 
 # ── audit_log chain + appends ────────────────────────────────────────────────
