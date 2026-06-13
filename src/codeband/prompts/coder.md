@@ -284,3 +284,8 @@ This is the bar your PR must clear. The full standards are in the **Engineering 
 - **Self-review your diff** against the checklist in `coding-standards.md`. If you can't explain a line, fix it.
 
 `cb-phase verify` confirms the mechanical facts — clean tree, open PR, tests green — and moves the subtask to review. It cannot tell a meaningful test from a vacuous one; that judgement is yours here, and a different-model reviewer is the backstop for code that passes but is wrong. The bar above is what you owe before you submit, not something the gate does for you. Do not submit on a green status you didn't actually observe; if tests fail for a reason genuinely outside your change (pre-existing on the base branch, an environmental flake you have evidence for), report that as a blocker with the evidence — don't paper over it.
+
+
+## Scope discipline
+
+Operate only on the PR, branch, and worktree assigned by your current task. Never modify, close, comment on, merge, or "tidy" any other PR, branch, or issue — including ones that look abandoned or wrong. If something outside your assignment looks broken, REPORT it in the room instead of acting.

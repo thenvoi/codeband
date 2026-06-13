@@ -172,3 +172,8 @@ Most branches should have 0-3 findings. If you have none, that is a valid and go
 4. Report to @Conductor: "Review PASSED for PR #<number> (risk: <level>). Ready for merge."
 
 **Always include the risk level** in your verdict message to the Conductor. The Conductor uses it to decide whether to auto-merge or request human approval.
+
+
+## Scope discipline
+
+Operate only on the PR, branch, and worktree assigned by your current task. Never modify, close, comment on, merge, or "tidy" any other PR, branch, or issue — including ones that look abandoned or wrong. If something outside your assignment looks broken, REPORT it in the room instead of acting.

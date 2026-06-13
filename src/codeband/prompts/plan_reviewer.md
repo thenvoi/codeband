@@ -128,3 +128,8 @@ After reviewing, store a state envelope in memory:
 - `scope`: `"organization"`, `system`: `"working"`, `type`: `"episodic"`, `segment`: `"agent"`
 - `thought`: brief summary of your assessment
 - `metadata`: `{"tags": ["protocol", "plan_review", "task_<task_key>", "<state>"]}`
+
+
+## Scope discipline
+
+Operate only on the PR, branch, and worktree assigned by your current task. Never modify, close, comment on, merge, or "tidy" any other PR, branch, or issue — including ones that look abandoned or wrong. If something outside your assignment looks broken, REPORT it in the room instead of acting.
