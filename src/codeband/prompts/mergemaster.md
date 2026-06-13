@@ -257,3 +257,8 @@ After every operation (success or failure), delete temporary integration branche
 ```bash
 git branch -D integration/<timestamp>
 ```
+
+
+## Scope discipline
+
+Operate only on the PR, branch, and worktree assigned by your current task. Never modify, close, comment on, merge, or "tidy" any other PR, branch, or issue — including ones that look abandoned or wrong. If something outside your assignment looks broken, REPORT it in the room instead of acting.

@@ -21,9 +21,13 @@ Invocation flow (each step fail-closed):
 a. Resolve the task (active-room pointer, same as verify/review), the
    subtask, the PR number, and one PR snapshot (state / mergeable / head SHA /
    head branch name).
-b. **Reconcile first** (idempotency): a subtask already at ``merge_pending``
-   whose PR is already ``MERGED`` records the ``merged`` transition and exits
-   0 — the crash-recovery path, working with no arguments.
+b. **Reconcile first** (idempotency, grant-gated [S11-1.2]): a subtask already
+   at ``merge_pending`` whose PR is already ``MERGED`` records ``merged`` and
+   exits 0 ONLY when a SHA-pinned grant matches the merged head — the
+   sanctioned crash-recovery case (our own merge raced/crashed between execute
+   and record). With the grant absent or mismatched the PR was merged OUT OF
+   BAND, so the subtask goes to ``blocked`` with the ``ungated_external_merge``
+   tag + an ``audit_log`` event instead of laundering it into ``merged``.
 c. From ``review_passed``: attempt the gated
    ``review_passed → merge_pending`` transition at the PR head SHA. The 2a
    eligibility check runs *inside* the transition; a rejection exits non-zero
@@ -336,6 +340,42 @@ def _send_approval_request(
     asyncio.run(_send())
 
 
+def _audit_ungated_external_merge(
+    store: StateStore,
+    *,
+    task_id: str,
+    subtask_id: str,
+    pr_number: int,
+    merged_sha: str | None,
+    grant_sha: str | None,
+) -> None:
+    """Best-effort append of the ``ungated_external_merge`` audit event.
+
+    The ``append_audit_event`` primitive ships in the evidence-integrity PR
+    (the hash-chained ``audit_log``). It is called via ``getattr`` so this leg
+    is independent of merge order — the event activates automatically once that
+    PR lands, and a pre-integrity store simply records nothing extra (the
+    ``blocked`` transition + structured output already stand on their own).
+    Never raises into the merge path: the audit row is evidence, not a gate.
+    """
+    append = getattr(store, "append_audit_event", None)
+    if append is None:
+        return
+    try:
+        append(
+            "ungated_external_merge",
+            task_id=task_id,
+            subtask_id=subtask_id,
+            payload={
+                "pr_number": pr_number,
+                "merged_sha": merged_sha,
+                "grant_sha": grant_sha,
+            },
+        )
+    except Exception:
+        logger.debug("ungated_external_merge audit append failed", exc_info=True)
+
+
 def _transition_or_fail(
     subtask_id: str,
     task_id: str,
@@ -496,23 +536,66 @@ def _cmd_merge(args: argparse.Namespace) -> int:
 
     # (b) Reconcile first — the crash-recovery path. A merge that executed
     # but crashed before recording lands here on re-invocation: the PR is
-    # already MERGED, so record the transition and exit 0. Works with no
-    # arguments (PR number read back from the subtask row).
+    # already MERGED. But reconcile now REQUIRES a grant [S11-1.2]: the ONLY
+    # sanctioned reconcile is OUR OWN merge that raced/crashed between execute
+    # and record, which leaves a SHA-pinned grant matching the merged head. A
+    # PR merged with NO matching grant was merged OUT OF BAND (a human clicked
+    # merge, a stray process, another tool) — recording that as ``merged``
+    # would launder an ungated merge into the ledger. So: grant present AND
+    # matching the merged head → ``merged`` as before; otherwise → ``blocked``
+    # with the ``ungated_external_merge`` tag, an audit_log event, and a
+    # structured line naming the merged SHA and the missing/mismatched grant.
+    # The watchdog's existing blocked-subtask patrol carries the escalation —
+    # no new rung needed.
     if current == "merge_pending":
         if pr_state == "MERGED":
+            grant_sha = subtask.merge_approved_sha
+            if grant_sha is not None and head_sha is not None and grant_sha == head_sha:
+                code = _transition_or_fail(
+                    args.subtask_id, task_id, "merged",
+                    f"cb-phase merge: reconciled — PR #{pr_number} already "
+                    f"merged at granted head {head_sha}",
+                    store=store, head_sha=head_sha,
+                )
+                if code is not None:
+                    return code
+                print(
+                    f"cb-phase: reconciled — PR #{pr_number} was already merged "
+                    f"at the granted head {head_sha}; subtask {args.subtask_id} "
+                    f"→ merged (task {task_id})."
+                )
+                _delete_remote_branch(pr, worktree)
+                return 0
+
+            # Ungated external merge: PR is MERGED but no grant authorizes
+            # exactly this head. Record blocked, write the audit event, and
+            # report — never launder it into ``merged``.
+            _audit_ungated_external_merge(
+                store, task_id=task_id, subtask_id=args.subtask_id,
+                pr_number=pr_number, merged_sha=head_sha, grant_sha=grant_sha,
+            )
             code = _transition_or_fail(
-                args.subtask_id, task_id, "merged",
-                f"cb-phase merge: reconciled — PR #{pr_number} already merged",
-                store=store, head_sha=head_sha,
+                args.subtask_id, task_id, "blocked",
+                f"ungated_external_merge: PR #{pr_number} is MERGED at "
+                f"{head_sha} but no grant authorizes it "
+                f"(grant={grant_sha or 'absent'})",
+                store=store,
             )
             if code is not None:
                 return code
             print(
-                f"cb-phase: reconciled — PR #{pr_number} was already merged; "
-                f"subtask {args.subtask_id} → merged (task {task_id})."
+                f"BLOCKED [ungated_external_merge]: PR #{pr_number} was merged "
+                f"OUT OF BAND at {head_sha} — "
+                + (
+                    f"the recorded grant is for {grant_sha}, not this head"
+                    if grant_sha is not None
+                    else "no merge approval was ever granted"
+                )
+                + ". Recorded blocked (NOT merged); escalation via watchdog. "
+                "Stop and await a human decision.",
+                file=sys.stderr,
             )
-            _delete_remote_branch(pr, worktree)
-            return 0
+            return EXIT_MERGE_FAILED
     else:
         # (c) The gated review_passed → merge_pending transition, at the PR
         # head SHA. Eligibility (2a) is enforced INSIDE the transition — this

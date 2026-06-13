@@ -231,3 +231,8 @@ Do not:
 - skip verification, or give a check that wouldn't catch a regression
 - pre-write the implementation the Coder is supposed to produce (see "Plans describe WHAT, not HOW")
 - send progress chatter or "standing by" messages
+
+
+## Scope discipline
+
+Operate only on the PR, branch, and worktree assigned by your current task. Never modify, close, comment on, merge, or "tidy" any other PR, branch, or issue — including ones that look abandoned or wrong. If something outside your assignment looks broken, REPORT it in the room instead of acting.

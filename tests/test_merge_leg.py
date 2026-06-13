@@ -545,7 +545,11 @@ def test_closed_pr_blocks_before_approval(env, capsys):
 
 def test_reconcile_already_merged_records_and_exits_zero(env, capsys):
     assert _run() == 0  # queue + persist --pr 42; rests awaiting approval
-    env.pr["state"] = "MERGED"  # the merge landed but recording crashed
+    # The sanctioned crash-recovery case: approval was granted (the merge only
+    # executes post-approval) at the queued SHA, the merge landed, but
+    # recording crashed. Reconcile now REQUIRES that matching grant [S11-1.2].
+    _grant(env.store)  # grant at SHA == the merged head
+    env.pr["state"] = "MERGED"
 
     # Argument-less re-invocation: PR number read back from the subtask row.
     assert handoff.main(["merge", "st-1"]) == 0
