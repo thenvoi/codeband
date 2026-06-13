@@ -1475,6 +1475,118 @@ def _parse_since(value: str):
     return dt.fromisoformat(value)
 
 
+def _room_msg_to_dict(m: object, agent_names: dict[str, str]) -> dict:
+    """Convert a REST message object to a plain dict for FeedFormatter / JSON output."""
+    sender_id = ""
+    for attr in ("sender_id", "participant_id", "author_id", "from_id"):
+        v = getattr(m, attr, None)
+        if v is not None:
+            sender_id = str(v)
+            break
+
+    ts = ""
+    for attr in ("created_at", "createdAt", "inserted_at"):
+        v = getattr(m, attr, None)
+        if v is not None:
+            ts = str(v)
+            break
+
+    return {
+        "sender_id": sender_id,
+        "sender_name": agent_names.get(sender_id, sender_id),
+        "message_type": str(getattr(m, "message_type", None) or "text").lower(),
+        "content": str(getattr(m, "content", None) or ""),
+        "inserted_at": ts,
+    }
+
+
+async def _fetch_room_messages(
+    rest_client: object,
+    room_id: str,
+    *,
+    max_pages: int = 100,
+    page_size: int = 50,
+) -> list:
+    """Paginate through a room's history and return all messages, oldest-first."""
+    all_msgs = []
+    for page in range(1, max_pages + 1):
+        resp = await rest_client.human_api_messages.list_my_chat_messages(
+            room_id, page=page, page_size=page_size,
+        )
+        data = getattr(resp, "data", None) or []
+        if not data:
+            break
+        all_msgs.extend(data)
+        if len(data) < page_size:
+            break
+
+    def _ts(m: object) -> str:
+        for attr in ("created_at", "createdAt", "inserted_at"):
+            v = getattr(m, attr, None)
+            if v is not None:
+                return str(v)
+        return ""
+
+    all_msgs.sort(key=_ts)
+    return all_msgs
+
+
+@cli.command("room-log")
+@click.argument("room_id", required=False, default=None)
+@click.option("--json", "as_json", is_flag=True, help="Output raw JSON lines (one object per line)")
+@click.option("--dir", "project_dir", default=".", help="Project directory")
+@_project_aware
+def room_log(room_id: str | None, as_json: bool, project_dir: str) -> None:
+    """Dump a Band room's full message transcript.
+
+    ROOM_ID defaults to the active room (.codeband_room pointer).
+    Messages are printed in timestamp order with agent attribution,
+    matching the `cb feed` format. Use --json for raw structured output.
+    """
+    import json as _json
+    import os
+
+    project = Path(project_dir).resolve()
+    config = load_config(project)
+
+    if room_id is None:
+        from codeband.state.registration import read_room_pointer, resolve_state_dir
+
+        room_id = read_room_pointer(project, resolve_state_dir(config, project))
+        if not room_id:
+            raise click.ClickException(
+                "No active room found. Pass a ROOM_ID argument or start a task with 'cb task'."
+            )
+
+    api_key = os.environ.get("BAND_API_KEY")
+    if not api_key:
+        click.echo("Error: BAND_API_KEY not set. Set it in .env or environment.", err=True)
+        sys.exit(1)
+
+    from codeband.config import load_agent_config
+    from codeband.monitoring.feed import FeedFormatter
+    from thenvoi.client.rest import AsyncRestClient
+
+    agent_config = load_agent_config(project)
+    agent_names = {v.agent_id: k for k, v in agent_config.agents.items()}
+    formatter = FeedFormatter(agent_names, verbose=True)
+
+    rest = AsyncRestClient(api_key=api_key, base_url=config.band.rest_url)
+
+    async def _dump() -> None:
+        msgs = await _fetch_room_messages(rest, room_id)
+        if not as_json:
+            click.echo(f"# Room {room_id} — {len(msgs)} messages\n")
+        for m in msgs:
+            msg_dict = _room_msg_to_dict(m, agent_names)
+            if as_json:
+                click.echo(_json.dumps(msg_dict))
+            else:
+                line = formatter.format(msg_dict)
+                if line is not None:
+                    click.echo(line)
+
+    _run_async(_dump())
 
 
 def _detect_git_credentials(env: dict[str, str]) -> None:
