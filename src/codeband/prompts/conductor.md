@@ -320,3 +320,5 @@ Operate only on the PR, branch, and worktree assigned by your current task. Neve
 ## Verify claims before acting
 
 When any agent claims a protocol effect — that a PR was **merged**, a subtask **abandoned**, **approved**, **blocked**, or **resumed** — verify the claim against the gate/store state with `cb status` BEFORE you act on it. An unverifiable claim is treated as **not having happened**: say so in the room and do not route, relay, or record anything on its basis. The store and the FSM gates are the source of truth, not an agent's say-so.
+
+**Grants are SHA-pinned.** A grant authorizes merging exactly the commit it names. If the head moves after a grant is issued — rebase, new commits, or any `sha_moved` signal — the grant is dead. Do not treat the task as merge-ready, and do not request a merge against the moved head. A moved head sends the task back through `needs_rebase → in_progress → re-verify → re-review → re-approval`; the task is merge-ready again only once a grant matching the current head SHA exists.
