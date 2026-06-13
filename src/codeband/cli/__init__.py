@@ -1530,3 +1530,38 @@ def _detect_github_auth(env: dict[str, str]) -> None:
     token = result.stdout.strip()
     if token:
         env.setdefault("GH_TOKEN", token)
+
+
+def main() -> None:
+    """Console entry point for ``cb`` / ``codeband``.
+
+    Wraps the click group with the Stage-3 attribution logging: a
+    ``cli_invocation`` event before dispatch and a ``cli_completion`` event
+    with the resolved exit code after — for the whole sanctioned CLI surface.
+    Runs click with ``standalone_mode=False`` so the exit code is observable on
+    every path (success, ``ClickException``, ``Abort``, ``SystemExit``), then
+    re-exits with it. Logging is best-effort and never alters the exit code.
+    """
+    from codeband.monitoring.activity_log import record_cli_invocation
+
+    argv = sys.argv[1:]
+    complete = record_cli_invocation("cb", argv)
+    try:
+        cli.main(args=argv, standalone_mode=False)
+    except click.ClickException as exc:
+        exc.show()
+        complete(exc.exit_code)
+        sys.exit(exc.exit_code)
+    except click.exceptions.Abort:
+        click.echo("Aborted!", err=True)
+        complete(1)
+        sys.exit(1)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        complete(code)
+        raise
+    except Exception:
+        complete(1)
+        raise
+    else:
+        complete(0)

@@ -658,8 +658,18 @@ async def _install_memory_backend(
 
 # ─── workspace path helpers ─────────────────────────────────────────────────
 
-def _export_project_dir_env(project_dir: Path) -> None:
+def _export_project_dir_env(project_dir: Path, *, role: str | None = None) -> None:
     """Export ``CODEBAND_PROJECT_DIR`` for every session this process spawns.
+
+    ``role`` (Stage-3 attribution): when given, also exports
+    ``CODEBAND_ROLE=<role>`` on this process so every spawned session inherits
+    it. This is the same seam that #46 used for ``CODEBAND_AGENT_SESSION``. It
+    is only meaningful in **distributed mode** (``run_agent``), where the
+    process IS a single role — local ``run_local`` runs every role in one
+    process, so there is no single role to export and ``CODEBAND_ROLE`` stays
+    unset (the operator-like, ungated path; cb-phase role gating treats unset
+    as allowed). Like the session marker, this is an accident guard / forensic
+    marker, not authentication.
 
     The coder/reviewer/mergemaster CLI sessions (Claude Code / Codex
     subprocesses spawned by the adapters, which already receive their ``cwd``
@@ -686,6 +696,8 @@ def _export_project_dir_env(project_dir: Path) -> None:
 
     os.environ["CODEBAND_PROJECT_DIR"] = str(Path(project_dir).resolve())
     os.environ["CODEBAND_AGENT_SESSION"] = "1"
+    if role is not None:
+        os.environ["CODEBAND_ROLE"] = role
 
 
 def _resolve_workspace_config(config: CodebandConfig, project_dir: Path) -> CodebandConfig:
@@ -1179,7 +1191,9 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
     # resolved project dir so cb-phase / cb approve work from any cwd. In
     # Docker the compose env block already pins this to /app/config — the
     # re-export resolves to the identical path (project_dir IS that dir).
-    _export_project_dir_env(project_dir)
+    # Distributed mode IS a single role per process, so we also export
+    # CODEBAND_ROLE here (Stage-3 attribution / cb-phase role gating).
+    _export_project_dir_env(project_dir, role=role)
 
     # Resolve memory backend per process.
     probe_client = _create_rest_client(creds.api_key, resolved_config.band.rest_url)

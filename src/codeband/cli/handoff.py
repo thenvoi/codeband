@@ -195,6 +195,51 @@ EXIT_PR_QUERY_FAILED = 15
 # hole: before this gate any open PR satisfied the "PR is open" check. A
 # legitimate coder error: counts as one rejected verify attempt.
 EXIT_WRONG_PR = 16
+# (17 is the merge leg's rebase-cap escalation in ``cli/merge.py``.)
+# The caller's ``$CODEBAND_ROLE`` is set (a spawned agent session) but is not
+# in the subcommand's allowed-role set — an ACCIDENT GUARD that catches a role
+# reaching for a command outside its lane (e.g. a reviewer running ``merge``).
+# Trivially bypassable (a process can unset the env var) — NOT authentication.
+# Unset role (the human-operator path) is always allowed.
+EXIT_ROLE_MISMATCH = 18
+
+# Per-subcommand allowed roles for the accident-guard role gate (Stage-3). The
+# role string is ``$CODEBAND_ROLE`` as exported by the runner's spawn seam
+# (distributed mode). A command absent from this map is ungated.
+_ROLE_ALLOWED: dict[str, frozenset[str]] = {
+    "start": frozenset({"conductor", "coder"}),
+    "verify": frozenset({"coder"}),
+    "review": frozenset({"reviewer"}),
+    "merge": frozenset({"mergemaster"}),
+    "abandon": frozenset({"conductor"}),
+    "resume": frozenset({"conductor"}),
+}
+
+
+def _check_role(command: str) -> int | None:
+    """Accident-guard role gate: refuse a role reaching outside its lane.
+
+    Returns :data:`EXIT_ROLE_MISMATCH` (after a tagged stderr line) when
+    ``$CODEBAND_ROLE`` is set AND not in ``command``'s allowed-role set;
+    returns ``None`` (allowed) when the env var is unset — the human-operator
+    path, by construction — or the command is ungated. This is an accident
+    guard, NOT authentication: a process that controls its own environment can
+    unset the marker, so this stops reflexive mistakes, not a motivated actor.
+    """
+    role = os.environ.get("CODEBAND_ROLE")
+    allowed = _ROLE_ALLOWED.get(command)
+    if role is None or allowed is None:
+        return None
+    if role not in allowed:
+        print(
+            f"REJECTED [role_mismatch]: cb-phase {command} is restricted to "
+            f"role(s) {sorted(allowed)}, but CODEBAND_ROLE is {role!r}. This is "
+            "an accident guard (trivially bypassable, not authentication); the "
+            "human-operator path runs with no role set.",
+            file=sys.stderr,
+        )
+        return EXIT_ROLE_MISMATCH
+    return None
 
 # How many trailing lines of a failing verify command's output to surface in
 # the ``REJECTED [verify_failed]`` message — enough to see the failure without
@@ -1059,7 +1104,14 @@ def _cmd_review(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cb-phase",
-        description="Verify-gated phase handoffs for codeband subtasks.",
+        description=(
+            "Verify-gated phase handoffs for codeband subtasks. Each "
+            "subcommand declares the agent role(s) allowed to run it; when "
+            "CODEBAND_ROLE is set (a spawned agent session) a mismatch is "
+            "refused with [role_mismatch]. This is an accident guard — "
+            "trivially bypassable, NOT authentication; the human operator runs "
+            "with no role set and is never gated."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1211,6 +1263,23 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Console entry point for ``cb-phase``. Returns a process exit code.
 
+    Records the attribution invocation/completion events (Stage-3) around the
+    actual run, then delegates to :func:`_run` for the parse-and-dispatch with
+    its traceback-free error contract. The completion event always fires with
+    the resolved exit code, including the error paths.
+    """
+    from codeband.monitoring.activity_log import record_cli_invocation
+
+    raw = list(sys.argv[1:]) if argv is None else list(argv)
+    complete = record_cli_invocation("cb-phase", raw)
+    code = _run(argv)
+    complete(code)
+    return code
+
+
+def _run(argv: list[str] | None) -> int:
+    """Parse + dispatch one ``cb-phase`` invocation, returning its exit code.
+
     Top-level error handling [F7-4]: the legs raise freely (missing
     ``codeband.yaml``, a pydantic ``ValidationError`` from a malformed one,
     unexpected IO errors); this is the single place that turns any of them
@@ -1222,6 +1291,11 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
+    # Accident-guard role gate (Stage-3): refuse a spawned role reaching for a
+    # command outside its lane. No-op when CODEBAND_ROLE is unset.
+    role_code = _check_role(args.command)
+    if role_code is not None:
+        return role_code
     try:
         return args.func(args)
     except FileNotFoundError as exc:

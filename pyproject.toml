@@ -56,8 +56,8 @@ dev = [
 ]
 
 [project.scripts]
-cb = "codeband.cli:cli"
-codeband = "codeband.cli:cli"
+cb = "codeband.cli:main"
+codeband = "codeband.cli:main"
 cb-phase = "codeband.cli.handoff:main"
 
 [project.urls]
