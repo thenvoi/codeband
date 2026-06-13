@@ -172,3 +172,23 @@ def test_conductor_prompt_pins_verify_claims_duty():
     # Names the protocol effects it must verify.
     for effect in ("merged", "abandoned", "approved", "blocked", "resumed"):
         assert effect in text
+
+
+# ── 3d: conductor acceptance-verification dispatch carries acceptance criteria ─
+
+def test_conductor_acceptance_dispatch_includes_acceptance_criteria():
+    """The Acceptance Verification Protocol dispatch must include the task's
+    acceptance criteria so the Verifier has the contract to check against."""
+    text = Path("src/codeband/prompts/conductor.md").read_text(encoding="utf-8")
+    # The dispatch line must name all five fields — PR URL, subtask, task key,
+    # branch, and acceptance criteria.
+    assert "acceptance criteria" in text
+    # Specifically within the Acceptance Verification Protocol section.
+    avp_start = text.index("### Acceptance Verification Protocol")
+    avp_end = text.index("\n###", avp_start + 1)
+    avp_text = text[avp_start:avp_end]
+    assert "acceptance criteria" in avp_text
+    assert "PR URL" in avp_text or "PR url" in avp_text.lower()
+    assert "subtask" in avp_text
+    assert "task key" in avp_text
+    assert "branch" in avp_text
