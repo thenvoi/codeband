@@ -872,6 +872,24 @@ class WatchdogDaemon:
             git_head = await asyncio.to_thread(self._git_head, branch)
             if git_head is None:
                 reads_failed += 1
+
+        # SHA-drift rung (finding 28): for merge_pending subtasks, detect when
+        # the branch HEAD has moved past the approved SHA.  The approved SHA is
+        # the commit the approver signed off on; a drift means the grant is stale
+        # and a fresh rebase → re-review → re-approval cycle is needed.  Route
+        # via the same mergemaster FSM edge used by the merge leg so the rebase-
+        # round cap and all FSM invariants are preserved.  Fires only when both
+        # merge_approved_sha and git_head are known; skipped on unresolvable HEAD
+        # to avoid false trips on transient probe failures.
+        approved_sha: str | None = getattr(sub, "merge_approved_sha", None)
+        if (
+            sub.state == "merge_pending"
+            and approved_sha
+            and git_head is not None
+            and git_head != approved_sha
+        ):
+            await self._on_merge_pending_sha_drift(sub, git_head)
+            return
         pr_ts = None
         if sub.pr_number is not None:
             reads_attempted += 1
@@ -945,6 +963,72 @@ class WatchdogDaemon:
             # silent permanent stall is not.
             if await self._send_blocked_escalation(sub):
                 health.escalated = True
+
+    async def _on_merge_pending_sha_drift(self, sub: Any, live_sha: str) -> None:
+        """Route a merge_pending subtask to needs_rebase after its head drifted.
+
+        Uses the Mergemaster's FSM edge (``merge_pending → needs_rebase``) so
+        the rebase-round cap is enforced and all FSM invariants are preserved.
+        Logs a room alert so the Conductor and Coder are informed immediately.
+        Best-effort: a failed FSM transition or post is logged but does not
+        break patrol.
+        """
+        import asyncio
+        from codeband.state import fsm
+
+        approved_sha: str | None = getattr(sub, "merge_approved_sha", None)
+        reason = (
+            f"[watchdog] head SHA moved since grant "
+            f"({approved_sha[:8] if approved_sha else '?'} → {live_sha[:8]})"
+        )
+        logger.warning(
+            "Subtask %s: merge_pending head drifted from approved SHA %s to %s "
+            "— routing to needs_rebase",
+            sub.subtask_id, approved_sha, live_sha,
+        )
+        try:
+            await asyncio.to_thread(
+                fsm.transition,
+                sub.subtask_id, sub.task_id, "needs_rebase",
+                caller_role="mergemaster", reason=reason, store=self._store,
+            )
+        except Exception:
+            logger.exception(
+                "Watchdog: needs_rebase transition failed for %s after SHA drift",
+                sub.subtask_id,
+            )
+            return
+
+        if self._activity:
+            self._activity.log(
+                "SUBTASK_SHA_DRIFT", "watchdog",
+                f"Subtask {sub.subtask_id} routed to needs_rebase: "
+                f"head moved from {approved_sha} to {live_sha}",
+            )
+
+        room_id = await self._resolve_room_id(sub.task_id)
+        if room_id is None:
+            return
+        from thenvoi_rest.types import ChatMessageRequest
+
+        try:
+            await self._rest.agent_api_messages.create_agent_chat_message(
+                chat_id=room_id,
+                message=ChatMessageRequest(
+                    content=(
+                        f"[Watchdog] Subtask {sub.subtask_id}: branch HEAD moved "
+                        f"({approved_sha[:8] if approved_sha else '?'} → {live_sha[:8]}) "
+                        f"while merge_pending — grant is stale, subtask sent to "
+                        f"needs_rebase. Coder: rebase, re-verify, re-earn verdicts, "
+                        f"then request re-approval."
+                    ),
+                    mentions=[],
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Watchdog: failed to post SHA-drift alert for %s", sub.subtask_id,
+            )
 
     def _git_head(self, branch: str) -> str | None:
         """Return the commit SHA at ``branch``, or ``None`` if it can't be read.
@@ -1076,7 +1160,24 @@ class WatchdogDaemon:
         if room_id is None:
             return fsm_applied
 
-        from thenvoi_rest.types import ChatMessageRequest
+        from thenvoi_rest.types import ChatMessageRequest, ChatMessageRequestMentionsItem
+
+        # Determine who to mention in the stall alert: the assigned worker
+        # when known, otherwise the task owner.  Never pass None to
+        # ChatMessageRequestMentionsItem — that produces an HTTP 422
+        # (mentioned_participant_not_in_room) from the server.
+        mention_id: str | None = getattr(sub, "assigned_worker", None)
+        if mention_id is None:
+            mention_id = await self._resolve_owner_id(sub.task_id)
+        if mention_id is None:
+            logger.debug(
+                "Stall-blocked alert for subtask %s: no mention target "
+                "(assigned_worker=None, owner unresolvable) — posting without mention",
+                sub.subtask_id,
+            )
+        mentions = (
+            [ChatMessageRequestMentionsItem(id=mention_id)] if mention_id else []
+        )
 
         suffix = "" if fsm_applied else " (blocked-transition could not be applied)"
         try:
@@ -1089,7 +1190,7 @@ class WatchdogDaemon:
                         f"patrols. Marking it blocked; Conductor please reassign or "
                         f"investigate.{suffix}"
                     ),
-                    mentions=[],
+                    mentions=mentions,
                 ),
             )
         except Exception:

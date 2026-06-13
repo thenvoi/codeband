@@ -1522,3 +1522,141 @@ async def test_page_walk_is_capped(tmp_path):
     assert len(requested) - 1 == _MAX_PROBE_PAGES
     # Newest five pages' contents, oldest→newest.
     assert [m.id for m in messages] == ["p6-0", "p7-0", "p8-0", "p9-0", "p10-0"]
+
+
+# ── finding 26: stall-blocked alert uses assigned_worker or owner for mention ─
+
+def _seed_stall_blocked(tmp_path, *, assigned_worker: str | None = None,
+                        owner_id: str | None = None):
+    """Store with one subtask in in_progress and optional worker/owner."""
+    from codeband.state import StateStore
+
+    store = StateStore(tmp_path / "state" / "orchestration.db")
+    store.create_task(TASK_ID, "demo task", ROOM_ID, owner_id=owner_id)
+    store.ensure_subtask(
+        SUBTASK_ID, TASK_ID,
+        state="in_progress",
+        metadata={"branch": "feature-x"},
+    )
+    if assigned_worker is not None:
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(store.db_path)
+        conn.execute(
+            "UPDATE subtask_states SET assigned_worker = ? WHERE subtask_id = ?",
+            (assigned_worker, SUBTASK_ID),
+        )
+        conn.commit()
+        conn.close()
+    return store
+
+
+@pytest.mark.asyncio
+async def test_stall_blocked_alert_mentions_assigned_worker(tmp_path):
+    """When assigned_worker is set the stall-blocked alert mentions them."""
+    store = _seed_stall_blocked(tmp_path, assigned_worker="coder-42", owner_id="owner-1")
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest, owner_id="owner-1")
+
+    sub = store.get_subtask(SUBTASK_ID, TASK_ID)
+    await daemon._send_blocked_escalation(sub)
+
+    msg = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
+    assert [m.id for m in msg.mentions] == ["coder-42"]
+
+
+@pytest.mark.asyncio
+async def test_stall_blocked_alert_null_worker_routes_to_owner(tmp_path):
+    """With assigned_worker=NULL the alert falls back to the task owner."""
+    store = _seed_stall_blocked(tmp_path, assigned_worker=None, owner_id="owner-7")
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest, owner_id="owner-7")
+
+    sub = store.get_subtask(SUBTASK_ID, TASK_ID)
+    await daemon._send_blocked_escalation(sub)
+
+    msg = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
+    assert [m.id for m in msg.mentions] == ["owner-7"]
+
+
+@pytest.mark.asyncio
+async def test_stall_blocked_alert_null_worker_null_owner_no_422(tmp_path):
+    """When both assigned_worker and owner are NULL the alert posts without a
+    mention so no None id reaches ChatMessageRequestMentionsItem (→ 422)."""
+    store = _seed_stall_blocked(tmp_path, assigned_worker=None, owner_id=None)
+    rest = _mock_rest()
+    daemon = _owner_daemon(store, rest, owner_id=None, owner_handle=None)
+
+    sub = store.get_subtask(SUBTASK_ID, TASK_ID)
+    await daemon._send_blocked_escalation(sub)
+
+    msg = rest.agent_api_messages.create_agent_chat_message.call_args.kwargs["message"]
+    assert msg.mentions == []
+
+
+# ── finding 28: merge_pending SHA-drift rung routes to needs_rebase ──────────
+
+def _seed_merge_pending(tmp_path, *, approved_sha: str, owner_id: str = "owner-1"):
+    """Store with a merge_pending subtask whose approved SHA is set."""
+    import sqlite3 as _sqlite3
+    from codeband.state import StateStore
+
+    store = StateStore(tmp_path / "state" / "orchestration.db")
+    store.create_task(TASK_ID, "demo task", ROOM_ID, owner_id=owner_id)
+    store.ensure_subtask(
+        SUBTASK_ID, TASK_ID,
+        state="in_progress",
+        metadata={"branch": "feature-x"},
+    )
+    conn = _sqlite3.connect(store.db_path)
+    conn.execute(
+        "UPDATE subtask_states SET state = 'merge_pending', "
+        "merge_approved_sha = ? WHERE subtask_id = ?",
+        (approved_sha, SUBTASK_ID),
+    )
+    conn.commit()
+    conn.close()
+    return store
+
+
+@pytest.mark.asyncio
+async def test_merge_pending_sha_drift_routes_to_needs_rebase(tmp_path, monkeypatch):
+    """When the branch HEAD has moved past the approved SHA, the watchdog drives
+    the merge_pending subtask to needs_rebase via the mergemaster FSM edge."""
+    approved_sha = "aaa1111"
+    live_sha = "bbb2222"
+    store = _seed_merge_pending(tmp_path, approved_sha=approved_sha)
+    rest = _mock_rest()
+
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **kw: type("R", (), {"returncode": 0, "stdout": live_sha + "\n"})(),
+    )
+
+    config = WatchdogConfig(max_phase_visits=10, git_progress_check=True)
+    daemon = _daemon(store, config=config, rest=rest)
+    now = datetime.now(UTC)
+    await daemon._check_subtask_progress(now)
+
+    sub = store.get_subtask(SUBTASK_ID, TASK_ID)
+    assert sub.state == "needs_rebase"
+
+
+@pytest.mark.asyncio
+async def test_merge_pending_sha_stable_no_reroute(tmp_path, monkeypatch):
+    """When the live HEAD matches the approved SHA no needs_rebase transition fires."""
+    sha = "aaa1111"
+    store = _seed_merge_pending(tmp_path, approved_sha=sha)
+    rest = _mock_rest()
+
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **kw: type("R", (), {"returncode": 0, "stdout": sha + "\n"})(),
+    )
+
+    config = WatchdogConfig(max_phase_visits=10, git_progress_check=True)
+    daemon = _daemon(store, config=config, rest=rest)
+    now = datetime.now(UTC)
+    await daemon._check_subtask_progress(now)
+
+    sub = store.get_subtask(SUBTASK_ID, TASK_ID)
+    assert sub.state == "merge_pending"
