@@ -10,7 +10,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from codeband.cli import _load_project_dotenv
+
+# These tests exercise real .env loading — opt out of the _isolate_dotenv fixture.
+pytestmark = pytest.mark.real_dotenv
 
 
 def test_loads_env_from_project_dir(tmp_path: Path, monkeypatch):

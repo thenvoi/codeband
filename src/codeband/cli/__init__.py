@@ -20,6 +20,7 @@ from codeband.config import (
     Framework,
     RepoConfig,
     load_config,
+    resolve_workspace_path,
 )
 from codeband.orchestration.compose import (
     ComposeFileNotFound,
@@ -553,9 +554,7 @@ def register_task_cmd(
     from codeband.state import StateStore
     from codeband.state.registration import register_task
 
-    workspace_path = Path(config.workspace.path)
-    if not workspace_path.is_absolute():
-        workspace_path = project / workspace_path
+    workspace_path = resolve_workspace_path(config, project)
     store = StateStore(workspace_path / "state" / "orchestration.db")
 
     try:
@@ -606,7 +605,10 @@ def prs(sort_mode: str, smart: bool, limit: int, pick: int | None,
     slug = repo_slug(config.repo.url)
     click.echo(f"Fetching open PRs from {slug}...")
 
-    raw = fetch_open_prs(slug, limit=100)
+    try:
+        raw = fetch_open_prs(slug, limit=100)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from None
     if not raw:
         click.echo("No open PRs found.")
         return
@@ -707,7 +709,10 @@ def issues(sort_mode: str, smart: bool, limit: int, pick: int | None,
     slug = repo_slug(config.repo.url)
     click.echo(f"Fetching open issues from {slug}...")
 
-    raw = fetch_open_issues(slug, limit=100, label=label)
+    try:
+        raw = fetch_open_issues(slug, limit=100, label=label)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from None
     if not raw:
         click.echo("No open issues found.")
         return
@@ -720,7 +725,10 @@ def issues(sort_mode: str, smart: bool, limit: int, pick: int | None,
             click.echo(f"Issue #{pick} not found among open issues.", err=True)
             sys.exit(1)
         # Fetch full body for the picked issue
-        detail = fetch_issue_detail(slug, pick)
+        try:
+            detail = fetch_issue_detail(slug, pick)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from None
         chosen = IssueInfo.from_gh(detail)
     elif smart:
         click.echo("Ranking issues by impact (AI)...")
@@ -732,7 +740,10 @@ def issues(sort_mode: str, smart: bool, limit: int, pick: int | None,
         choice = click.prompt("Pick an issue number to send as task (0 to cancel)", type=int)
         if choice == 0:
             return
-        detail = fetch_issue_detail(slug, choice)
+        try:
+            detail = fetch_issue_detail(slug, choice)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from None
         chosen = IssueInfo.from_gh(detail)
     else:
         sorted_issues = sort_issues(issues_list, sort_mode)[:limit]
@@ -743,7 +754,10 @@ def issues(sort_mode: str, smart: bool, limit: int, pick: int | None,
         choice = click.prompt("Pick an issue number to send as task (0 to cancel)", type=int)
         if choice == 0:
             return
-        detail = fetch_issue_detail(slug, choice)
+        try:
+            detail = fetch_issue_detail(slug, choice)
+        except RuntimeError as exc:
+            raise click.ClickException(str(exc)) from None
         chosen = IssueInfo.from_gh(detail)
 
     description = _build_issue_task(chosen, auto=auto)
@@ -770,7 +784,10 @@ def issue(number: int, auto: bool, project_dir: str) -> None:
     slug = repo_slug(config.repo.url)
     click.echo(f"Fetching issue #{number} from {slug}...")
 
-    detail = fetch_issue_detail(slug, number)
+    try:
+        detail = fetch_issue_detail(slug, number)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from None
     chosen = IssueInfo.from_gh(detail)
 
     description = _build_issue_task(chosen, auto=auto)
@@ -1309,7 +1326,12 @@ def usage(agent: str | None, since: str | None, project_dir: str) -> None:
 
     reader = make_backend(config, project).make_activity_reader()
 
-    since_dt = _parse_since(since) if since else None
+    since_dt = None
+    if since:
+        try:
+            since_dt = _parse_since(since)
+        except (ValueError, OverflowError) as exc:
+            raise click.ClickException(f"Invalid --since value {since!r}: {exc}") from None
     summary = UsageSummary.from_activity_reader(reader, agent=agent, since=since_dt)
 
     if summary.call_count == 0:
@@ -1364,7 +1386,12 @@ def log(agent: str | None, event_type: str | None, since: str | None,
 
     reader = make_backend(config, project).make_activity_reader()
 
-    since_dt = _parse_since(since) if since else None
+    since_dt = None
+    if since:
+        try:
+            since_dt = _parse_since(since)
+        except (ValueError, OverflowError) as exc:
+            raise click.ClickException(f"Invalid --since value {since!r}: {exc}") from None
     events = reader.read(agent=agent, event_type=event_type, since=since_dt)
 
     if not events:
@@ -1415,7 +1442,6 @@ def verify_log(project_dir: str) -> None:
     import sqlite3
 
     from codeband.cli.handoff import resolve_project_dir
-    from codeband.config import resolve_workspace_path
     from codeband.state import (
         AUDIT_HASH_COLS,
         TRANSITION_HASH_COLS,

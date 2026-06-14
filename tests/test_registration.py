@@ -659,3 +659,46 @@ class TestRegisterTaskCli:
         assert result.exit_code != 0
         assert not _ws_pointer(tmp_path).exists()
         assert not (tmp_path / "workspace" / "state" / "orchestration.db").exists()
+
+    def test_workspace_env_var_wins_over_config_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """$WORKSPACE overrides relative config.workspace.path for the store location.
+
+        register-task must use resolve_workspace_path (the ONE shared rule) so
+        Docker containers with $WORKSPACE=/workspace don't open a shadow store
+        in a project-relative directory.
+        """
+        from codeband.config import AgentsConfig, CodebandConfig, RepoConfig, WorkspaceConfig
+
+        workspace_dir = tmp_path / "custom_workspace"
+        workspace_dir.mkdir()
+        monkeypatch.setenv("WORKSPACE", str(workspace_dir))
+
+        # Use a relative workspace.path so $WORKSPACE kicks in.
+        config = CodebandConfig(
+            repo=RepoConfig(url="https://github.com/example/repo.git", branch="main"),
+            agents=AgentsConfig(handoff_verify_command="true"),
+            workspace=WorkspaceConfig(path=".codeband"),
+        )
+        config.to_yaml(tmp_path / "codeband.yaml")
+
+        runner = CliRunner()
+        result = runner.invoke(cb_cli, [
+            "register-task",
+            "--room", "room-ws",
+            "--owner", "owner-1",
+            "--description", "workspace env test",
+            "--dir", str(tmp_path),
+        ])
+
+        assert result.exit_code == 0, result.output
+        # DB must be under $WORKSPACE, not under project_dir/.codeband/
+        ws_db = workspace_dir / ".codeband" / "state" / "orchestration.db"
+        assert ws_db.exists(), f"Expected DB at {ws_db}"
+        task = StateStore(ws_db).get_task("room-ws")
+        assert task is not None
+        assert task.owner_id == "owner-1"
+        # The shadow path (project-relative) must NOT have a DB.
+        shadow_db = tmp_path / ".codeband" / "state" / "orchestration.db"
+        assert not shadow_db.exists(), f"Shadow DB found at {shadow_db} — $WORKSPACE not honored"
