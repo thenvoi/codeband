@@ -859,6 +859,24 @@ def _iter_pool(pool: FrameworkPool, role: WorkerRole):
 
 # ─── run_local: pool-driven in-process runtime ─────────────────────────────
 
+def _make_watchdog_done_callback(activity: Any) -> Callable[[asyncio.Task], None]:
+    """Return a done-callback that surfaces unexpected watchdog task deaths loudly."""
+
+    def _on_done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error(
+                "Watchdog task died unexpectedly — %s: %s",
+                type(exc).__name__, exc,
+                exc_info=exc,
+            )
+            activity.log("WATCHDOG_CRASH", "watchdog", f"{type(exc).__name__}: {exc}")
+
+    return _on_done
+
+
 async def run_local(
     config: CodebandConfig,
     project_dir: Path,
@@ -1120,6 +1138,7 @@ async def run_local(
 
     watchdog_task = asyncio.create_task(watchdog.run())
     task_names[watchdog_task] = "watchdog"
+    watchdog_task.add_done_callback(_make_watchdog_done_callback(activity))
     shutdown_task = asyncio.create_task(shutdown_event.wait())
 
     all_tasks = unsupervised_tasks + supervisor_tasks + [watchdog_task]
