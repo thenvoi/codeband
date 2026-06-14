@@ -109,6 +109,45 @@ class TestResolveClaudeAuth:
             _resolve_claude_auth()
             mock_probe.assert_not_called()
 
+    def test_prefer_api_key_flag_retains_key_when_oauth_env_present(self):
+        """CODEBAND_CLAUDE_PREFER_API_KEY=1 keeps ANTHROPIC_API_KEY even with OAuth."""
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-test",
+            "CLAUDE_CODE_OAUTH_TOKEN": "tok-test",
+            "CODEBAND_CLAUDE_PREFER_API_KEY": "1",
+        }
+        with patch.dict(os.environ, env, clear=False), patch(
+            "codeband.cli._has_claude_subscription_oauth", return_value=False,
+        ):
+            _resolve_claude_auth()
+            assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test"
+            assert "CODEBAND_FALLBACK_ANTHROPIC_API_KEY" not in os.environ
+
+    def test_prefer_api_key_flag_retains_key_when_subscription_oauth_present(self):
+        """CODEBAND_CLAUDE_PREFER_API_KEY=1 keeps ANTHROPIC_API_KEY with subscription OAuth."""
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-test",
+            "CODEBAND_CLAUDE_PREFER_API_KEY": "true",
+        }
+        with patch.dict(os.environ, env, clear=False), patch(
+            "codeband.cli._has_claude_subscription_oauth", return_value=True,
+        ):
+            os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            _resolve_claude_auth()
+            assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test"
+            assert "CODEBAND_FALLBACK_ANTHROPIC_API_KEY" not in os.environ
+
+    def test_prefer_api_key_flag_absent_does_not_change_existing_behavior(self):
+        """Without the flag, OAuth still strips the API key (default path unchanged)."""
+        env = {"ANTHROPIC_API_KEY": "sk-ant-test", "CLAUDE_CODE_OAUTH_TOKEN": "tok-test"}
+        with patch.dict(os.environ, env, clear=False), patch(
+            "codeband.cli._has_claude_subscription_oauth", return_value=False,
+        ):
+            os.environ.pop("CODEBAND_CLAUDE_PREFER_API_KEY", None)
+            _resolve_claude_auth()
+            assert "ANTHROPIC_API_KEY" not in os.environ
+            assert os.environ["CODEBAND_FALLBACK_ANTHROPIC_API_KEY"] == "sk-ant-test"
+
 
 class TestResolveCodexAuth:
     """Codex subscription auth wins at startup; API key is fallback only."""

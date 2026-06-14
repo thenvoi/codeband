@@ -155,6 +155,14 @@ def _resolve_claude_auth() -> None:
     """
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return
+    # Explicit opt-out of subscription-first. Set CODEBAND_CLAUDE_PREFER_API_KEY=1
+    # to keep ANTHROPIC_API_KEY even when an OAuth source exists, restoring the
+    # Claude CLI's native precedence (API key over OAuth) — e.g. when parallel
+    # coders would exhaust a subscription's rate limits. Codex is unaffected.
+    if os.environ.get("CODEBAND_CLAUDE_PREFER_API_KEY", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        return
     if (
         os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
         or _has_claude_subscription_oauth()
