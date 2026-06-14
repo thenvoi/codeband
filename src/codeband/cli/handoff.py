@@ -235,8 +235,11 @@ _ROLE_ALLOWED: dict[str, frozenset[str]] = {
 # Planned-subtask id shape — ``st-<integer>`` as emitted by the Planner. The
 # claim-time guard rejects anything that does not match BEFORE store / task
 # resolution runs, so a typo (e.g. a task key passed in the subtask slot)
-# cannot create a phantom row or burn any counter.
-_SUBTASK_ID_RE = re.compile(r"^st-\d+$")
+# cannot create a phantom row or burn any counter. We use ``re.fullmatch``
+# rather than ``re.match`` + ``^...$`` because Python's ``$`` also matches
+# *before* a trailing newline, so ``^st-\d+$`` would accept ``"st-1\n"`` and
+# the very loophole this guard exists to close would survive.
+_SUBTASK_ID_RE = re.compile(r"st-\d+")
 
 
 def _validate_subtask_id(subtask_id: str) -> int | None:
@@ -244,13 +247,14 @@ def _validate_subtask_id(subtask_id: str) -> int | None:
 
     Runs as the FIRST statement of every ``cb-phase`` leg, before any store
     open or task-id resolution: a malformed id (a typo, a task key in the
-    subtask slot, an empty string) must never reach :func:`_resolve_store` —
-    otherwise the FSM auto-creates the row and the typo becomes a phantom
-    subtask the rest of the system has to chase. On rejection, prints a
-    ``REJECTED [invalid_subtask_id]`` line naming the id and returns
-    :data:`EXIT_INVALID_SUBTASK_ID`; returns ``None`` for valid ids.
+    subtask slot, an empty string, anything with a trailing newline) must
+    never reach :func:`_resolve_store` — otherwise the FSM auto-creates the
+    row and the typo becomes a phantom subtask the rest of the system has
+    to chase. On rejection, prints a ``REJECTED [invalid_subtask_id]`` line
+    naming the id and returns :data:`EXIT_INVALID_SUBTASK_ID`; returns
+    ``None`` for valid ids.
     """
-    if not _SUBTASK_ID_RE.match(subtask_id):
+    if _SUBTASK_ID_RE.fullmatch(subtask_id) is None:
         print(
             f"REJECTED [invalid_subtask_id]: {subtask_id!r} is not a valid "
             "planned-subtask id — expected st-N (e.g., st-1, st-2).",

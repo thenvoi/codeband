@@ -795,6 +795,39 @@ def test_valid_subtask_id_passes_validator(good_id):
     assert handoff._validate_subtask_id(good_id) is None
 
 
+@pytest.mark.parametrize(
+    "sneaky_id",
+    [
+        "st-1\n",            # trailing newline — Python's $ matches before \n
+        "st-1\r\n",          # CRLF
+        "st-1\r",            # bare CR
+        "\nst-1",            # leading newline
+        "st-1\nst-2",        # embedded newline before another valid id
+        " st-1",             # leading whitespace
+        "st-1 ",             # trailing whitespace
+        "st-",               # no digits
+        "",                  # empty
+        "st-1a",             # trailing non-digit
+        "ST-1",              # wrong case
+    ],
+)
+def test_validator_rejects_sneaky_inputs(sneaky_id, capsys):
+    """Whitespace/newline/empty/case bypass attempts must be rejected.
+
+    The trailing-newline case is the original PR-#64 review finding: Python's
+    ``$`` matches *before* a final ``\\n``, so ``re.match(r"^st-\\d+$",
+    "st-1\\n")`` returns a match. ``re.fullmatch`` is the structural fix —
+    these cases lock it in.
+    """
+    assert (
+        handoff._validate_subtask_id(sneaky_id)
+        == handoff.EXIT_INVALID_SUBTASK_ID
+    )
+    err = capsys.readouterr().err
+    assert "REJECTED [invalid_subtask_id]" in err
+    assert repr(sneaky_id) in err
+
+
 def _build_guard_args(subcommand: str, bad_id: str) -> list[str]:
     """The minimum required-flags argv for each subcommand under guard test."""
     common = ["--project-dir", "."]
