@@ -235,11 +235,15 @@ _ROLE_ALLOWED: dict[str, frozenset[str]] = {
 # Planned-subtask id shape — ``st-<integer>`` as emitted by the Planner. The
 # claim-time guard rejects anything that does not match BEFORE store / task
 # resolution runs, so a typo (e.g. a task key passed in the subtask slot)
-# cannot create a phantom row or burn any counter. We use ``re.fullmatch``
-# rather than ``re.match`` + ``^...$`` because Python's ``$`` also matches
-# *before* a trailing newline, so ``^st-\d+$`` would accept ``"st-1\n"`` and
-# the very loophole this guard exists to close would survive.
-_SUBTASK_ID_RE = re.compile(r"st-\d+")
+# cannot create a phantom row or burn any counter. Two deliberate choices in
+# this pattern: (1) we use ``re.fullmatch`` rather than ``re.match`` + the
+# ``^...$`` anchors, because Python's ``$`` also matches *before* a trailing
+# newline, so the anchored form would accept ``"st-1\n"``; (2) we write
+# ``[0-9]+`` rather than ``\d+`` because ``\d`` matches Unicode digits by
+# default (e.g. ``"١"`` U+0661, ``"１"`` U+FF11), and a non-ASCII digit
+# subtask id would pass the guard but fail downstream — leaving the same
+# phantom-row class of bug open under a different input shape.
+_SUBTASK_ID_RE = re.compile(r"st-[0-9]+")
 
 
 def _validate_subtask_id(subtask_id: str) -> int | None:

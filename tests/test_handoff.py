@@ -809,15 +809,23 @@ def test_valid_subtask_id_passes_validator(good_id):
         "",                  # empty
         "st-1a",             # trailing non-digit
         "ST-1",              # wrong case
+        "st-١",         # Arabic-Indic digit U+0661 — \d accepts, [0-9] does not
+        "st-１２",   # full-width digits U+FF11 U+FF12 — same class
+        "st-1١",        # mixed ASCII + Unicode digit
     ],
 )
 def test_validator_rejects_sneaky_inputs(sneaky_id, capsys):
-    """Whitespace/newline/empty/case bypass attempts must be rejected.
+    """Whitespace/newline/empty/case/Unicode-digit bypass attempts must be rejected.
 
-    The trailing-newline case is the original PR-#64 review finding: Python's
-    ``$`` matches *before* a final ``\\n``, so ``re.match(r"^st-\\d+$",
-    "st-1\\n")`` returns a match. ``re.fullmatch`` is the structural fix —
-    these cases lock it in.
+    The trailing-newline case is the round-1 review finding: Python's ``$``
+    matches *before* a final ``\\n``, so ``re.match(r"^st-\\d+$", "st-1\\n")``
+    returns a match. ``re.fullmatch`` is the structural fix.
+
+    The Unicode-digit cases are the round-2 review finding: ``\\d`` in Python
+    matches any Unicode decimal digit by default (e.g. Arabic-Indic
+    ``\\u0661`` or full-width ``\\uff11``), so ``st-\\d+`` would accept
+    ``"st-\\u0661"``. ``[0-9]+`` restricts to ASCII digits — the only shape
+    the Planner ever emits.
     """
     assert (
         handoff._validate_subtask_id(sneaky_id)
