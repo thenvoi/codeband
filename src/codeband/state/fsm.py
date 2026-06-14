@@ -74,7 +74,7 @@ logger = logging.getLogger(__name__)
 # that one fires on the *absence* of mechanical progress (no git-HEAD change, no
 # new transition), so it never trips on a loop that commits real code every
 # round. The review-round cap bounds exactly that productive-but-circular loop.
-MAX_REVIEW_ROUNDS = 3
+MAX_REVIEW_ROUNDS = 6
 
 # Per-subtask rebase-round cap (S2-1). A subtask may *enter* ``needs_rebase``
 # at most this many times; the next attempt is rejected and the merge leg
