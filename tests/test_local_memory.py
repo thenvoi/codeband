@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from multiprocessing import Process
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -308,3 +310,58 @@ class TestSidecarLockAndCompaction:
 
         archived = [r for r in store._iter_records() if r.status == "archived"]
         assert len(archived) == 21
+
+
+class TestOSErrorDegradation:
+    """T-03: OSError in the write path must degrade, not crash-loop the caller."""
+
+    async def test_append_oserror_degrades_not_raises(
+        self, store: LocalMemoryStore, caplog: pytest.LogCaptureFixture
+    ):
+        """An OSError opening the data file must be caught and logged, not raised."""
+        original_open = Path.open
+
+        def fail_data_write(path_self: Path, mode: str = "r", **kwargs):
+            # Only the data file (suffix .jsonl) opened for append should fail.
+            # The lock sidecar (.jsonl.lock) must still open normally.
+            if path_self.suffix == ".jsonl" and "a" in mode:
+                raise OSError("simulated disk full")
+            return original_open(path_self, mode, **kwargs)
+
+        with patch.object(Path, "open", fail_data_write):
+            with caplog.at_level(logging.ERROR, logger="codeband.memory.local_store"):
+                result = await store.store(
+                    content="x", system="s", type="t", segment="seg"
+                )
+
+        assert result is not None  # returns a MemoryRecord — does not raise
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+
+    def test_rewrite_locked_oserror_degrades_not_raises(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        """An OSError writing the tmp file must be caught and logged, not raised."""
+        store = LocalMemoryStore(tmp_path / "memories.jsonl")
+        # Point path at a non-existent directory so the tmp write cannot succeed.
+        store.path = tmp_path / "nonexistent_dir" / "memories.jsonl"
+        rec = MemoryRecord(
+            id="mem_test", content="x", system="s", type="t",
+            segment="seg", scope="org", thought="",
+        )
+        with caplog.at_level(logging.ERROR, logger="codeband.memory.local_store"):
+            store._rewrite_locked([rec])  # must not raise
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+
+
+class TestArchiveOffLoop:
+    """T-09: archive()'s blocking flock + read + rewrite must run off the event loop."""
+
+    async def test_archive_dispatches_via_to_thread(self, store: LocalMemoryStore):
+        rec = await store.store(
+            content="x", system="working", type="episodic",
+            segment="agent", scope="organization", thought="",
+        )
+        with patch("asyncio.to_thread", wraps=asyncio.to_thread) as mock_tt:
+            result = await store.archive(rec.id)
+        assert result is not None
+        mock_tt.assert_called_once()
