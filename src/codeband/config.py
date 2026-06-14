@@ -401,6 +401,15 @@ class AgentsConfig(_StrictModel):
     # subtask on its first send-back.
     max_rebase_rounds: int = Field(default=3, ge=1)
 
+    # Exit codes from the verify command that classify as an infrastructure
+    # failure rather than a test failure. When the command exits with one of
+    # these codes the verify attempt is NOT counted against the coder's budget.
+    # ``None`` resolves to the module-level default in ``cli/handoff.py``
+    # (``_DEFAULT_INFRA_EXIT_CODES``): {124, 126, 127, 137, 143}. Can also be
+    # overridden per-repo via ``verify_infra_exit_codes`` in the worktree's
+    # ``.codeband.yaml``.
+    verify_infra_exit_codes: list[int] | None = None
+
     # How quickly an idle agent re-polls its pending message queue — the
     # SDK's Phase-2 idle resync, the delivery backstop for missed websocket
     # pushes. Passed to every role uniformly (coders included — same intake

@@ -37,6 +37,10 @@ def patch_gates(monkeypatch, store):
     monkeypatch.setattr(handoff, "_current_branch", lambda worktree: "feat-x")
     monkeypatch.setattr(handoff, "_run_verify_command", lambda cmd, cwd: (0, ""))
     monkeypatch.setattr(handoff, "_git_head", lambda worktree: "cafe1234")
+    monkeypatch.setattr(
+        handoff, "_verify_infra_exit_codes",
+        lambda project_dir, worktree: handoff._DEFAULT_INFRA_EXIT_CODES,
+    )
     # Verify's ONE gh snapshot: OPEN, on the worktree's branch, with the PR
     # head matching the worktree HEAD (the coder pushed) by default.
     monkeypatch.setattr(
@@ -228,6 +232,86 @@ def test_verify_failed_tail_is_truncated(patch_gates, monkeypatch, capsys):
     assert err.count("row-") <= handoff._VERIFY_OUTPUT_TAIL_LINES
 
 
+# ── infra exit-code bypass ────────────────────────────────────────────────────
+
+def test_verify_infra_exit_does_not_burn_attempt(patch_gates, monkeypatch, capsys):
+    """An infra exit code (127 = command not found) must NOT burn a verify attempt."""
+    store = patch_gates
+    monkeypatch.setattr(handoff, "_run_verify_command", lambda cmd, cwd: (127, "command not found"))
+    monkeypatch.setattr(handoff, "_verify_infra_exit_codes", lambda p, w: frozenset({127}))
+    attempts_before = store.get_subtask("st-1", "room-1").verify_attempts
+
+    assert _run() == handoff.EXIT_VERIFY_INFRA_FAILED
+    err = capsys.readouterr().err
+    assert "REJECTED [verify_infra_failed]" in err
+    assert "no attempt burned" in err
+    sub = store.get_subtask("st-1", "room-1")
+    assert sub.state == "verify_pending"
+    assert sub.verify_attempts == attempts_before
+
+
+@pytest.mark.parametrize("code", sorted(handoff._DEFAULT_INFRA_EXIT_CODES))
+def test_verify_default_infra_codes_bypass_budget(patch_gates, monkeypatch, code):
+    """Every default infra exit code routes to EXIT_VERIFY_INFRA_FAILED, no burn."""
+    store = patch_gates
+    monkeypatch.setattr(handoff, "_run_verify_command", lambda cmd, cwd: (code, ""))
+    attempts_before = store.get_subtask("st-1", "room-1").verify_attempts
+
+    assert _run() == handoff.EXIT_VERIFY_INFRA_FAILED
+    assert store.get_subtask("st-1", "room-1").verify_attempts == attempts_before
+
+
+def test_verify_exit_1_still_burns_attempt(patch_gates, monkeypatch):
+    """Exit 1 (real test failure) is NOT in the infra set — must burn one attempt."""
+    store = patch_gates
+    monkeypatch.setattr(handoff, "_run_verify_command", lambda cmd, cwd: (1, "tests failed"))
+    attempts_before = store.get_subtask("st-1", "room-1").verify_attempts
+
+    assert _run() == handoff.EXIT_VERIFY_FAILED
+    assert store.get_subtask("st-1", "room-1").verify_attempts == attempts_before + 1
+
+
+def test_verify_infra_codes_inrepo_overrides_default(tmp_path):
+    """An in-repo .codeband.yaml with verify_infra_exit_codes overrides the default."""
+    import unittest.mock as mock
+
+    inrepo = tmp_path / ".codeband.yaml"
+    inrepo.write_text("verify_infra_exit_codes:\n  - 42\n")
+    with mock.patch.object(
+        handoff, "load_config",
+        return_value=mock.MagicMock(agents=mock.MagicMock(verify_infra_exit_codes=None)),
+    ):
+        codes = handoff._verify_infra_exit_codes(tmp_path, tmp_path)
+    assert 42 in codes
+    assert 127 not in codes  # overrides the default entirely
+
+
+def test_verify_infra_codes_home_config_used_when_no_inrepo(tmp_path):
+    """Home config verify_infra_exit_codes is used when the worktree has no override."""
+    import unittest.mock as mock
+
+    with mock.patch.object(
+        handoff, "load_config",
+        return_value=mock.MagicMock(agents=mock.MagicMock(verify_infra_exit_codes=[99])),
+    ):
+        codes = handoff._verify_infra_exit_codes(tmp_path, tmp_path)
+    assert codes == frozenset({99})
+
+
+def test_verify_infra_codes_invalid_inrepo_falls_through(tmp_path):
+    """A malformed verify_infra_exit_codes in .codeband.yaml falls through to default."""
+    import unittest.mock as mock
+
+    inrepo = tmp_path / ".codeband.yaml"
+    inrepo.write_text("verify_infra_exit_codes: not-a-list\n")
+    with mock.patch.object(
+        handoff, "load_config",
+        return_value=mock.MagicMock(agents=mock.MagicMock(verify_infra_exit_codes=None)),
+    ):
+        codes = handoff._verify_infra_exit_codes(tmp_path, tmp_path)
+    assert codes == handoff._DEFAULT_INFRA_EXIT_CODES
+
+
 def test_cap_reached_emits_blocked_tag_and_exit_code(patch_gates, monkeypatch, capsys):
     store = patch_gates
     # Force the subtask to the cap so the next call escalates.
@@ -254,8 +338,9 @@ def test_each_failure_mode_has_a_distinct_exit_code():
         handoff.EXIT_WRONG_PR,
         handoff.EXIT_INVALID_SUBTASK_ID,
         handoff.EXIT_NO_VERIFY_COMMAND,
+        handoff.EXIT_VERIFY_INFRA_FAILED,
     }
-    assert len(codes) == 11  # all distinct
+    assert len(codes) == 12  # all distinct
     assert 0 not in codes  # never collide with success
     # 7–12 belong to the merge leg (cli/merge.py) — never reuse them here.
     assert codes.isdisjoint(range(7, 13))

@@ -98,6 +98,7 @@ next step, and each failure mode exits with a distinct code.
     REJECTED [no_pr]: no open PR for branch <b>. Push and open a PR, then re-run.
     REJECTED [wrong_pr]: PR #<n> head branch is <X>, worktree branch is <Y>. …
     REJECTED [no_verify_command]: no verify command configured. … (no burn)
+    REJECTED [verify_infra_failed] (exit <code>): <last ~20 lines>. … (no burn)
     REJECTED [verify_failed] (exit <code>): <last ~20 lines>. Fix and re-run.
     BLOCKED [cap_reached]: <n> verify attempts. Escalated to human; stop and await.
 
@@ -235,6 +236,22 @@ EXIT_INVALID_SUBTASK_ID = 21
 # infra/config error, not a coder error: no verify attempt is burned. The
 # operator must configure a command before retrying.
 EXIT_NO_VERIFY_COMMAND = 22
+# The verify command exited with an infrastructure failure code (timeout, OOM,
+# missing binary, not-executable) — the command could not run cleanly, not that
+# it ran and the tests failed. Infra never burns durable budget.
+EXIT_VERIFY_INFRA_FAILED = 23
+
+# Default set of exit codes that signal an infrastructure failure of the verify
+# command rather than a test failure. Overridable per-project via
+# ``agents.verify_infra_exit_codes`` in ``codeband.yaml`` or per-repo via
+# ``verify_infra_exit_codes`` in the worktree's ``.codeband.yaml``.
+#
+# 124 = timeout(1) deadline exceeded
+# 126 = command not executable (permission denied)
+# 127 = command not found (missing binary)
+# 137 = SIGKILL / OOM-killed (128 + 9)
+# 143 = SIGTERM (128 + 15)
+_DEFAULT_INFRA_EXIT_CODES: frozenset[int] = frozenset({124, 126, 127, 137, 143})
 
 # Per-subcommand allowed roles for the accident-guard role gate (Stage-3). The
 # role string is ``$CODEBAND_ROLE`` as exported by the runner's spawn seam
@@ -448,6 +465,33 @@ def _verify_command(project_dir: Path, worktree: Path) -> str | None:
     if inrepo is not None:
         return inrepo
     return load_config(project_dir).agents.handoff_verify_command
+
+
+def _verify_infra_exit_codes(project_dir: Path, worktree: Path) -> frozenset[int]:
+    """Resolve the infra-exit-code set: in-repo ``.codeband.yaml`` > home config > default.
+
+    Returns the frozenset of exit codes that classify a verify-command exit as
+    an infrastructure failure (no budget burn). In-repo overrides home config;
+    both override :data:`_DEFAULT_INFRA_EXIT_CODES`. A missing or malformed
+    ``verify_infra_exit_codes`` key falls through to the next level silently —
+    infra-code detection is supplemental and the verify command is still wired.
+    """
+    inrepo = worktree / ".codeband.yaml"
+    if inrepo.is_file():
+        try:
+            data = yaml.safe_load(inrepo.read_text())
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            codes = data.get("verify_infra_exit_codes")
+            if isinstance(codes, list) and all(isinstance(c, int) for c in codes):
+                return frozenset(codes)
+
+    cfg_codes = load_config(project_dir).agents.verify_infra_exit_codes
+    if cfg_codes is not None:
+        return frozenset(cfg_codes)
+
+    return _DEFAULT_INFRA_EXIT_CODES
 
 
 def _max_verify_attempts(project_dir: Path) -> int:
@@ -953,6 +997,17 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     code, output = _run_verify_command(verify_command, worktree)
     if code != 0:
         tail = _output_tail(output)
+        infra_codes = _verify_infra_exit_codes(project_dir, worktree)
+        if code in infra_codes:
+            # Infrastructure failure — the verify command could not run cleanly
+            # (timeout, OOM, missing binary). Infra never burns durable budget.
+            print(
+                f"REJECTED [verify_infra_failed] (exit {code}): {tail}. "
+                "Verify outcome NOT recorded and no attempt burned. "
+                "Fix the infrastructure issue, then re-run.",
+                file=sys.stderr,
+            )
+            return EXIT_VERIFY_INFRA_FAILED
         return _reject(
             store,
             args.subtask_id,

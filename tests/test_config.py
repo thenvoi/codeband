@@ -686,3 +686,33 @@ class TestIdleResyncSeconds:
 
     def test_one_is_the_floor(self):
         assert AgentsConfig(idle_resync_seconds=1).idle_resync_seconds == 1
+
+
+
+class TestVerifyInfraExitCodes:
+    """agents.verify_infra_exit_codes — infra-exit-code set for no-burn bypass."""
+
+    def test_default_is_none(self):
+        """None signals 'use module-level default' in cli/handoff.py."""
+        assert AgentsConfig().verify_infra_exit_codes is None
+
+    def test_accepts_list_of_ints(self):
+        cfg = AgentsConfig(verify_infra_exit_codes=[124, 127])
+        assert cfg.verify_infra_exit_codes == [124, 127]
+
+    def test_empty_list_accepted(self):
+        """Empty list disables the feature (no exit code is treated as infra)."""
+        cfg = AgentsConfig(verify_infra_exit_codes=[])
+        assert cfg.verify_infra_exit_codes == []
+
+    def test_roundtrip_via_yaml(self, tmp_path: Path):
+        import yaml as _yaml
+
+        config = CodebandConfig(
+            repo=RepoConfig(url="https://github.com/a/b.git"),
+            agents=AgentsConfig(verify_infra_exit_codes=[124, 127]),
+        )
+        data = config.model_dump(mode="json")
+        dumped = _yaml.safe_dump(data)
+        loaded = CodebandConfig(**_yaml.safe_load(dumped))
+        assert loaded.agents.verify_infra_exit_codes == [124, 127]
