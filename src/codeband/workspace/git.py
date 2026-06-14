@@ -411,11 +411,6 @@ def _prepare_task_branch_inner(
     _run_git(["checkout", "-b", task_branch, reset_ref], cwd=worktree_path)
 
 
-def fetch_latest(repo_path: Path, remote: str = "origin") -> None:
-    """Fetch latest from remote."""
-    _run_git(["fetch", remote], cwd=repo_path)
-
-
 def commit_and_push(
     worktree_path: Path,
     message: str,
