@@ -224,13 +224,22 @@ def check_claude_auth(_ctx: Context) -> CheckResult:
             "Codeband will start with OAuth and keep the API key as a usage-limit fallback",
         )
     if api and has_sub and not oauth:
+        prefer = os.environ.get("CODEBAND_CLAUDE_PREFER_API_KEY", "").strip().lower()
+        if prefer in ("1", "true", "yes", "on"):
+            return CheckResult(
+                Status.OK,
+                "Claude auth: ANTHROPIC_API_KEY (CODEBAND_CLAUDE_PREFER_API_KEY override active — "
+                "subscription OAuth will not take precedence)",
+            )
         return CheckResult(
             Status.WARN,
             "ANTHROPIC_API_KEY set alongside host subscription OAuth — "
             "Codeband will start with the subscription and keep the API key as a fallback",
             remediation=(
                 "This is valid. ANTHROPIC_API_KEY is used only if the Claude "
-                "Pro/Max subscription path reports a usage-limit error."
+                "Pro/Max subscription path reports a usage-limit error.\n"
+                "Set CODEBAND_CLAUDE_PREFER_API_KEY=1 to force API-key precedence "
+                "(e.g. when parallel coders would exhaust subscription rate limits)."
             ),
         )
     if oauth:
