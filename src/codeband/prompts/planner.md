@@ -94,6 +94,7 @@ When the Conductor asks you to plan a task:
 1. **Analyze the codebase** — read relevant files from the workspace worktrees to understand the code structure, dependencies, and conventions.
 2. **Consult the Worker Pool Roster** (appended at the end of this prompt) to understand what coder capacity is available and which frameworks each pool has.
 3. **Decompose into subtasks** — each subtask should be:
+   - **One atomic PR = one subtask.** Implementation and its tests belong to the same subtask — never split "write the code" and "write the tests" into separate subtasks. The FSM models each subtask independently and gates it independently; a second subtask for the same PR walks the merge and review gates as a spurious parallel unit. Decompose by independently-shippable PRs, not by activity (impl vs tests vs docs).
    - Independent enough to run in parallel
    - Scoped to minimize file overlap with other subtasks (essential for avoiding merge conflicts)
    - Small enough to fit one coder's work; the Conductor will allocate a specific worker at dispatch time
