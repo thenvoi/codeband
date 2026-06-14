@@ -202,8 +202,9 @@ def test_each_failure_mode_has_a_distinct_exit_code():
         handoff.EXIT_HEAD_MISMATCH,
         handoff.EXIT_PR_QUERY_FAILED,
         handoff.EXIT_WRONG_PR,
+        handoff.EXIT_INVALID_SUBTASK_ID,
     }
-    assert len(codes) == 9  # all distinct
+    assert len(codes) == 10  # all distinct
     assert 0 not in codes  # never collide with success
     # 7–12 belong to the merge leg (cli/merge.py) — never reuse them here.
     assert codes.isdisjoint(range(7, 13))
@@ -333,19 +334,19 @@ def _start(store, monkeypatch, subtask_id):
 
 
 def test_start_creates_nonexistent_subtask_in_progress(store, monkeypatch, capsys):
-    # st-new does not exist yet — start must create it and land it in_progress.
-    assert store.get_subtask("st-new", "room-1") is None
-    assert _start(store, monkeypatch, "st-new") == 0
-    assert store.get_subtask("st-new", "room-1").state == "in_progress"
+    # st-2 does not exist yet — start must create it and land it in_progress.
+    assert store.get_subtask("st-2", "room-1") is None
+    assert _start(store, monkeypatch, "st-2") == 0
+    assert store.get_subtask("st-2", "room-1").state == "in_progress"
     out = capsys.readouterr().out
-    assert "subtask st-new → in_progress (task room-1)." in out
+    assert "subtask st-2 → in_progress (task room-1)." in out
 
 
 def test_start_is_idempotent(store, monkeypatch, capsys):
     # Starting twice is a no-op the second time — never moves backward.
-    assert _start(store, monkeypatch, "st-new") == 0
-    assert _start(store, monkeypatch, "st-new") == 0
-    assert store.get_subtask("st-new", "room-1").state == "in_progress"
+    assert _start(store, monkeypatch, "st-2") == 0
+    assert _start(store, monkeypatch, "st-2") == 0
+    assert store.get_subtask("st-2", "room-1").state == "in_progress"
     assert "already at in_progress" in capsys.readouterr().out
 
 
@@ -381,8 +382,8 @@ def test_start_task_label_is_optional(store, monkeypatch):
         handoff, "_resolve_task_id",
         lambda project_dir, s, task_arg: ("room-1", None),
     )
-    assert handoff.main(["start", "st-new"]) == 0
-    assert store.get_subtask("st-new", "room-1").state == "in_progress"
+    assert handoff.main(["start", "st-2"]) == 0
+    assert store.get_subtask("st-2", "room-1").state == "in_progress"
 
 
 # ── cb-phase review — reviewer verdict routed through the FSM ────────────────
@@ -774,3 +775,103 @@ def test_pr_head_sha_returns_none_on_non_github_url(monkeypatch, tmp_path):
 
     monkeypatch.setattr(handoff.subprocess, "run", _boom)
     assert handoff._pr_head_sha(tmp_path, 42) is None
+
+
+# --- claim-time guard ---
+
+
+@pytest.mark.parametrize("bad_id", ["claim-time-guard", "subtask-1"])
+def test_invalid_subtask_id_rejected_with_tagged_stderr(bad_id, capsys):
+    """The validator refuses anything that is not ``st-N``."""
+    assert handoff._validate_subtask_id(bad_id) == handoff.EXIT_INVALID_SUBTASK_ID
+    err = capsys.readouterr().err
+    assert "REJECTED [invalid_subtask_id]" in err
+    assert repr(bad_id) in err
+
+
+@pytest.mark.parametrize("good_id", ["st-1", "st-99"])
+def test_valid_subtask_id_passes_validator(good_id):
+    """``st-N`` ids return None — no rejection."""
+    assert handoff._validate_subtask_id(good_id) is None
+
+
+def _build_guard_args(subcommand: str, bad_id: str) -> list[str]:
+    """The minimum required-flags argv for each subcommand under guard test."""
+    common = ["--project-dir", "."]
+    if subcommand == "start":
+        return ["start", bad_id, *common]
+    if subcommand == "verify":
+        return ["verify", bad_id, "--pr", "42", "--worktree", ".", *common]
+    if subcommand == "review":
+        return ["review", bad_id, "--pr", "42", "--approve", *common]
+    if subcommand == "verify-acceptance":
+        return ["verify-acceptance", bad_id, "--pr", "42", "--accept", *common]
+    if subcommand == "abandon":
+        return ["abandon", bad_id, *common]
+    if subcommand == "resume":
+        return ["resume", bad_id, *common]
+    raise AssertionError(f"unhandled subcommand: {subcommand}")
+
+
+@pytest.mark.parametrize(
+    "subcommand",
+    ["start", "verify", "review", "verify-acceptance", "abandon", "resume"],
+)
+@pytest.mark.parametrize("bad_id", ["claim-time-guard", "subtask-1"])
+def test_guard_fires_before_store_in_every_subcommand(
+    subcommand, bad_id, monkeypatch, capsys,
+):
+    """Guard runs BEFORE store / task-id resolution in all six legs.
+
+    If the guard ever runs after ``_resolve_store`` / ``_resolve_task_id``, a
+    malformed id can already have opened the DB or read the active-room
+    pointer — both of which the guard exists to prevent. Monkeypatching them
+    to raise makes the ordering structural, not a comment.
+    """
+    def _must_not_call(*args, **kwargs):
+        raise AssertionError(
+            "guard must reject before store / task-id resolution",
+        )
+
+    monkeypatch.setattr(handoff, "_resolve_store", _must_not_call)
+    monkeypatch.setattr(handoff, "_resolve_task_id", _must_not_call)
+
+    argv = _build_guard_args(subcommand, bad_id)
+    assert handoff.main(argv) == handoff.EXIT_INVALID_SUBTASK_ID
+    err = capsys.readouterr().err
+    assert "REJECTED [invalid_subtask_id]" in err
+    assert repr(bad_id) in err
+
+
+def test_guard_regression_valid_id_proceeds_through_start(tmp_path, monkeypatch):
+    """A valid ``st-N`` id is not blocked — the normal start path still works.
+
+    Uses a real codeband.yaml + tmp_path-backed store via
+    ``CODEBAND_PROJECT_DIR`` (no resolver stubs) so this exercises the guard
+    in series with the real store — the one round-trip that proves the guard
+    does not over-reject the happy path.
+    """
+    from codeband.config import (
+        AgentsConfig,
+        CodebandConfig,
+        RepoConfig,
+        WorkspaceConfig,
+    )
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    cfg = CodebandConfig(
+        repo=RepoConfig(url="https://github.com/example/repo.git", branch="main"),
+        agents=AgentsConfig(),
+        workspace=WorkspaceConfig(path=str(workspace)),
+    )
+    cfg.to_yaml(project_dir / "codeband.yaml")
+    (project_dir / ".codeband_room").write_text("room-1", encoding="utf-8")
+    store = StateStore(workspace / "state" / "orchestration.db")
+    store.create_task("room-1", "demo", "room-1")
+
+    monkeypatch.setenv("CODEBAND_PROJECT_DIR", str(project_dir))
+
+    assert handoff.main(["start", "st-1", "--project-dir", str(project_dir)]) == 0
+    assert store.get_subtask("st-1", "room-1").state == "in_progress"

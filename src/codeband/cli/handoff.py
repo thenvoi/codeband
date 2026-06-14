@@ -133,6 +133,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -211,6 +212,11 @@ EXIT_CHAIN_BROKEN = 19
 # diverges from the store's FSM state + grants for this subtask. The acceptance
 # verdict is NOT issued — acceptance must never rubber-stamp a false claim.
 EXIT_CLAIM_MISMATCH = 20
+# Claim-time subtask-id format guard: the caller passed a string that does not
+# match the planned-subtask id shape (``st-N``). Refused BEFORE any store /
+# task-id resolution runs, so a typo (e.g. a task key in the subtask slot)
+# cannot create a phantom row or burn any counter.
+EXIT_INVALID_SUBTASK_ID = 21
 
 # Per-subcommand allowed roles for the accident-guard role gate (Stage-3). The
 # role string is ``$CODEBAND_ROLE`` as exported by the runner's spawn seam
@@ -224,6 +230,34 @@ _ROLE_ALLOWED: dict[str, frozenset[str]] = {
     "abandon": frozenset({"conductor"}),
     "resume": frozenset({"conductor"}),
 }
+
+
+# Planned-subtask id shape — ``st-<integer>`` as emitted by the Planner. The
+# claim-time guard rejects anything that does not match BEFORE store / task
+# resolution runs, so a typo (e.g. a task key passed in the subtask slot)
+# cannot create a phantom row or burn any counter.
+_SUBTASK_ID_RE = re.compile(r"^st-\d+$")
+
+
+def _validate_subtask_id(subtask_id: str) -> int | None:
+    """Refuse a subtask id that is not in the planned ``st-N`` shape.
+
+    Runs as the FIRST statement of every ``cb-phase`` leg, before any store
+    open or task-id resolution: a malformed id (a typo, a task key in the
+    subtask slot, an empty string) must never reach :func:`_resolve_store` —
+    otherwise the FSM auto-creates the row and the typo becomes a phantom
+    subtask the rest of the system has to chase. On rejection, prints a
+    ``REJECTED [invalid_subtask_id]`` line naming the id and returns
+    :data:`EXIT_INVALID_SUBTASK_ID`; returns ``None`` for valid ids.
+    """
+    if not _SUBTASK_ID_RE.match(subtask_id):
+        print(
+            f"REJECTED [invalid_subtask_id]: {subtask_id!r} is not a valid "
+            "planned-subtask id — expected st-N (e.g., st-1, st-2).",
+            file=sys.stderr,
+        )
+        return EXIT_INVALID_SUBTASK_ID
+    return None
 
 
 def _check_role(command: str) -> int | None:
@@ -738,6 +772,9 @@ def _walk_to_verify_pending(
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
+    error_code = _validate_subtask_id(args.subtask_id)
+    if error_code is not None:
+        return error_code
     project_dir = resolve_project_dir(args.project_dir)
     worktree = Path(args.worktree).resolve()
     store = _resolve_store(project_dir)
@@ -934,6 +971,9 @@ def _cmd_start(args: argparse.Namespace) -> int:
     start, so no gate runs — the gates that matter (verify → review_pending,
     the review verdict) stay downstream and untouched.
     """
+    error_code = _validate_subtask_id(args.subtask_id)
+    if error_code is not None:
+        return error_code
     project_dir = resolve_project_dir(args.project_dir)
     store = _resolve_store(project_dir)
 
@@ -977,6 +1017,9 @@ def _cmd_abandon(args: argparse.Namespace) -> int:
     success; a rejected transition (already terminal) prints the standard
     ``cb-phase: transition rejected — …`` line and exits 1.
     """
+    error_code = _validate_subtask_id(args.subtask_id)
+    if error_code is not None:
+        return error_code
     project_dir = resolve_project_dir(args.project_dir)
     store = _resolve_store(project_dir)
 
@@ -1018,6 +1061,9 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     preserved counters; only legal from ``blocked`` — any other state prints
     the standard rejection and exits 1.
     """
+    error_code = _validate_subtask_id(args.subtask_id)
+    if error_code is not None:
+        return error_code
     project_dir = resolve_project_dir(args.project_dir)
     store = _resolve_store(project_dir)
 
@@ -1071,6 +1117,9 @@ def _cmd_review(args: argparse.Namespace) -> int:
     verification — the route is enforced in code, not by an LLM following a
     prompt.
     """
+    error_code = _validate_subtask_id(args.subtask_id)
+    if error_code is not None:
+        return error_code
     project_dir = resolve_project_dir(args.project_dir)
     store = _resolve_store(project_dir)
 
@@ -1206,6 +1255,9 @@ def _cmd_verify_acceptance(args: argparse.Namespace) -> int:
     subprocess must not do. It lives in ``prompts/verifier.md`` as the
     Verifier's own bounded duty over the messages already in its context.
     """
+    error_code = _validate_subtask_id(args.subtask_id)
+    if error_code is not None:
+        return error_code
     project_dir = resolve_project_dir(args.project_dir)
     store = _resolve_store(project_dir)
 

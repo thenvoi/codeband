@@ -1125,7 +1125,7 @@ class TestVerifyAttemptCap:
 
         # Default cap (20). verify_command 'exit 1' rejects every attempt.
         project_dir, store = self._project(tmp_path, verify_command="exit 1")
-        self._seed_verify_pending(store, "st-v", "feat-v")
+        self._seed_verify_pending(store, "st-5", "feat-v")
         assert MAX_VERIFY_ATTEMPTS == 20             # the documented default
 
         rest = _fake_rest()
@@ -1139,30 +1139,30 @@ class TestVerifyAttemptCap:
         now = datetime.now(timezone.utc)
         await daemon._check_subtask_progress(now)    # baseline patrol
 
-        base_log = _log_count(store, "st-v")         # 3 seeding rows
+        base_log = _log_count(store, "st-5")         # 3 seeding rows
         for i in range(1, MAX_VERIFY_ATTEMPTS + 1):  # MAX rejecting attempts
             _commit_on(repo, "feat-v", f"attempt-{i}")   # REAL HEAD movement
             _git(repo, "checkout", "main")
             await daemon._check_subtask_progress(now)    # watchdog sees progress
-            assert self._run_verify(project_dir, repo, "st-v") != 0
-            sub = store.get_subtask("st-v", "room-1")
+            assert self._run_verify(project_dir, repo, "st-5") != 0
+            sub = store.get_subtask("st-5", "room-1")
             assert sub.verify_attempts == i              # one count per rejection
             assert sub.state == "verify_pending"         # rejection ≠ transition
-            assert _log_count(store, "st-v") == base_log  # no log row on rejection
+            assert _log_count(store, "st-5") == base_log  # no log row on rejection
 
         # The progressing loop never tripped the (tight) watchdog stall cap.
-        assert daemon._subtask_state[("room-1", "st-v")].patrol_visits_without_progress == 0
+        assert daemon._subtask_state[("room-1", "st-5")].patrol_visits_without_progress == 0
         assert rest.agent_api_messages.create_agent_chat_message.await_count == 0
-        assert store.get_subtask("st-v", "room-1").verify_attempts == MAX_VERIFY_ATTEMPTS
+        assert store.get_subtask("st-5", "room-1").verify_attempts == MAX_VERIFY_ATTEMPTS
 
         # The next verify call hits the cap: escalate verify_pending → blocked,
         # writing nothing but the blocked transition (no further increment).
-        assert self._run_verify(project_dir, repo, "st-v") != 0
-        sub = store.get_subtask("st-v", "room-1")
+        assert self._run_verify(project_dir, repo, "st-5") != 0
+        sub = store.get_subtask("st-5", "room-1")
         assert sub.state == "blocked"
         assert sub.verify_attempts == MAX_VERIFY_ATTEMPTS  # not bumped on escalate
-        assert _log_count(store, "st-v") == base_log + 1
-        last = _log_rows(store, "st-v")[-1]
+        assert _log_count(store, "st-5") == base_log + 1
+        last = _log_rows(store, "st-5")[-1]
         assert (last["from_state"], last["to_state"]) == ("verify_pending", "blocked")
         assert last["caller_role"] == "coder"
 
@@ -1174,21 +1174,21 @@ class TestVerifyAttemptCap:
         project_dir, store = self._project(
             tmp_path, verify_command="exit 1", max_verify_attempts=2,
         )
-        self._seed_verify_pending(store, "st-c", "feat-c")
-        base = _log_count(store, "st-c")
+        self._seed_verify_pending(store, "st-3", "feat-c")
+        base = _log_count(store, "st-3")
 
-        assert self._run_verify(project_dir, repo, "st-c") != 0   # attempt 1
-        assert self._run_verify(project_dir, repo, "st-c") != 0   # attempt 2
-        sub = store.get_subtask("st-c", "room-1")
+        assert self._run_verify(project_dir, repo, "st-3") != 0   # attempt 1
+        assert self._run_verify(project_dir, repo, "st-3") != 0   # attempt 2
+        sub = store.get_subtask("st-3", "room-1")
         assert sub.verify_attempts == 2
         assert sub.state == "verify_pending"
-        assert _log_count(store, "st-c") == base                  # no log rows
+        assert _log_count(store, "st-3") == base                  # no log rows
 
         # Third call: count has reached the (overridden) cap → blocked.
-        assert self._run_verify(project_dir, repo, "st-c") != 0
-        assert store.get_subtask("st-c", "room-1").state == "blocked"
-        assert store.get_subtask("st-c", "room-1").verify_attempts == 2     # not re-bumped
-        assert _log_count(store, "st-c") == base + 1
+        assert self._run_verify(project_dir, repo, "st-3") != 0
+        assert store.get_subtask("st-3", "room-1").state == "blocked"
+        assert store.get_subtask("st-3", "room-1").verify_attempts == 2     # not re-bumped
+        assert _log_count(store, "st-3") == base + 1
 
     # ── durability: the count survives a crash/reopen mid-loop ───────────────
 
@@ -1201,28 +1201,28 @@ class TestVerifyAttemptCap:
         project_dir, store = self._project(
             tmp_path, verify_command="exit 1", max_verify_attempts=3,
         )
-        self._seed_verify_pending(store, "st-d", "feat-d")
+        self._seed_verify_pending(store, "st-4", "feat-d")
 
-        assert self._run_verify(project_dir, repo, "st-d") != 0   # attempt 1
-        assert self._run_verify(project_dir, repo, "st-d") != 0   # attempt 2
-        assert store.get_subtask("st-d", "room-1").verify_attempts == 2
+        assert self._run_verify(project_dir, repo, "st-4") != 0   # attempt 1
+        assert self._run_verify(project_dir, repo, "st-4") != 0   # attempt 2
+        assert store.get_subtask("st-4", "room-1").verify_attempts == 2
 
         # Simulate a crash/restart: drop the handle, reopen the same file fresh.
         db_path = store.db_path
         del store
         reopened = StateStore(db_path)
-        assert reopened.get_subtask("st-d", "room-1").verify_attempts == 2  # survived reopen
-        assert reopened.get_subtask("st-d", "room-1").state == "verify_pending"
+        assert reopened.get_subtask("st-4", "room-1").verify_attempts == 2  # survived reopen
+        assert reopened.get_subtask("st-4", "room-1").state == "verify_pending"
 
-        base = _log_count(reopened, "st-d")
-        assert self._run_verify(project_dir, repo, "st-d") != 0   # attempt 3 → cap
-        assert reopened.get_subtask("st-d", "room-1").verify_attempts == 3
-        assert _log_count(reopened, "st-d") == base               # still no log row
+        base = _log_count(reopened, "st-4")
+        assert self._run_verify(project_dir, repo, "st-4") != 0   # attempt 3 → cap
+        assert reopened.get_subtask("st-4", "room-1").verify_attempts == 3
+        assert _log_count(reopened, "st-4") == base               # still no log row
 
         # Next call after reopen escalates — the cap fired across the "crash".
-        assert self._run_verify(project_dir, repo, "st-d") != 0
-        assert reopened.get_subtask("st-d", "room-1").state == "blocked"
-        assert _log_count(reopened, "st-d") == base + 1
+        assert self._run_verify(project_dir, repo, "st-4") != 0
+        assert reopened.get_subtask("st-4", "room-1").state == "blocked"
+        assert _log_count(reopened, "st-4") == base + 1
 
     # ── isolation: one subtask's cap does not affect another's counter ───────
 
@@ -1234,31 +1234,31 @@ class TestVerifyAttemptCap:
         project_dir, store = self._project(
             tmp_path, verify_command="exit 1", max_verify_attempts=3,
         )
-        for sid, branch in [("st-a", "feat-a"), ("st-b", "feat-b"),
-                            ("st-c", "feat-c")]:
+        for sid, branch in [("st-1", "feat-a"), ("st-2", "feat-b"),
+                            ("st-3", "feat-c")]:
             self._seed_verify_pending(store, sid, branch)
 
-        # st-a → cap (3 rejections, then a 4th call escalates to blocked).
+        # st-1 → cap (3 rejections, then a 4th call escalates to blocked).
         for _ in range(3):
-            assert self._run_verify(project_dir, repo, "st-a") != 0
-        assert self._run_verify(project_dir, repo, "st-a") != 0
-        # st-b once, st-c twice — both below the cap.
-        assert self._run_verify(project_dir, repo, "st-b") != 0
+            assert self._run_verify(project_dir, repo, "st-1") != 0
+        assert self._run_verify(project_dir, repo, "st-1") != 0
+        # st-2 once, st-3 twice — both below the cap.
+        assert self._run_verify(project_dir, repo, "st-2") != 0
         for _ in range(2):
-            assert self._run_verify(project_dir, repo, "st-c") != 0
+            assert self._run_verify(project_dir, repo, "st-3") != 0
 
-        assert store.get_subtask("st-a", "room-1").state == "blocked"
-        assert store.get_subtask("st-a", "room-1").verify_attempts == 3
-        assert store.get_subtask("st-b", "room-1").state == "verify_pending"
-        assert store.get_subtask("st-b", "room-1").verify_attempts == 1
-        assert store.get_subtask("st-c", "room-1").state == "verify_pending"
-        assert store.get_subtask("st-c", "room-1").verify_attempts == 2
+        assert store.get_subtask("st-1", "room-1").state == "blocked"
+        assert store.get_subtask("st-1", "room-1").verify_attempts == 3
+        assert store.get_subtask("st-2", "room-1").state == "verify_pending"
+        assert store.get_subtask("st-2", "room-1").verify_attempts == 1
+        assert store.get_subtask("st-3", "room-1").state == "verify_pending"
+        assert store.get_subtask("st-3", "room-1").verify_attempts == 2
 
         # The capped subtask is blocked, but the others — below their own caps —
         # keep accepting attempts independently.
-        assert self._run_verify(project_dir, repo, "st-b") != 0
-        assert store.get_subtask("st-b", "room-1").state == "verify_pending"
-        assert store.get_subtask("st-b", "room-1").verify_attempts == 2
+        assert self._run_verify(project_dir, repo, "st-2") != 0
+        assert store.get_subtask("st-2", "room-1").state == "verify_pending"
+        assert store.get_subtask("st-2", "room-1").verify_attempts == 2
 
     # ── interaction: verify cap and review-round cap are independent loops ────
 
@@ -1275,29 +1275,29 @@ class TestVerifyAttemptCap:
         project_dir, store = self._project(
             tmp_path, verify_command="exit 1", max_verify_attempts=20,
         )
-        self._seed_verify_pending(store, "st-i", "feat-i")
+        self._seed_verify_pending(store, "st-6", "feat-i")
 
         # Two verify rejections: verify_attempts climbs, review_round stays 0.
-        assert self._run_verify(project_dir, repo, "st-i") != 0
-        assert self._run_verify(project_dir, repo, "st-i") != 0
-        sub = store.get_subtask("st-i", "room-1")
+        assert self._run_verify(project_dir, repo, "st-6") != 0
+        assert self._run_verify(project_dir, repo, "st-6") != 0
+        sub = store.get_subtask("st-6", "room-1")
         assert sub.verify_attempts == 2
         assert sub.review_round == 0
 
         # Now verify *passes* (verify command exits 0) → advances to
         # review_pending; a success leaves verify_attempts untouched.
         monkeypatch.setattr(handoff, "_verify_command", lambda project_dir: "exit 0")
-        assert self._run_verify(project_dir, repo, "st-i") == 0
-        sub = store.get_subtask("st-i", "room-1")
+        assert self._run_verify(project_dir, repo, "st-6") == 0
+        sub = store.get_subtask("st-6", "room-1")
         assert sub.state == "review_pending"
         assert sub.verify_attempts == 2          # success never increments
         assert sub.review_round == 0
 
         # A failed review increments review_round only — verify_attempts is the
         # other cap's counter and stays put.
-        transition("st-i", "room-1", "review_failed", caller_role="reviewer",
+        transition("st-6", "room-1", "review_failed", caller_role="reviewer",
                    store=store)
-        sub = store.get_subtask("st-i", "room-1")
+        sub = store.get_subtask("st-6", "room-1")
         assert sub.review_round == 1
         assert sub.verify_attempts == 2
 
