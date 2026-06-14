@@ -23,6 +23,7 @@ agent tool runtime (which only touches `.content` / `.thought` /
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import json
@@ -167,20 +168,27 @@ class LocalMemoryStore:
         and be dropped. The rewrite also compacts: archived records beyond the
         newest :data:`_ARCHIVED_KEEP_LAST` are dropped (S8-F4); live records
         are untouched.
+
+        The locked critical section (flock + full-file read + rewrite) runs in
+        a worker thread via asyncio.to_thread so blocking I/O does not stall
+        the event loop (T-09).
         """
-        updated: MemoryRecord | None = None
-        with self._locked():
-            records = list(self._iter_records())
-            for rec in records:
-                if rec.id == memory_id and rec.status != "archived":
-                    rec.status = "archived"
-                    rec.archived_at = _now_iso()
-                    rec.updated_at = rec.archived_at
-                    updated = rec
-                    break
-            if updated is not None:
-                self._rewrite_locked(self._compact(records))
-        return updated
+        def _do_archive() -> MemoryRecord | None:
+            updated: MemoryRecord | None = None
+            with self._locked():
+                records = list(self._iter_records())
+                for rec in records:
+                    if rec.id == memory_id and rec.status != "archived":
+                        rec.status = "archived"
+                        rec.archived_at = _now_iso()
+                        rec.updated_at = rec.archived_at
+                        updated = rec
+                        break
+                if updated is not None:
+                    self._rewrite_locked(self._compact(records))
+            return updated
+
+        return await asyncio.to_thread(_do_archive)
 
     # --- internals ----------------------------------------------------------
 
@@ -225,17 +233,23 @@ class LocalMemoryStore:
         # Open the data file only AFTER acquiring the sidecar lock: a
         # concurrent archive() may have replaced the file's inode, and a
         # handle opened before the lock could point at the orphaned one.
-        with self._locked():
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(record.to_json() + "\n")
+        try:
+            with self._locked():
+                with self.path.open("a", encoding="utf-8") as fh:
+                    fh.write(record.to_json() + "\n")
+        except OSError as exc:
+            logger.error("local_store _append failed, record dropped: %s", exc)
 
     def _rewrite_locked(self, records: list[MemoryRecord]) -> None:
         """Atomically replace the data file. Caller must hold the sidecar lock."""
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            for rec in records:
-                fh.write(rec.to_json() + "\n")
-        tmp.replace(self.path)
+        try:
+            with tmp.open("w", encoding="utf-8") as fh:
+                for rec in records:
+                    fh.write(rec.to_json() + "\n")
+            tmp.replace(self.path)
+        except OSError as exc:
+            logger.error("local_store _rewrite_locked failed, archive degraded: %s", exc)
 
     @contextlib.contextmanager
     def _locked(self) -> Iterator[None]:
