@@ -1286,7 +1286,7 @@ class TestVerifyAttemptCap:
 
         # Now verify *passes* (verify command exits 0) → advances to
         # review_pending; a success leaves verify_attempts untouched.
-        monkeypatch.setattr(handoff, "_verify_command", lambda project_dir: "exit 0")
+        monkeypatch.setattr(handoff, "_verify_command", lambda project_dir, worktree: "exit 0")
         assert self._run_verify(project_dir, repo, "st-6") == 0
         sub = store.get_subtask("st-6", "room-1")
         assert sub.state == "review_pending"

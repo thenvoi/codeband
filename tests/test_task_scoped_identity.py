@@ -110,7 +110,7 @@ def test_task2_repro_through_cb_phase_main(store, monkeypatch):
         handoff, "_resolve_task_id",
         lambda project_dir, s, task_arg: (TASK_B, None),
     )
-    monkeypatch.setattr(handoff, "_verify_command", lambda project_dir: None)
+    monkeypatch.setattr(handoff, "_verify_command", lambda project_dir, worktree: "true")
     monkeypatch.setattr(handoff, "_max_verify_attempts", lambda project_dir: 20)
     monkeypatch.setattr(handoff, "_max_review_rounds", lambda project_dir: 3)
     monkeypatch.setattr(handoff, "_uncommitted_files", lambda worktree: [])

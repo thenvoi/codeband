@@ -30,7 +30,7 @@ def patch_gates(monkeypatch, store):
         handoff, "_resolve_task_id",
         lambda project_dir, store, task_arg: ("room-1", None),
     )
-    monkeypatch.setattr(handoff, "_verify_command", lambda project_dir: "verify-cmd")
+    monkeypatch.setattr(handoff, "_verify_command", lambda project_dir, worktree: "verify-cmd")
     monkeypatch.setattr(handoff, "_max_verify_attempts", lambda project_dir: 20)
     monkeypatch.setattr(handoff, "_max_review_rounds", lambda project_dir: 3)
     monkeypatch.setattr(handoff, "_uncommitted_files", lambda worktree: [])
@@ -88,16 +88,66 @@ def test_verify_fails_on_failing_verify_command(patch_gates, monkeypatch):
     assert store.get_subtask("st-1", "room-1").state == "verify_pending"
 
 
-def test_verify_skips_command_when_unconfigured(patch_gates, monkeypatch):
+def test_inrepo_config_present_takes_priority(tmp_path, monkeypatch):
+    """In-repo .codeband.yaml verify_command wins over home config."""
+    from types import SimpleNamespace
+
+    worktree = tmp_path / "target"
+    worktree.mkdir()
+    (worktree / ".codeband.yaml").write_text("verify_command: make test\n")
+    monkeypatch.setattr(
+        handoff, "load_config",
+        lambda p: SimpleNamespace(
+            agents=SimpleNamespace(handoff_verify_command="home-cmd"),
+        ),
+    )
+    assert handoff._verify_command(tmp_path, worktree) == "make test"
+
+
+def test_inrepo_absent_home_config_used(tmp_path, monkeypatch):
+    """When no in-repo .codeband.yaml, falls back to home handoff_verify_command."""
+    from types import SimpleNamespace
+
+    worktree = tmp_path / "target"
+    worktree.mkdir()
+    monkeypatch.setattr(
+        handoff, "load_config",
+        lambda p: SimpleNamespace(
+            agents=SimpleNamespace(handoff_verify_command="home-cmd"),
+        ),
+    )
+    assert handoff._verify_command(tmp_path, worktree) == "home-cmd"
+
+
+def test_neither_source_resolves_returns_none(tmp_path, monkeypatch):
+    """When neither in-repo nor home config has a command, returns None."""
+    from types import SimpleNamespace
+
+    worktree = tmp_path / "target"
+    worktree.mkdir()
+    monkeypatch.setattr(
+        handoff, "load_config",
+        lambda p: SimpleNamespace(
+            agents=SimpleNamespace(handoff_verify_command=None),
+        ),
+    )
+    assert handoff._verify_command(tmp_path, worktree) is None
+
+
+def test_no_verify_command_fails_loud_and_does_not_pass(patch_gates, monkeypatch, capsys):
+    """When no verify command resolves, gate refuses with EXIT_NO_VERIFY_COMMAND."""
     store = patch_gates
-    monkeypatch.setattr(handoff, "_verify_command", lambda project_dir: None)
+    monkeypatch.setattr(handoff, "_verify_command", lambda project_dir, worktree: None)
 
     def _boom(cmd, cwd):  # pragma: no cover - must not be called
-        raise AssertionError("verify command should not run when unconfigured")
+        raise AssertionError("verify command must not run when unresolved")
 
     monkeypatch.setattr(handoff, "_run_verify_command", _boom)
-    assert _run() == 0
-    assert store.get_subtask("st-1", "room-1").state == "review_pending"
+    assert _run() == handoff.EXIT_NO_VERIFY_COMMAND
+    err = capsys.readouterr().err
+    assert "REJECTED [no_verify_command]" in err
+    assert ".codeband.yaml" in err
+    assert store.get_subtask("st-1", "room-1").state == "verify_pending"
 
 
 # ── rebase rework: verify re-entry from the merge gate's send-back ──────────
@@ -203,8 +253,9 @@ def test_each_failure_mode_has_a_distinct_exit_code():
         handoff.EXIT_PR_QUERY_FAILED,
         handoff.EXIT_WRONG_PR,
         handoff.EXIT_INVALID_SUBTASK_ID,
+        handoff.EXIT_NO_VERIFY_COMMAND,
     }
-    assert len(codes) == 10  # all distinct
+    assert len(codes) == 11  # all distinct
     assert 0 not in codes  # never collide with success
     # 7–12 belong to the merge leg (cli/merge.py) — never reuse them here.
     assert codes.isdisjoint(range(7, 13))

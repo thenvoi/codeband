@@ -58,8 +58,17 @@ Gate sequence:
    the ``no_pr`` rejection (burns — coder error); ``headRefName`` not equal
    to the worktree's branch → ``REJECTED [wrong_pr]`` (burns) — closes the
    any-open-PR-number gate hole.
-3. If ``agents.handoff_verify_command`` is configured, run it in the worktree;
-   exit 0 is required.
+3. Resolve the verify command — target-repo first, home config fallback, then
+   FAIL-LOUD:
+
+   a. Read ``verify_command`` from ``{worktree}/.codeband.yaml`` if present.
+   b. Else fall back to ``agents.handoff_verify_command`` in the project's
+      ``codeband.yaml``.
+   c. If neither resolves → ``REJECTED [no_verify_command]`` without burning a
+      verify attempt (config error, not a coder error). The gate REFUSES — it
+      must never silently pass with nothing to verify.
+
+   When a command IS resolved, run it in the worktree; exit 0 is required.
 4. The worktree HEAD must equal the snapshot's PR head. The worktree side
    unresolvable → ``REJECTED [head_unresolved]`` and nothing recorded; a
    mismatch → ``REJECTED [head_mismatch]`` (push your commits) — so a
@@ -88,6 +97,7 @@ next step, and each failure mode exits with a distinct code.
     REJECTED [pr_query_failed]: could not query PR #<n> via gh — … (no burn)
     REJECTED [no_pr]: no open PR for branch <b>. Push and open a PR, then re-run.
     REJECTED [wrong_pr]: PR #<n> head branch is <X>, worktree branch is <Y>. …
+    REJECTED [no_verify_command]: no verify command configured. … (no burn)
     REJECTED [verify_failed] (exit <code>): <last ~20 lines>. Fix and re-run.
     BLOCKED [cap_reached]: <n> verify attempts. Escalated to human; stop and await.
 
@@ -137,6 +147,8 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+import yaml
 
 from codeband.config import load_config
 from codeband.state import StateStore
@@ -217,6 +229,12 @@ EXIT_CLAIM_MISMATCH = 20
 # task-id resolution runs, so a typo (e.g. a task key in the subtask slot)
 # cannot create a phantom row or burn any counter.
 EXIT_INVALID_SUBTASK_ID = 21
+# No verify command is configured in either the target repo's ``.codeband.yaml``
+# or the home ``codeband.yaml`` (``agents.handoff_verify_command``). The gate
+# REFUSES — it must never silently pass when there is nothing to verify. An
+# infra/config error, not a coder error: no verify attempt is burned. The
+# operator must configure a command before retrying.
+EXIT_NO_VERIFY_COMMAND = 22
 
 # Per-subcommand allowed roles for the accident-guard role gate (Stage-3). The
 # role string is ``$CODEBAND_ROLE`` as exported by the runner's spawn seam
@@ -398,10 +416,38 @@ def _resolve_task_id(
     return room_id, None
 
 
-def _verify_command(project_dir: Path) -> str | None:
-    """Return the configured ``agents.handoff_verify_command`` (or ``None``)."""
-    config = load_config(project_dir)
-    return config.agents.handoff_verify_command
+def _read_inrepo_verify_command(worktree: Path) -> str | None:
+    """Read ``verify_command`` from ``{worktree}/.codeband.yaml``, or ``None``.
+
+    A missing file → ``None`` (no in-repo override, fall through to home config).
+    A present-but-malformed file → ``ValueError`` so the caller FAIL-LOUDs rather
+    than silently falling through with a corrupt in-repo config in place.
+    A present file with no ``verify_command`` key → ``None``.
+    """
+    inrepo = worktree / ".codeband.yaml"
+    if not inrepo.is_file():
+        return None
+    try:
+        data = yaml.safe_load(inrepo.read_text())
+    except Exception as exc:
+        raise ValueError(f"Cannot parse {inrepo}: {exc}") from exc
+    if not isinstance(data, dict):
+        return None
+    cmd = data.get("verify_command")
+    return cmd if isinstance(cmd, str) and cmd.strip() else None
+
+
+def _verify_command(project_dir: Path, worktree: Path) -> str | None:
+    """Resolve the verify command: in-repo ``.codeband.yaml`` > home config.
+
+    Returns the command string, or ``None`` when neither source configured one.
+    ``None`` is a FAIL-LOUD signal at the call site — the gate must never silently
+    pass with no command to run.
+    """
+    inrepo = _read_inrepo_verify_command(worktree)
+    if inrepo is not None:
+        return inrepo
+    return load_config(project_dir).agents.handoff_verify_command
 
 
 def _max_verify_attempts(project_dir: Path) -> int:
@@ -892,18 +938,28 @@ def _cmd_verify(args: argparse.Namespace) -> int:
             EXIT_WRONG_PR,
         )
 
-    verify_command = _verify_command(project_dir)
-    if verify_command:
-        code, output = _run_verify_command(verify_command, worktree)
-        if code != 0:
-            tail = _output_tail(output)
-            return _reject(
-                store,
-                args.subtask_id,
-                task_id,
-                f"REJECTED [verify_failed] (exit {code}): {tail}. Fix and re-run.",
-                EXIT_VERIFY_FAILED,
-            )
+    verify_command = _verify_command(project_dir, worktree)
+    if verify_command is None:
+        # Config/operator error — no attempt burned (mirrors the infra-failure
+        # precedent of pr_query_failed / head_unresolved).
+        print(
+            "REJECTED [no_verify_command]: no verify command is configured. "
+            "Set verify_command in the target repo's .codeband.yaml, or set "
+            "agents.handoff_verify_command in the project codeband.yaml. "
+            "Verify outcome NOT recorded — no attempt burned.",
+            file=sys.stderr,
+        )
+        return EXIT_NO_VERIFY_COMMAND
+    code, output = _run_verify_command(verify_command, worktree)
+    if code != 0:
+        tail = _output_tail(output)
+        return _reject(
+            store,
+            args.subtask_id,
+            task_id,
+            f"REJECTED [verify_failed] (exit {code}): {tail}. Fix and re-run.",
+            EXIT_VERIFY_FAILED,
+        )
 
     # Pin the verify outcome to the exact commit the gates ran against — and
     # prove that commit is what the PR actually contains. Both ends must
