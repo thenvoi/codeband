@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from enum import Enum
 from pathlib import Path
 from typing import Literal
@@ -520,10 +522,22 @@ class AgentConfigFile(_StrictModel):
         return cls.model_validate(data)
 
     def to_yaml(self, path: Path) -> None:
-        """Write agent credentials to YAML."""
+        """Write agent credentials to YAML, private (0600) and atomic."""
         data = self.model_dump(mode="json")
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        if path.exists():
+            os.chmod(path, 0o600)
+        tmp_fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
     def get(self, key: str) -> AgentCredentials:
         """Get credentials for an agent key, raising if not found."""

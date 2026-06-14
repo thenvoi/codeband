@@ -131,6 +131,33 @@ class TestAgentConfigFile:
         assert loaded.agents["conductor"].agent_id == "abc"
         assert loaded.agents["coder-claude_sdk-0"].api_key == "key-2"
 
+    def test_to_yaml_is_private(self, tmp_path: Path):
+        """Written file must be owner-read/write only (0o600)."""
+        import stat
+
+        config = AgentConfigFile(agents={
+            "conductor": AgentCredentials(agent_id="abc", api_key="key-1"),
+        })
+        yaml_path = tmp_path / "agent_config.yaml"
+        config.to_yaml(yaml_path)
+        mode = stat.S_IMODE(yaml_path.stat().st_mode)
+        assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
+    def test_to_yaml_restricts_preexisting_file(self, tmp_path: Path):
+        """An existing world-readable file must be tightened before overwriting."""
+        import stat
+
+        yaml_path = tmp_path / "agent_config.yaml"
+        yaml_path.write_text("agents: {}\n")
+        yaml_path.chmod(0o644)
+
+        config = AgentConfigFile(agents={
+            "conductor": AgentCredentials(agent_id="abc", api_key="key-1"),
+        })
+        config.to_yaml(yaml_path)
+        mode = stat.S_IMODE(yaml_path.stat().st_mode)
+        assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
     def test_get_missing_key_raises(self):
         """Getting a missing key raises with helpful message."""
         config = AgentConfigFile(agents={
