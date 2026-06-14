@@ -381,7 +381,7 @@ def _audit_ungated_external_merge(
             },
         )
     except Exception:
-        logger.debug("ungated_external_merge audit append failed", exc_info=True)
+        logger.warning("ungated_external_merge audit append failed", exc_info=True)
 
 
 def _transition_or_fail(
