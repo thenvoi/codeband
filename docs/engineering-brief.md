@@ -450,7 +450,7 @@ The user only supplies the three keys. The global `codeband` tool stays the **Py
 
 ## 3.3 The one real gap: distributing the skill files themselves
 
-The bootstrap installs all the *software*, but a fresh machine still needs the **skill files** (`commands/codeband.md` + `codeband/setup.sh`) before anyone can type `/codeband`. The clean fix mirrors what `jam` already does — ship it as a **Claude Code plugin via a marketplace**. We drafted exactly this (a `greenroom`/`codeband` plugin for the `jam-marketplace` repo). Then the whole onboarding collapses to:
+The bootstrap installs all the *software*, but a fresh machine still needs the **skill files** (`commands/codeband.md` + `codeband/setup.sh`) before anyone can type `/codeband`. The clean fix mirrors what `jam` already does — ship it as a **Claude Code plugin via a marketplace**. We drafted exactly this (a `codeband` plugin for the `jam-marketplace` repo). Then the whole onboarding collapses to:
 
 ```
 claude plugin marketplace add ed-lepedus-thenvoi/jam-marketplace
