@@ -118,6 +118,31 @@ async def send_task(config: CodebandConfig, project_dir: Path, description: str)
         participant=ParticipantRequest(participant_id=conductor_id),
     )
 
+    # If a session agent is present (CODEBAND_SESSION_AGENT_KEY set by the
+    # skill), enroll it as a participant now — it must be in the room before
+    # send_room_message can post under its identity (agent_api_messages requires
+    # room membership). Failure is fatal: a non-enrolled session agent would
+    # cause silent 4xx on every subsequent cb approve/reject post.
+    session_agent_key = os.environ.get("CODEBAND_SESSION_AGENT_KEY") or None
+    if session_agent_key:
+        try:
+            session_client = AsyncRestClient(
+                api_key=session_agent_key, base_url=config.band.rest_url,
+            )
+            session_identity = await session_client.agent_api_identity.get_agent_me()
+            session_agent_id = session_identity.data.id
+            await human_client.human_api_participants.add_my_chat_participant(
+                room_id,
+                participant=ParticipantRequest(participant_id=session_agent_id),
+            )
+            logger.info("Enrolled session agent %s as room participant", session_agent_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to enroll session agent as room participant: {exc}. "
+                "Ensure CODEBAND_SESSION_AGENT_KEY is valid. A non-enrolled "
+                "session agent causes silent 4xx on every post."
+            ) from exc
+
     context_msg = (
         f"{description}\n\n"
         f"@{conductor_name} — here's a new task for the team. "

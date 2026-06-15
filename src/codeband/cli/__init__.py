@@ -587,6 +587,115 @@ def register_task_cmd(
         click.echo(f"Registered task {result.room_id}")
 
 
+@cli.group("session-agent")
+def session_agent_group() -> None:
+    """Manage the per-session Band agent lifecycle."""
+
+
+@session_agent_group.command("register")
+@click.option("--owner", "owner_id", required=True,
+              help="Band participant id of the session owner (the human operator)")
+@click.option("--dir", "project_dir", default=".", help="Project directory")
+@_project_aware
+def session_agent_register_cmd(owner_id: str, project_dir: str) -> None:
+    """Mint and register a per-session Band agent.
+
+    Prints the new agent's api_key as the last line on stdout so the calling
+    skill can capture it for export as CODEBAND_SESSION_AGENT_KEY.
+    """
+    from codeband.orchestration.session_agent import (
+        register_session_agent,
+        repo_slug_from_project,
+    )
+
+    project = Path(project_dir).resolve()
+    config = load_config(project)
+    api_key = os.environ.get("BAND_API_KEY")
+    if not api_key:
+        click.echo(
+            "Error: BAND_API_KEY is required for session-agent register.", err=True,
+        )
+        sys.exit(1)
+
+    repo = repo_slug_from_project(project)
+
+    try:
+        _agent_id, agent_api_key = _run_async(
+            register_session_agent(
+                owner_id,
+                repo,
+                rest_url=config.band.rest_url,
+                band_api_key=api_key,
+            )
+        )
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Registered session agent for repo '{repo}' (owner: {owner_id})")
+    # Last line bare — skill captures this for CODEBAND_SESSION_AGENT_KEY
+    click.echo(agent_api_key)
+
+
+@session_agent_group.command("sweep")
+@click.option("--dir", "project_dir", default=".", help="Project directory")
+@_project_aware
+def session_agent_sweep_cmd(project_dir: str) -> None:
+    """Delete stale codeband-session-* agents owned by this operator.
+
+    Stale = no local marker, heartbeat older than 15 min, or dead pid.
+    Spares agents with a fresh marker. Skips the current session's own agent
+    when CODEBAND_SESSION_AGENT_KEY is set.
+    """
+    from codeband.orchestration.session_agent import sweep_stale_session_agents
+
+    project = Path(project_dir).resolve()
+    config = load_config(project)
+    api_key = os.environ.get("BAND_API_KEY")
+    if not api_key:
+        click.echo(
+            "Error: BAND_API_KEY is required for session-agent sweep.", err=True,
+        )
+        sys.exit(1)
+
+    # Resolve current session agent id so we don't sweep ourselves
+    current_agent_id: str | None = None
+    session_key = os.environ.get("CODEBAND_SESSION_AGENT_KEY") or None
+    if session_key:
+        try:
+            from thenvoi_rest import AsyncRestClient
+
+            async def _resolve_id() -> str:
+                c = AsyncRestClient(api_key=session_key, base_url=config.band.rest_url)
+                identity = await c.agent_api_identity.get_agent_me()
+                return identity.data.id
+
+            current_agent_id = _run_async(_resolve_id())
+        except Exception as exc:
+            click.echo(
+                f"Warning: could not resolve current session agent id: {exc}", err=True,
+            )
+
+    try:
+        deleted = _run_async(
+            sweep_stale_session_agents(
+                band_api_key=api_key,
+                rest_url=config.band.rest_url,
+                current_agent_id=current_agent_id,
+            )
+        )
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    if deleted:
+        for agent_id in deleted:
+            click.echo(f"Deleted stale session agent: {agent_id}")
+        click.echo(f"Swept {len(deleted)} stale session agent(s).")
+    else:
+        click.echo("No stale session agents found.")
+
+
 @cli.command()
 @click.option("--sort", "sort_mode", default="newest",
               type=click.Choice(["newest", "oldest", "smallest", "largest", "most-discussed"]),

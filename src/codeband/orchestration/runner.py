@@ -1155,7 +1155,37 @@ async def run_local(
     watchdog_task.add_done_callback(_make_watchdog_done_callback(activity))
     shutdown_task = asyncio.create_task(shutdown_event.wait())
 
+    # Session-agent heartbeat — only when CODEBAND_SESSION_AGENT_KEY is set.
+    # Refreshes the local liveness marker on a ~5-min timer, tied to this
+    # process's lifecycle so the marker stays fresh as long as the orchestrator
+    # is alive and goes stale when it dies.
+    heartbeat_task: asyncio.Task | None = None
+    session_agent_key = os.environ.get("CODEBAND_SESSION_AGENT_KEY") or None
+    if session_agent_key:
+        try:
+            from codeband.orchestration.session_agent import start_heartbeat_loop
+            from thenvoi_rest import AsyncRestClient as _ARC
+            _sa_client = _ARC(
+                api_key=session_agent_key, base_url=resolved_config.band.rest_url,
+            )
+            _sa_identity = await _sa_client.agent_api_identity.get_agent_me()
+            _sa_id = _sa_identity.data.id
+            _sa_name = _sa_identity.data.name
+            _sa_repo = _watchdog_repo_slug(resolved_config) or "repo"
+            heartbeat_task = asyncio.create_task(
+                start_heartbeat_loop(_sa_id, _sa_name, _sa_repo)
+            )
+            task_names[heartbeat_task] = "session-heartbeat"
+            logger.info("Session heartbeat started for agent %s", _sa_id)
+        except Exception:
+            logger.warning(
+                "Could not resolve session agent identity — heartbeat skipped",
+                exc_info=True,
+            )
+
     all_tasks = unsupervised_tasks + supervisor_tasks + [watchdog_task]
+    if heartbeat_task is not None:
+        all_tasks.append(heartbeat_task)
     worker_keys = [name for _, name in unsupervised] + [s._worker_id for s in supervisors]  # noqa: SLF001
     print(f"Agents ({agent_count}): {', '.join(worker_keys)}, watchdog")
     if ready_event is not None:
