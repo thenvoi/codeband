@@ -1804,29 +1804,33 @@ class WatchdogDaemon:
     ) -> None:
         """Detect and HEAL turn-boundary 422 cursor pins.
 
-        When the agent finishes its turn, the system marks the inbound delivery
-        ``processed``. If that POST returns 422 at the turn boundary, the
-        delivery stays in ``processing`` and the agent's cursor is pinned —
-        the agent will not pull the next message because the transport layer
-        thinks it is still on the last one. A chat nudge cannot wake a pinned
-        agent (its cursor is wedged below the new message). The heal re-asserts
-        ``processing → processed`` on the stuck delivery, which advances the
-        cursor so the agent's next poll flows.
+        When the agent finishes its turn, the SDK marks the inbound delivery
+        ``processed``. If that POST returns 422 (no active processing attempt),
+        the delivery falls back into the ``pending`` bucket head-of-queue and
+        the agent's cursor is pinned — the agent will not pull the next message
+        because the transport layer sees the old delivery as still unprocessed.
+        A chat nudge cannot wake a pinned agent (its cursor is wedged below
+        the new message).
 
-        MID-turn 422s are harmless — the agent keeps working and will mark
-        processed when done. Only a long-stuck ``processing`` past
-        ``transport_pin_threshold_seconds`` is treated as a pin. ``T`` is
-        conservatively LONGER than any plausible real turn (default 1800s is
-        2× the longest role threshold), so mid-turn deliveries are never
-        touched.
+        This rung probes BOTH buckets per (agent, room):
+        - ``pending`` (post-turn 422 class): 2-step re-open (``/processing``)
+          then complete (``/processed``), verified by re-listing the head.
+          Cursor advance confirmed by re-list = success; same head = failed
+          attempt; verify error = unknown (retry next patrol).
+        - ``processing`` (crash-during-turn class): 1-step ``/processed``
+          re-assert. A 422 here means the delivery is already processed;
+          treated as a benign idempotent no-op.
 
-        Per-agent REST clients are required because both the read
-        (``list_agent_messages(status="processing")``) and the heal
-        (``mark_agent_message_processed``) act on the calling agent's own
-        delivery row — the Conductor's credentials only see/heal the
-        Conductor's deliveries. When ``agent_rest_clients`` is empty (or the
-        kill switch is off), the rung is a no-op and the existing nudge /
-        escalation paths are unaffected.
+        Only deliveries whose ``inserted_at`` is older than
+        ``transport_pin_threshold_seconds`` are considered pins — this T is
+        LONGER than any plausible real turn (default 1800s), so mid-turn
+        deliveries are never touched.
+
+        Per-agent REST clients are required because both the probes and the
+        heals act on the calling agent's own delivery row — the Conductor's
+        credentials only see/heal the Conductor's deliveries. When
+        ``agent_rest_clients`` is empty (or the kill switch is off), the rung
+        is a no-op and the existing nudge / escalation paths are unaffected.
         """
         if not self._config.transport_heal_enabled:
             return
@@ -1889,22 +1893,68 @@ class WatchdogDaemon:
             inserted = _parse_ts(getattr(msg, "inserted_at", None))
             if inserted is None or (now - inserted) <= threshold:
                 continue
-            await self._attempt_pin_heal(agent_id, room_id, msg_id, client)
+            await self._attempt_pin_heal(
+                agent_id, room_id, msg_id, client, bucket="processing",
+            )
+
+        # --- pending probe (post-turn 422 class) ---
+        # A post-turn 422 leaves the poison in the pending bucket (no active
+        # processing attempt), not processing. Only the head (data[0]) pins
+        # the cursor; re-asserting /processing on non-head entries creates
+        # junk attempts and must be avoided.
+        try:
+            pending_resp = await client.agent_api_messages.list_agent_messages(
+                chat_id=room_id, status="pending", page=1, page_size=100,
+            )
+        except ApiError:
+            logger.debug(
+                "Transport-heal: list-pending failed for %s in %s",
+                agent_id, room_id, exc_info=True,
+            )
+            return
+        except Exception:
+            logger.debug(
+                "Transport-heal: list-pending crashed for %s in %s",
+                agent_id, room_id, exc_info=True,
+            )
+            return
+
+        pending_data = list(getattr(pending_resp, "data", None) or [])
+        if not pending_data:
+            return
+        head = pending_data[0]
+        head_id = getattr(head, "id", None)
+        if not isinstance(head_id, str):
+            return
+        inserted = _parse_ts(getattr(head, "inserted_at", None))
+        if inserted is None or (now - inserted) <= threshold:
+            return
+        await self._attempt_pin_heal(
+            agent_id, room_id, head_id, client, bucket="pending",
+        )
 
     async def _attempt_pin_heal(
         self, agent_id: str, room_id: str, message_id: str, client: Any,
+        *, bucket: str = "processing",
     ) -> None:
-        """Re-assert ``processing → processed`` on one stuck delivery.
+        """Heal one stuck delivery; behavior differs by ``bucket``.
 
-        Idempotency: re-asserting ``processed`` on an already-processed
-        delivery raises HTTP 422 ("Requires an active processing attempt") —
-        treated as success here because the cursor is already advanced past
-        the message (which is what the heal is trying to accomplish).
+        ``bucket="processing"`` (crash-during-turn class): 1-step
+        ``mark_agent_message_processed``. A 422 means the delivery is already
+        processed — cursor already advanced; idempotent no-op.
 
-        After ``transport_heal_max_attempts`` non-422 failures on the same
-        pin, the watchdog escalates to the owner once and stops healing this
-        delivery — a recurring server-side rejection must not become its own
-        storm.
+        ``bucket="pending"`` (post-turn 422 class): a post-turn 422 leaves
+        the delivery in the ``pending`` bucket (no active processing attempt),
+        so ``/processed`` alone 422s and must not be mis-read as success.
+        The 2-step heal re-opens a processing attempt
+        (``mark_agent_message_processing``) then completes it
+        (``mark_agent_message_processed``), then VERIFIES via a pending-head
+        re-list that the cursor actually advanced. Success is decided by the
+        verify (head advanced or absent), not by swallowing a 422.
+
+        After ``transport_heal_max_attempts`` verify-failures on the same
+        pending pin (or non-422 failures on a processing pin), escalate to the
+        owner once and stop healing this delivery.
         """
         from thenvoi_rest.core.api_error import ApiError
 
@@ -1912,6 +1962,79 @@ class WatchdogDaemon:
         if pin_key in self._pin_escalated:
             return
 
+        if bucket == "pending":
+            # Step a: re-open a processing attempt so /processed won't 422.
+            try:
+                await client.agent_api_messages.mark_agent_message_processing(
+                    chat_id=room_id, id=message_id,
+                )
+            except Exception:
+                logger.debug(
+                    "Transport-heal: mark-processing step failed for "
+                    "agent=%s msg=%s in room=%s",
+                    agent_id, message_id, room_id, exc_info=True,
+                )
+            # Step b: terminate the attempt.
+            try:
+                await client.agent_api_messages.mark_agent_message_processed(
+                    chat_id=room_id, id=message_id,
+                )
+            except Exception:
+                logger.debug(
+                    "Transport-heal: mark-processed step failed for "
+                    "agent=%s msg=%s in room=%s",
+                    agent_id, message_id, room_id, exc_info=True,
+                )
+            # Step c: verify by re-listing the pending head. A 422 on step b
+            # is expected when the delivery already advanced; the re-list is
+            # what decides success — do NOT treat a swallowed 422 as success.
+            try:
+                verify_resp = await client.agent_api_messages.list_agent_messages(
+                    chat_id=room_id, status="pending", page=1, page_size=100,
+                )
+                verify_data = list(getattr(verify_resp, "data", None) or [])
+                head_still_pinned = (
+                    bool(verify_data)
+                    and getattr(verify_data[0], "id", None) == message_id
+                )
+            except Exception:
+                logger.debug(
+                    "Transport-heal: pending verify re-list failed for "
+                    "agent=%s msg=%s in room=%s — unknown outcome, retry next patrol",
+                    agent_id, message_id, room_id, exc_info=True,
+                )
+                return  # UNKNOWN — do not update tracking
+            if not head_still_pinned:
+                # Cursor advanced (head gone or replaced) — success.
+                self._pin_heal_attempts.pop(pin_key, None)
+                logger.info(
+                    "Transport-heal: pending pin healed for agent=%s msg=%s "
+                    "in room=%s (cursor advanced)",
+                    agent_id, message_id, room_id,
+                )
+                if self._activity:
+                    self._activity.log(
+                        "AGENT_PIN_HEALED", "watchdog",
+                        f"Healed transport pin for {agent_id} msg={message_id}",
+                    )
+            else:
+                # Same head — heal did not advance the cursor.
+                attempts = self._pin_heal_attempts.get(pin_key, 0) + 1
+                self._pin_heal_attempts[pin_key] = attempts
+                logger.warning(
+                    "Transport-heal: pending heal attempt %d/%d did not "
+                    "advance cursor for agent=%s msg=%s in room=%s",
+                    attempts, self._config.transport_heal_max_attempts,
+                    agent_id, message_id, room_id,
+                )
+                if attempts >= self._config.transport_heal_max_attempts:
+                    await self._escalate_unhealable_pin(
+                        agent_id, room_id, message_id, attempts,
+                    )
+                    self._pin_escalated.add(pin_key)
+            return
+
+        # --- processing bucket: 1-step (unchanged) ---
         try:
             await client.agent_api_messages.mark_agent_message_processed(
                 chat_id=room_id, id=message_id,

@@ -72,14 +72,41 @@ def _make_conductor_rest_client() -> MagicMock:
     return client
 
 
-def _make_agent_rest_client(processing_messages: list) -> MagicMock:
-    """REST client for one agent's own deliveries (used by the heal rung)."""
+def _make_agent_rest_client(
+    processing_messages: list,
+    pending_messages: list | None = None,
+    verify_pending_messages: list | None = None,
+) -> MagicMock:
+    """REST client for one agent's own deliveries (used by the heal rung).
+
+    processing_messages: returned for status="processing" probes.
+    pending_messages: returned for the first status="pending" probe (detection).
+    verify_pending_messages: returned for subsequent pending probes (verify re-list).
+    Defaults to empty lists so existing tests that only pass processing_messages work.
+    """
     client = MagicMock()
     client.agent_api_messages = MagicMock()
+
+    _pending = pending_messages or []
+    _verify = verify_pending_messages if verify_pending_messages is not None else []
+    _pending_call_count: dict[str, int] = {"n": 0}
+
+    async def _list_side_effect(*args: object, **kwargs: object) -> MagicMock:
+        status = kwargs.get("status", "")
+        if status == "processing":
+            return _make_messages_response(processing_messages)
+        if status == "pending":
+            _pending_call_count["n"] += 1
+            if _pending_call_count["n"] == 1:
+                return _make_messages_response(_pending)
+            return _make_messages_response(_verify)
+        return _make_messages_response([])
+
     client.agent_api_messages.list_agent_messages = AsyncMock(
-        return_value=_make_messages_response(processing_messages),
+        side_effect=_list_side_effect,
     )
     client.agent_api_messages.mark_agent_message_processed = AsyncMock()
+    client.agent_api_messages.mark_agent_message_processing = AsyncMock()
     return client
 
 
@@ -122,7 +149,7 @@ async def test_stuck_processing_past_threshold_is_healed(watchdog_config):
 
     await daemon._patrol()
 
-    agent_client.agent_api_messages.list_agent_messages.assert_awaited_with(
+    agent_client.agent_api_messages.list_agent_messages.assert_any_await(
         chat_id="room-1", status="processing", page_size=100,
     )
     agent_client.agent_api_messages.mark_agent_message_processed.assert_awaited_once_with(
@@ -302,3 +329,238 @@ async def test_empty_clients_map_is_noop(watchdog_config):
     # No external probes triggered by the new rung; only the patrol's own
     # listing calls fire.
     conductor_rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Pending-bucket (post-turn 422 class) tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pending_head_older_than_threshold_is_healed(watchdog_config):
+    """Pending head older than T → 2-step heal + verify → AGENT_PIN_HEALED, tracking cleared."""
+    now = datetime.now(UTC)
+    head = _make_message("msg-pending-head", now - timedelta(seconds=900))  # > T (600)
+    conductor_rest = _make_conductor_rest_client()
+    # First pending probe returns [head]; verify re-list returns [] (cursor advanced).
+    agent_client = _make_agent_rest_client(
+        processing_messages=[],
+        pending_messages=[head],
+        verify_pending_messages=[],
+    )
+    daemon = _make_daemon(
+        watchdog_config, conductor_rest, {"agent-coder": agent_client},
+    )
+
+    await daemon._patrol()
+
+    # Both 2-step calls must fire, in order.
+    processing_call = agent_client.agent_api_messages.mark_agent_message_processing
+    processed_call = agent_client.agent_api_messages.mark_agent_message_processed
+    processing_call.assert_awaited_once_with(chat_id="room-1", id="msg-pending-head")
+    processed_call.assert_awaited_once_with(chat_id="room-1", id="msg-pending-head")
+
+    # Successful verify → tracking cleared.
+    pin_key = ("agent-coder", "msg-pending-head")
+    assert pin_key not in daemon._pin_heal_attempts
+    assert pin_key not in daemon._pin_escalated
+
+
+@pytest.mark.asyncio
+async def test_pending_heal_verify_same_head_increments_and_escalates(watchdog_config):
+    """When verify re-list still shows the same head, increment attempts; escalate at max."""
+    now = datetime.now(UTC)
+    head = _make_message("msg-stubborn", now - timedelta(seconds=900))
+    conductor_rest = _make_conductor_rest_client()
+    # Both detection and verify always return [head] — heal never advances cursor.
+    agent_client = _make_agent_rest_client(
+        processing_messages=[],
+        pending_messages=[head],
+        verify_pending_messages=[head],
+    )
+    daemon = _make_daemon(
+        watchdog_config, conductor_rest, {"agent-coder": agent_client},
+    )
+
+    pin_key = ("agent-coder", "msg-stubborn")
+    posts = conductor_rest.agent_api_messages.create_agent_chat_message
+
+    # Two failing patrols — no escalation yet.
+    for _ in range(2):
+        await daemon._patrol()
+
+    assert pin_key not in daemon._pin_escalated
+    assert daemon._pin_heal_attempts[pin_key] == 2
+    # No AGENT_PIN_HEALED activity logged.
+    posts.assert_not_called()
+
+    # Third patrol — hits max_attempts (3).
+    await daemon._patrol()
+
+    assert pin_key in daemon._pin_escalated
+    assert daemon._pin_heal_attempts[pin_key] == 3
+    # Exactly one escalation post.
+    assert posts.await_count == 1
+
+    # Fourth patrol — heal skipped entirely (pin already in _pin_escalated).
+    await daemon._patrol()
+    assert posts.await_count == 1
+    # mark_agent_message_processing was called 3 times (once per healing patrol).
+    assert agent_client.agent_api_messages.mark_agent_message_processing.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_processing_head_is_one_step_unchanged(watchdog_config):
+    """Processing head older than T → 1-step processed only; mark_agent_message_processing
+    must NOT be called — processing-bucket behavior is byte-for-byte unchanged."""
+    now = datetime.now(UTC)
+    stuck = _make_message("msg-crash-recovery", now - timedelta(seconds=900))
+    conductor_rest = _make_conductor_rest_client()
+    agent_client = _make_agent_rest_client(processing_messages=[stuck])
+    daemon = _make_daemon(
+        watchdog_config, conductor_rest, {"agent-coder": agent_client},
+    )
+
+    await daemon._patrol()
+
+    agent_client.agent_api_messages.mark_agent_message_processed.assert_awaited_once_with(
+        chat_id="room-1", id="msg-crash-recovery",
+    )
+    agent_client.agent_api_messages.mark_agent_message_processing.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pending_head_younger_than_threshold_no_heal(watchdog_config):
+    """Pending head younger than T → no heal calls (mid-turn safety)."""
+    now = datetime.now(UTC)
+    fresh = _make_message("msg-fresh-pending", now - timedelta(seconds=60))  # < T
+    conductor_rest = _make_conductor_rest_client()
+    agent_client = _make_agent_rest_client(
+        processing_messages=[],
+        pending_messages=[fresh],
+    )
+    daemon = _make_daemon(
+        watchdog_config, conductor_rest, {"agent-coder": agent_client},
+    )
+
+    await daemon._patrol()
+
+    agent_client.agent_api_messages.mark_agent_message_processing.assert_not_called()
+    agent_client.agent_api_messages.mark_agent_message_processed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_only_pending_head_is_healed_not_non_head_entries(watchdog_config):
+    """Three pending records → only data[0] (head) healed; non-head get no /processing call."""
+    now = datetime.now(UTC)
+    head = _make_message("msg-head", now - timedelta(seconds=900))
+    msg2 = _make_message("msg-second", now - timedelta(seconds=800))
+    msg3 = _make_message("msg-third", now - timedelta(seconds=700))
+    conductor_rest = _make_conductor_rest_client()
+    agent_client = _make_agent_rest_client(
+        processing_messages=[],
+        pending_messages=[head, msg2, msg3],
+        verify_pending_messages=[],
+    )
+    daemon = _make_daemon(
+        watchdog_config, conductor_rest, {"agent-coder": agent_client},
+    )
+
+    await daemon._patrol()
+
+    # /processing called exactly once, only for the head.
+    processing_calls = agent_client.agent_api_messages.mark_agent_message_processing
+    processing_calls.assert_awaited_once_with(chat_id="room-1", id="msg-head")
+
+    # /processed also called once for the head.
+    agent_client.agent_api_messages.mark_agent_message_processed.assert_awaited_once_with(
+        chat_id="room-1", id="msg-head",
+    )
+
+    # Non-head ids never appear in any call.
+    all_processing_calls = [str(c) for c in processing_calls.await_args_list]
+    assert not any("msg-second" in c or "msg-third" in c for c in all_processing_calls)
+
+
+@pytest.mark.asyncio
+async def test_pending_probe_api_error_no_crash_patrol_continues(watchdog_config):
+    """Pending probe raises ApiError → no crash, no heal; patrol completes normally."""
+    from thenvoi_rest.core.api_error import ApiError
+
+    now = datetime.now(UTC)
+    conductor_rest = _make_conductor_rest_client()
+    agent_client = MagicMock()
+    agent_client.agent_api_messages = MagicMock()
+
+    async def _list_side_effect(*args: object, **kwargs: object) -> MagicMock:
+        status = kwargs.get("status", "")
+        if status == "processing":
+            return _make_messages_response([])
+        raise ApiError(status_code=429, headers={}, body="rate limited")
+
+    agent_client.agent_api_messages.list_agent_messages = AsyncMock(
+        side_effect=_list_side_effect,
+    )
+    agent_client.agent_api_messages.mark_agent_message_processed = AsyncMock()
+    agent_client.agent_api_messages.mark_agent_message_processing = AsyncMock()
+
+    daemon = _make_daemon(watchdog_config, conductor_rest, {"agent-coder": agent_client})
+
+    # Must not raise.
+    await daemon._patrol()
+
+    agent_client.agent_api_messages.mark_agent_message_processing.assert_not_called()
+    agent_client.agent_api_messages.mark_agent_message_processed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pending_probe_generic_exception_no_crash(watchdog_config):
+    """Pending probe raises a generic Exception → no crash, no heal."""
+    now = datetime.now(UTC)
+    conductor_rest = _make_conductor_rest_client()
+    agent_client = MagicMock()
+    agent_client.agent_api_messages = MagicMock()
+
+    async def _list_side_effect(*args: object, **kwargs: object) -> MagicMock:
+        status = kwargs.get("status", "")
+        if status == "processing":
+            return _make_messages_response([])
+        raise RuntimeError("network gone")
+
+    agent_client.agent_api_messages.list_agent_messages = AsyncMock(
+        side_effect=_list_side_effect,
+    )
+    agent_client.agent_api_messages.mark_agent_message_processed = AsyncMock()
+    agent_client.agent_api_messages.mark_agent_message_processing = AsyncMock()
+
+    daemon = _make_daemon(watchdog_config, conductor_rest, {"agent-coder": agent_client})
+
+    await daemon._patrol()
+
+    agent_client.agent_api_messages.mark_agent_message_processing.assert_not_called()
+    agent_client.agent_api_messages.mark_agent_message_processed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_disables_both_probes(watchdog_config):
+    """transport_heal_enabled=False → neither pending nor processing probe runs."""
+    watchdog_config = WatchdogConfig(
+        transport_heal_enabled=False,
+        transport_pin_threshold_seconds=600,
+    )
+    now = datetime.now(UTC)
+    head = _make_message("msg-pending-head", now - timedelta(seconds=900))
+    conductor_rest = _make_conductor_rest_client()
+    agent_client = _make_agent_rest_client(
+        processing_messages=[head],
+        pending_messages=[head],
+    )
+    daemon = _make_daemon(
+        watchdog_config, conductor_rest, {"agent-coder": agent_client},
+    )
+
+    await daemon._patrol()
+
+    agent_client.agent_api_messages.list_agent_messages.assert_not_called()
+    agent_client.agent_api_messages.mark_agent_message_processing.assert_not_called()
+    agent_client.agent_api_messages.mark_agent_message_processed.assert_not_called()
