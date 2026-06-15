@@ -171,8 +171,6 @@ async def send_room_message(
             f"Start a task first with '{task_cmd}' or '{issue_cmd}'."
         )
 
-    api_key = _require_api_key()
-    human_client = AsyncRestClient(api_key=api_key, base_url=config.band.rest_url)
     agent_config = load_agent_config(project_dir)
 
     # Resolve conductor name (need one API call for the display name)
@@ -186,10 +184,21 @@ async def send_room_message(
 
     content = f"@{conductor_name} — {message}"
     mentions = [Mention(id=conductor_id, name=conductor_name)]
-    await human_client.human_api_messages.send_my_chat_message(
-        task_room_id,
-        message=ChatMessageRequest(content=content, mentions=mentions),
-    )
+
+    session_key = os.environ.get("CODEBAND_SESSION_AGENT_KEY") or None
+    if session_key:
+        session_client = AsyncRestClient(api_key=session_key, base_url=config.band.rest_url)
+        await session_client.agent_api_messages.create_agent_chat_message(
+            task_room_id,
+            message=ChatMessageRequest(content=content, mentions=mentions),
+        )
+    else:
+        api_key = _require_api_key()
+        human_client = AsyncRestClient(api_key=api_key, base_url=config.band.rest_url)
+        await human_client.human_api_messages.send_my_chat_message(
+            task_room_id,
+            message=ChatMessageRequest(content=content, mentions=mentions),
+        )
     logger.info("Message sent to room %s", task_room_id)
 
 

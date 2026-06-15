@@ -568,3 +568,123 @@ class TestResetActiveRoom:
         # Mergemaster removal still happened despite conductor failure
         mm_client = factory("key-mm")
         mm_client.agent_api_participants.remove_agent_chat_participant.assert_called_once()
+
+
+class TestSendRoomMessage:
+    """Tests for send_room_message — env-gated session agent identity."""
+
+    def _setup_room(self, tmp_path, sample_agent_config):
+        """Write room pointer (legacy path) and agent_config.yaml."""
+        (tmp_path / ".codeband_room").write_text("room-abc", encoding="utf-8")
+        sample_agent_config.to_yaml(tmp_path / "agent_config.yaml")
+
+    def _make_factory(self, human_client, session_client=None):
+        """Return an AsyncRestClient factory callable.
+
+        human_client: returned when api_key == "human-key"
+        session_client: returned when api_key == "session-key" (optional)
+        Conductor (api_key == "key-cond") gets a fresh AsyncMock with identity wired.
+        """
+        conductor_client = AsyncMock()
+        conductor_client.agent_api_identity.get_agent_me.return_value = FakeIdentityResponse(
+            data=FakeIdentity(id="cond-0", name="Conductor")
+        )
+        _session = session_client  # avoid shadowing in closure
+
+        def factory(api_key, base_url=None):
+            if api_key == "human-key":
+                return human_client
+            if api_key == "session-key" and _session is not None:
+                return _session
+            if api_key == "key-cond":
+                return conductor_client
+            raise ValueError(f"unexpected api_key in factory: {api_key!r}")
+
+        return factory
+
+    @pytest.mark.asyncio
+    async def test_env_absent_uses_human_path(
+        self, sample_config, sample_agent_config, tmp_path, monkeypatch
+    ):
+        """With CODEBAND_SESSION_AGENT_KEY unset, posts via human_api_messages (regression guard)."""
+        from codeband.orchestration import kickoff
+
+        self._setup_room(tmp_path, sample_agent_config)
+
+        human_client = AsyncMock()
+        factory = self._make_factory(human_client)
+
+        monkeypatch.delenv("CODEBAND_SESSION_AGENT_KEY", raising=False)
+        monkeypatch.setenv("BAND_API_KEY", "human-key")
+
+        import thenvoi_rest
+        original = thenvoi_rest.AsyncRestClient
+        thenvoi_rest.AsyncRestClient = factory
+        try:
+            await kickoff.send_room_message(sample_config, tmp_path, "APPROVED")
+        finally:
+            thenvoi_rest.AsyncRestClient = original
+
+        human_client.human_api_messages.send_my_chat_message.assert_called_once()
+        call_kwargs = human_client.human_api_messages.send_my_chat_message.call_args
+        assert call_kwargs[0][0] == "room-abc"
+        msg = call_kwargs[1]["message"]
+        assert "APPROVED" in msg.content
+        assert "Conductor" in msg.content
+
+    @pytest.mark.asyncio
+    async def test_env_set_uses_agent_path(
+        self, sample_config, sample_agent_config, tmp_path, monkeypatch
+    ):
+        """With CODEBAND_SESSION_AGENT_KEY set, posts via agent_api_messages (session identity)."""
+        from codeband.orchestration import kickoff
+
+        self._setup_room(tmp_path, sample_agent_config)
+
+        session_client = AsyncMock()
+        human_client = AsyncMock()
+        factory = self._make_factory(human_client, session_client=session_client)
+
+        monkeypatch.setenv("CODEBAND_SESSION_AGENT_KEY", "session-key")
+        monkeypatch.setenv("BAND_API_KEY", "human-key")
+
+        import thenvoi_rest
+        original = thenvoi_rest.AsyncRestClient
+        thenvoi_rest.AsyncRestClient = factory
+        try:
+            await kickoff.send_room_message(sample_config, tmp_path, "APPROVED")
+        finally:
+            thenvoi_rest.AsyncRestClient = original
+
+        session_client.agent_api_messages.create_agent_chat_message.assert_called_once()
+        human_client.human_api_messages.send_my_chat_message.assert_not_called()
+        call_kwargs = session_client.agent_api_messages.create_agent_chat_message.call_args
+        assert call_kwargs[0][0] == "room-abc"
+        msg = call_kwargs[1]["message"]
+        assert "APPROVED" in msg.content
+        assert "Conductor" in msg.content
+
+    @pytest.mark.asyncio
+    async def test_env_empty_string_uses_human_path(
+        self, sample_config, sample_agent_config, tmp_path, monkeypatch
+    ):
+        """CODEBAND_SESSION_AGENT_KEY='' (empty string) is treated as absent — human path."""
+        from codeband.orchestration import kickoff
+
+        self._setup_room(tmp_path, sample_agent_config)
+
+        human_client = AsyncMock()
+        factory = self._make_factory(human_client)
+
+        monkeypatch.setenv("CODEBAND_SESSION_AGENT_KEY", "")
+        monkeypatch.setenv("BAND_API_KEY", "human-key")
+
+        import thenvoi_rest
+        original = thenvoi_rest.AsyncRestClient
+        thenvoi_rest.AsyncRestClient = factory
+        try:
+            await kickoff.send_room_message(sample_config, tmp_path, "REJECTED")
+        finally:
+            thenvoi_rest.AsyncRestClient = original
+
+        human_client.human_api_messages.send_my_chat_message.assert_called_once()
