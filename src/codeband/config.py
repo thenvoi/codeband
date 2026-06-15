@@ -159,6 +159,18 @@ class WatchdogConfig(_StrictModel):
     transport_heal_enabled: bool = True
     transport_pin_threshold_seconds: int = Field(default=1800, ge=1)
     transport_heal_max_attempts: int = Field(default=3, ge=1)
+    # Approval→merge backstop rung: re-@mention the Mergemaster when a
+    # merge_pending subtask has a recorded human approval at the current HEAD
+    # but LLM dispatch has stalled, instead of letting the watchdog escalate
+    # an already-approved PR to blocked.
+    # ``merge_approval_backstop_seconds``: staleness window (seconds since the
+    # last grant or backstop nudge) before the first renudge fires.
+    # ``merge_approval_backstop_max_renudges``: number of backstop re-@mentions
+    # the rung may send per approved-SHA (0 disables the send leg entirely
+    # while still owning the patrol; 1 = the default, sends once then releases
+    # so a genuinely hung Mergemaster still surfaces as blocked).
+    merge_approval_backstop_seconds: int = Field(default=240, ge=1)
+    merge_approval_backstop_max_renudges: int = Field(default=1, ge=0)
 
 
 # ─── Worker-pool config primitives ──────────────────────────────────────────

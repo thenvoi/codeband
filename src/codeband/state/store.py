@@ -809,6 +809,47 @@ class StateStore:
                 payload=payload,
             )
 
+    def latest_audit_events(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+        event_types: tuple[str, ...],
+    ) -> list[tuple[str, str, dict[str, Any] | None]]:
+        """Return ``[(event_type, ts, payload), …]`` for matching audit rows,
+        newest first.
+
+        ``event_types`` is an exact-match filter applied in SQL (IN clause).
+        ``payload`` is the decoded JSON dict, or ``None`` when the column is
+        absent, empty, or not valid JSON.  Filtering by ``approved_sha`` inside
+        the payload is intentionally left to the caller — SQLite JSON-extract
+        is not portable enough to rely on here.
+        """
+        if not event_types:
+            return []
+        placeholders = ",".join("?" * len(event_types))
+        with self._transaction() as conn:
+            rows = conn.execute(
+                f"SELECT event_type, ts, payload FROM audit_log "
+                f"WHERE task_id = ? AND subtask_id = ? "
+                f"AND event_type IN ({placeholders}) "
+                f"ORDER BY ts DESC",
+                (task_id, subtask_id, *event_types),
+            ).fetchall()
+        result: list[tuple[str, str, dict[str, Any] | None]] = []
+        for row in rows:
+            event_type, ts, payload_text = row[0], row[1], row[2]
+            payload: dict[str, Any] | None = None
+            if payload_text:
+                try:
+                    decoded = json.loads(payload_text)
+                    if isinstance(decoded, dict):
+                        payload = decoded
+                except (ValueError, TypeError):
+                    pass
+            result.append((event_type, ts, payload))
+        return result
+
     def get_task(self, task_id: str) -> TaskRow | None:
         """Return the task row, or ``None`` if it does not exist."""
         with self._transaction() as conn:
