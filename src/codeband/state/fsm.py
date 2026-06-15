@@ -99,6 +99,23 @@ class InvalidTransitionError(Exception):
     """
 
 
+class NoOpTransitionError(Exception):
+    """Raised when the transition is already satisfied at the acting SHA.
+
+    The durable FSM already reflects the requested outcome — the subtask is at
+    the target state or past it on the forward pipeline. Exit 0; nothing to do.
+    """
+
+
+class StaleHeadError(Exception):
+    """Raised when the acting SHA differs from the last recorded SHA.
+
+    The agent is acting on a commit that differs from what the FSM last pinned
+    for this subtask. Exit with EXIT_STALE_HEAD (24); re-run against the new
+    head.
+    """
+
+
 class MergeNotEligibleError(InvalidTransitionError):
     """Raised when ``review_passed → merge_pending`` fails the eligibility gate.
 
@@ -129,6 +146,21 @@ _VERDICT_PASS_STATES: dict[str, str] = {
     "review": "review_passed",
     "verify_acceptance": "acceptance_passed",
 }
+
+# Ordered linear forward pipeline used for no-op classification. Branch states
+# (planned, assigned, review_failed, needs_rebase, blocked, abandoned) are NOT
+# on this sequence. A refused transition whose target is AT or BEFORE the
+# current position on this pipeline, at the same head SHA, is a no-op: the
+# agent's outcome is already durably recorded.
+FORWARD_PIPELINE: tuple[str, ...] = (
+    "in_progress",
+    "verify_pending",
+    "review_pending",
+    "review_passed",
+    "acceptance_passed",
+    "merge_pending",
+    "merged",
+)
 
 
 @dataclass
@@ -456,6 +488,58 @@ def transition(
             rebase_rounds = row["rebase_rounds"] if row is not None else 0
 
             if not _is_allowed(current_state, caller_role, new_state):
+                # Classify the refusal before raising the generic error.
+                # Read the most recent head_sha recorded for this subtask so
+                # we can distinguish "wrong SHA" (STALE) from "already done"
+                # (NO-OP) from a genuine protocol violation (Illegal).
+                last_row = conn.execute(
+                    "SELECT head_sha FROM transition_log "
+                    "WHERE task_id = ? AND subtask_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id, subtask_id),
+                ).fetchone()
+                last_sha = last_row["head_sha"] if last_row is not None else None
+
+                # STALE: both SHAs present and differ — the agent is acting on
+                # a commit that differs from the last FSM-recorded head.
+                if head_sha is not None and last_sha is not None and head_sha != last_sha:
+                    raise StaleHeadError(
+                        f"STALE: head moved {last_sha} -> {head_sha}; "
+                        "re-run your step against the new head"
+                    )
+
+                # NO-OP: requires a SHA-bearing call (forward-verb context),
+                # a matching last SHA, a non-terminal current state, and the
+                # target already satisfied on the forward pipeline. Terminal
+                # states (merged, abandoned) remain Illegal — the outcome is
+                # final and a prior-step retry is a protocol error, not
+                # idempotence. No-SHA calls (abandon, resume) similarly stay
+                # Illegal: they are not idempotent forward verbs.
+                if (
+                    head_sha is not None
+                    and head_sha == last_sha
+                    and current_state not in TERMINAL_STATES
+                ):
+                    target_pos = (
+                        FORWARD_PIPELINE.index(new_state)
+                        if new_state in FORWARD_PIPELINE else None
+                    )
+                    current_pos = (
+                        FORWARD_PIPELINE.index(current_state)
+                        if current_state in FORWARD_PIPELINE else None
+                    )
+                    already_satisfied = current_state == new_state or (
+                        target_pos is not None
+                        and current_pos is not None
+                        and target_pos <= current_pos
+                    )
+                    if already_satisfied:
+                        raise NoOpTransitionError(
+                            f"NO-OP [already_{new_state}] "
+                            f"{subtask_id}@{head_sha} "
+                            f"(state: {current_state}); nothing to do"
+                        )
+
                 raise InvalidTransitionError(
                     f"Illegal transition for subtask {subtask_id!r}: "
                     f"({current_state!r}, role={caller_role!r}) → {new_state!r}"

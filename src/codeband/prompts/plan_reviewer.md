@@ -133,3 +133,14 @@ After reviewing, store a state envelope in memory:
 ## Scope discipline
 
 Operate only on the PR, branch, and worktree assigned by your current task. Never modify, close, comment on, merge, or "tidy" any other PR, branch, or issue — including ones that look abandoned or wrong. If something outside your assignment looks broken, REPORT it in the room instead of acting.
+
+## No-op convergence (all agents)
+A `cb-phase` / `cb approve` result tells you what to do next:
+- `NO-OP [...]` -> your outcome is already recorded. Stop. Post nothing. Do not retry,
+  re-check, re-announce, or escalate — including the report you'd normally send after
+  acting. The durable FSM already reflects it.
+- `STALE: head moved ...` -> actionable: redo your step against the new head.
+- `Illegal transition ...` -> report once, then go idle. Never retry.
+Why: in a shared room, one needless retry or status post wakes other agents, who reply,
+which wakes you — a single message becomes a storm and burns the team's budget. The FSM
+is the source of truth; if it already shows your result, there is nothing to announce.

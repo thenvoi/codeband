@@ -109,6 +109,7 @@ import sys
 from pathlib import Path
 
 from codeband.cli.handoff import (
+    EXIT_STALE_HEAD,
     _output_tail,
     _resolve_store,
     _resolve_task_id,
@@ -118,6 +119,8 @@ from codeband.config import load_config
 from codeband.state.fsm import (
     InvalidTransitionError,
     MergeNotEligibleError,
+    NoOpTransitionError,
+    StaleHeadError,
     transition,
 )
 from codeband.state.store import StateStore, TaskRow
@@ -400,6 +403,12 @@ def _transition_or_fail(
             caller_role="mergemaster", reason=reason, store=store,
             head_sha=head_sha,
         )
+    except NoOpTransitionError as exc:
+        print(str(exc))
+        return None
+    except StaleHeadError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_STALE_HEAD
     except InvalidTransitionError as exc:
         print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
         return 1
@@ -657,10 +666,17 @@ def _cmd_merge(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return EXIT_NOT_ELIGIBLE
+        except NoOpTransitionError as exc:
+            print(str(exc))
+            current = "merge_pending"
+        except StaleHeadError as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_STALE_HEAD
         except InvalidTransitionError as exc:
             print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
             return 1
-        current = "merge_pending"
+        else:
+            current = "merge_pending"
 
     # The SHA the merge was queued at — anchor for the grant and the
     # execution-time re-check.
@@ -1053,6 +1069,15 @@ def record_approval_grant(project_dir: Path | str, pr_number: int) -> list[str]:
 
     recorded = []
     for sub in matching:
+        # Idempotent: a second grant at the same SHA is a no-op — the
+        # grant is already durably recorded, nothing to do.
+        if sub.merge_approved_sha == sub.merge_approval_requested_sha:
+            print(
+                f"NO-OP [already_granted] "
+                f"{sub.subtask_id}@{sub.merge_approval_requested_sha}; "
+                "nothing to do"
+            )
+            continue
         store.record_merge_approval(
             sub.subtask_id, task_id,
             approved_by=approved_by,
