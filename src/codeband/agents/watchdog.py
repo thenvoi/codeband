@@ -958,6 +958,26 @@ class WatchdogDaemon:
         ):
             await self._on_merge_pending_sha_drift(sub, git_head)
             return
+
+        # Backstop: approved + merge_pending + HEAD matches the approved SHA,
+        # but dispatch stalled. Re-nudge Mergemaster; do NOT let this PR get
+        # escalated to blocked while a valid grant is on record.
+        approved_sha = getattr(sub, "merge_approved_sha", None)
+        if (
+            sub.state == "merge_pending"
+            and approved_sha is not None
+            and git_head is not None
+            and git_head == approved_sha
+            and self._config.merge_approval_backstop_max_renudges > 0
+        ):
+            if await self._maybe_backstop_renudge(sub, approved_sha, now):
+                health = self._subtask_state.get((sub.task_id, sub.subtask_id))
+                if health is not None:
+                    health.patrol_visits_without_progress = 0
+                return
+            # cap hit → fall through to the stall counter so a genuinely hung
+            # Mergemaster still surfaces to the owner as blocked.
+
         pr_ts = None
         if sub.pr_number is not None:
             reads_attempted += 1
@@ -1100,6 +1120,164 @@ class WatchdogDaemon:
         except Exception:
             logger.exception(
                 "Watchdog: failed to post SHA-drift alert for %s", sub.subtask_id,
+            )
+
+    async def _maybe_backstop_renudge(
+        self, sub: Any, approved_sha: str, now: datetime,
+    ) -> bool:
+        """Return True when the backstop owns the patrol; False on cap-hit.
+
+        True = caller early-returns (rung is active, do not advance the stall
+        counter).  False = cap exhausted, caller falls through to the normal
+        stall path so a genuinely hung Mergemaster still surfaces as blocked.
+
+        Reads approval_grant + merge_backstop_nudge rows from the audit log,
+        filters to the current ``approved_sha``, and decides whether to fire.
+        Applies the staleness window against the anchor timestamp (last nudge,
+        or the original grant if no nudge yet). On fire: sends, flips
+        swarm-status active, and appends a durable marker (marker-after-send
+        discipline: only appended on successful send).
+        """
+        import asyncio
+
+        if self._store is None:
+            return False
+
+        rows = await asyncio.to_thread(
+            self._store.latest_audit_events,
+            task_id=sub.task_id, subtask_id=sub.subtask_id,
+            event_types=("approval_grant", "merge_backstop_nudge"),
+        )
+        grant_ts: datetime | None = None
+        last_nudge_ts: datetime | None = None
+        renudges_for_sha = 0
+        for event_type, ts_str, payload in rows:
+            if (payload or {}).get("approved_sha") != approved_sha:
+                continue
+            ts = _parse_ts(ts_str)
+            if event_type == "approval_grant" and grant_ts is None:
+                grant_ts = ts
+            elif event_type == "merge_backstop_nudge":
+                renudges_for_sha += 1
+                if last_nudge_ts is None:
+                    last_nudge_ts = ts
+        if grant_ts is None:
+            return False  # no grant in audit log — stall path owns this
+        if renudges_for_sha >= self._config.merge_approval_backstop_max_renudges:
+            return False  # cap hit — release patrol to stall path
+        anchor_ts = last_nudge_ts or grant_ts
+        window = timedelta(seconds=self._config.merge_approval_backstop_seconds)
+        if (now - anchor_ts) < window:
+            return True  # within window — own patrol, don't fire yet
+        fired = await self._send_merge_backstop_renudge(sub, approved_sha)
+        if not fired:
+            return True  # transient send failure — retry next patrol
+        await self._flip_swarm_status_active(sub.task_id)
+        await asyncio.to_thread(
+            self._store.append_audit_event,
+            "merge_backstop_nudge",
+            task_id=sub.task_id,
+            subtask_id=sub.subtask_id,
+            payload={"pr_number": sub.pr_number, "approved_sha": approved_sha},
+        )
+        return True
+
+    async def _send_merge_backstop_renudge(
+        self, sub: Any, approved_sha: str,
+    ) -> bool:
+        """@mention the Mergemaster asking it to run ``cb-phase merge``.
+
+        Resolves the Mergemaster agent id from ``_role_map``, then the room
+        from the store's task row.  Returns True on successful send, False on
+        any resolution failure or send exception (logged at WARNING; does not
+        raise so patrol continues).
+        """
+        from thenvoi_rest.types import ChatMessageRequest, ChatMessageRequestMentionsItem
+
+        mm_id: str | None = next(
+            (aid for aid, role in self._role_map.items() if role == "mergemaster"),
+            None,
+        )
+        if mm_id is None:
+            logger.warning(
+                "Backstop: no Mergemaster in role_map for subtask %s — cannot renudge",
+                sub.subtask_id,
+            )
+            return False
+
+        room_id = await self._resolve_room_id(sub.task_id)
+        if room_id is None:
+            logger.warning(
+                "Backstop: could not resolve room for task %s — cannot renudge %s",
+                sub.task_id, sub.subtask_id,
+            )
+            return False
+
+        short_sha = approved_sha[:8] if approved_sha else "?"
+        pr_ref = f"PR #{sub.pr_number}" if sub.pr_number is not None else "the PR"
+        content = (
+            f"[Watchdog backstop] Subtask {sub.subtask_id}: {pr_ref} has a "
+            f"recorded human approval at {short_sha} but merge dispatch appears "
+            f"stalled. Please run `cb-phase merge` now."
+        )
+        try:
+            await self._rest.agent_api_messages.create_agent_chat_message(
+                chat_id=room_id,
+                message=ChatMessageRequest(
+                    content=content,
+                    mentions=[ChatMessageRequestMentionsItem(id=mm_id)],
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Backstop: failed to send merge renudge for subtask %s",
+                sub.subtask_id, exc_info=True,
+            )
+            return False
+        return True
+
+    async def _flip_swarm_status_active(self, task_id: str) -> None:
+        """Write a ``swarm status active task <task_id>`` memory envelope.
+
+        **GLOBAL EFFECT — not per-subtask.** This write makes the recorded
+        envelope the *latest* swarm-status entry, which un-suppresses ALL
+        patrol rungs for ALL subtasks in ALL active rooms. The Conductor only
+        writes ``waiting_human_approval`` when ALL work is blocked on approval;
+        once any one grant lands that precondition is false, so ``active`` is
+        the semantically-correct latest envelope. The Conductor re-writes
+        ``waiting_human_approval`` on its next active turn if the condition
+        still holds.
+
+        Swallows all exceptions — this is a hint to the patrol-gate, not
+        gated state; a write failure means the gate reads the old envelope for
+        one more cycle, which is safe.
+        """
+        content = f"swarm status active task {task_id}"
+        try:
+            if self._memory_store is not None:
+                await self._memory_store.store(
+                    content=content,
+                    system="working",
+                    type="episodic",
+                    segment="agent",
+                    scope="organization",
+                )
+            else:
+                from thenvoi_rest.types import MemoryCreateRequest
+
+                await self._rest.agent_api_memories.create_agent_memory(
+                    memory=MemoryCreateRequest(
+                        content=content,
+                        system="working",
+                        type="episodic",
+                        segment="agent",
+                        scope="organization",
+                    ),
+                )
+        except Exception:
+            logger.debug(
+                "Backstop: could not flip swarm-status to active for task %s",
+                task_id, exc_info=True,
             )
 
     def _git_head(self, branch: str) -> str | None:
