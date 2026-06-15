@@ -109,7 +109,6 @@ import sys
 from pathlib import Path
 
 from codeband.cli.handoff import (
-    EXIT_STALE_HEAD,
     _output_tail,
     _resolve_store,
     _resolve_task_id,
@@ -120,7 +119,6 @@ from codeband.state.fsm import (
     InvalidTransitionError,
     MergeNotEligibleError,
     NoOpTransitionError,
-    StaleHeadError,
     transition,
 )
 from codeband.state.store import StateStore, TaskRow
@@ -406,9 +404,6 @@ def _transition_or_fail(
     except NoOpTransitionError as exc:
         print(str(exc))
         return None
-    except StaleHeadError as exc:
-        print(str(exc), file=sys.stderr)
-        return EXIT_STALE_HEAD
     except InvalidTransitionError as exc:
         print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
         return 1
@@ -669,9 +664,6 @@ def _cmd_merge(args: argparse.Namespace) -> int:
         except NoOpTransitionError as exc:
             print(str(exc))
             current = "merge_pending"
-        except StaleHeadError as exc:
-            print(str(exc), file=sys.stderr)
-            return EXIT_STALE_HEAD
         except InvalidTransitionError as exc:
             print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
             return 1

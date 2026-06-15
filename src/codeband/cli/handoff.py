@@ -156,7 +156,6 @@ from codeband.state import StateStore
 from codeband.state.fsm import (
     InvalidTransitionError,
     NoOpTransitionError,
-    StaleHeadError,
     transition,
 )
 
@@ -245,13 +244,6 @@ EXIT_NO_VERIFY_COMMAND = 22
 # missing binary, not-executable) — the command could not run cleanly, not that
 # it ran and the tests failed. Infra never burns durable budget.
 EXIT_VERIFY_INFRA_FAILED = 23
-# The acting SHA the agent passed to a gate differs from the last SHA recorded
-# in the FSM for this subtask — the agent is acting on a stale or moved head.
-# Distinct from EXIT_HEAD_MISMATCH (14, verify's push-check): this fires AFTER
-# the FSM validates the transition and finds a SHA conflict in the ledger.
-# Re-run the step against the new head named in the STALE message.
-EXIT_STALE_HEAD = 24
-
 # Default set of exit codes that signal an infrastructure failure of the verify
 # command rather than a test failure. Overridable per-project via
 # ``agents.verify_infra_exit_codes`` in ``codeband.yaml`` or per-repo via
@@ -1075,9 +1067,6 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     except NoOpTransitionError as exc:
         print(str(exc))
         return 0
-    except StaleHeadError as exc:
-        print(str(exc), file=sys.stderr)
-        return EXIT_STALE_HEAD
     except InvalidTransitionError as exc:
         print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
         return 1
@@ -1289,9 +1278,6 @@ def _cmd_review(args: argparse.Namespace) -> int:
     except NoOpTransitionError as exc:
         print(str(exc))
         return 0
-    except StaleHeadError as exc:
-        print(str(exc), file=sys.stderr)
-        return EXIT_STALE_HEAD
     except InvalidTransitionError as exc:
         print(f"cb-phase: review verdict rejected — {exc}", file=sys.stderr)
         return 1
@@ -1464,9 +1450,6 @@ def _cmd_verify_acceptance(args: argparse.Namespace) -> int:
     except NoOpTransitionError as exc:
         print(str(exc))
         return 0
-    except StaleHeadError as exc:
-        print(str(exc), file=sys.stderr)
-        return EXIT_STALE_HEAD
     except InvalidTransitionError as exc:
         print(
             f"cb-phase: acceptance verdict rejected — {exc}", file=sys.stderr,

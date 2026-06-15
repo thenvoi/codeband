@@ -1,7 +1,9 @@
-"""Tests for the idempotent no-op / stale-head transition classification.
+"""Tests for the record-based no-op transition classification.
 
-Lever #1 of the recovery workstream: refused FSM transitions classify as
-NO-OP (exit 0), STALE (exit EXIT_STALE_HEAD=24), or Illegal (non-zero).
+A refused FSM transition is a NO-OP (exit 0) iff a passing record for the
+requested to_state at the caller's exact head_sha already exists in
+transition_log. Anything else (moved head, anomalous split, no head_sha) is
+a loud Illegal (InvalidTransitionError / non-zero).
 """
 
 from __future__ import annotations
@@ -9,11 +11,9 @@ from __future__ import annotations
 import pytest
 
 from codeband.cli import handoff, merge
-from codeband.cli.handoff import EXIT_STALE_HEAD
 from codeband.state.fsm import (
-    FORWARD_PIPELINE,
+    InvalidTransitionError,
     NoOpTransitionError,
-    StaleHeadError,
     transition,
 )
 from codeband.state.store import StateStore
@@ -69,7 +69,12 @@ class TestNoOpTransitionFSM:
         assert "review_passed" in msg  # state echoed
 
     def test_reviewer_approve_forward_past_raises_noop(self, tmp_path):
-        """review --approve when state already acceptance_passed → NO-OP."""
+        """review --approve when state already acceptance_passed → NO-OP.
+
+        The review_passed record at SHA1 is in transition_log, so even though
+        the current state is acceptance_passed (past review_passed), the record
+        check finds the row and raises NoOpTransitionError.
+        """
         store = _make_store(tmp_path)
         _drive_to_acceptance_passed(store, sha=SHA1)
 
@@ -105,45 +110,57 @@ class TestNoOpTransitionFSM:
 
         assert store.get_subtask("st-1", TASK).state == "review_passed"
 
-
-class TestStaleHeadFSM:
-    """Direct FSM tests for StaleHeadError classification."""
-
-    def test_stale_head_raises_when_sha_moved(self, tmp_path):
-        """Forward verb when head SHA has moved → StaleHeadError."""
+    def test_moved_head_is_illegal_not_noop(self, tmp_path):
+        """review_passed@SHA1 recorded, attempt review_passed@SHA2 → Illegal."""
         store = _make_store(tmp_path)
         _drive_to_review_passed(store, sha=SHA1)
 
-        with pytest.raises(StaleHeadError) as exc_info:
+        with pytest.raises(InvalidTransitionError) as exc_info:
             transition("st-1", TASK, "review_passed", caller_role="reviewer",
                        store=store, head_sha=SHA2)
 
-        msg = str(exc_info.value)
-        assert "STALE" in msg
-        assert SHA1 in msg
-        assert SHA2 in msg
-        assert "re-run" in msg
+        assert not isinstance(exc_info.value, NoOpTransitionError)
+        assert "Illegal transition" in str(exc_info.value)
 
-    def test_stale_no_state_change(self, tmp_path):
-        """STALE writes nothing — durable state is unchanged."""
+    def test_anomalous_split_is_illegal(self, tmp_path):
+        """review_passed@SHA1 + acceptance_passed@SHA2; re-attempt review_passed@SHA2 → Illegal.
+
+        No review_passed record exists at SHA2, so there is no matching row and
+        the refusal escalates to loud Illegal.
+        """
+        store = _make_store(tmp_path)
+        # Drive to review_passed@SHA1
+        _drive_to_review_passed(store, sha=SHA1)
+        # Manually record acceptance_passed@SHA2 by driving there with SHA2 on the
+        # verifier leg (verifier can enter acceptance_passed from review_passed).
+        transition("st-1", TASK, "acceptance_passed", caller_role="verifier",
+                   store=store, head_sha=SHA2)
+
+        with pytest.raises(InvalidTransitionError) as exc_info:
+            transition("st-1", TASK, "review_passed", caller_role="reviewer",
+                       store=store, head_sha=SHA2)
+
+        assert not isinstance(exc_info.value, NoOpTransitionError)
+        assert "Illegal transition" in str(exc_info.value)
+
+    def test_refused_transition_head_sha_none_is_illegal(self, tmp_path):
+        """Refused transition with head_sha=None → Illegal (no record check)."""
         store = _make_store(tmp_path)
         _drive_to_review_passed(store, sha=SHA1)
 
-        with pytest.raises(StaleHeadError):
+        with pytest.raises(InvalidTransitionError) as exc_info:
             transition("st-1", TASK, "review_passed", caller_role="reviewer",
-                       store=store, head_sha=SHA2)
+                       store=store, head_sha=None)
 
-        assert store.get_subtask("st-1", TASK).state == "review_passed"
+        assert not isinstance(exc_info.value, NoOpTransitionError)
+        assert "Illegal transition" in str(exc_info.value)
 
 
 class TestIllegalRemainsIllegal:
     """Branch states stay loud Illegal — not silently NO-OP."""
 
-    from codeband.state.fsm import InvalidTransitionError
-
     def test_review_from_blocked_is_illegal(self, tmp_path):
         """forward verb when state is blocked → unchanged Illegal transition."""
-        from codeband.state.fsm import InvalidTransitionError
         store = _make_store(tmp_path)
         _drive_to_review_passed(store, sha=SHA1)
         transition("st-1", TASK, "blocked", caller_role="watchdog", store=store)
@@ -153,12 +170,10 @@ class TestIllegalRemainsIllegal:
                        store=store, head_sha=SHA1)
 
         assert "Illegal transition" in str(exc_info.value)
-        # Must NOT be a NoOpTransitionError
         assert not isinstance(exc_info.value, NoOpTransitionError)
 
     def test_review_from_needs_rebase_is_illegal(self, tmp_path):
         """forward verb when state is needs_rebase → unchanged Illegal transition."""
-        from codeband.state.fsm import InvalidTransitionError
         store = _make_store(tmp_path)
         _drive_to_review_passed(store, sha=SHA1)
         transition("st-1", TASK, "needs_rebase", caller_role="mergemaster", store=store)
@@ -221,15 +236,15 @@ class TestReviewCommandNoop:
         out = capsys.readouterr().out
         assert "NO-OP" in out
 
-    def test_stale_head_exits_24(self, tmp_path, monkeypatch, capsys):
-        """review --approve when head SHA has moved → EXIT_STALE_HEAD=24."""
+    def test_moved_head_illegal_non_zero(self, tmp_path, monkeypatch, capsys):
+        """review --approve when head SHA has moved → non-zero Illegal (not STALE)."""
         store = _make_review_store(tmp_path, sha=SHA1)
         _patch_review_env(monkeypatch, store, pr_sha=SHA2)
 
         rc = handoff.main(["review", "st-1", "--pr", "42", "--approve"])
-        assert rc == EXIT_STALE_HEAD
+        assert rc != 0
         err = capsys.readouterr().err
-        assert "STALE" in err
+        assert "Illegal transition" in err
 
     def test_blocked_state_illegal_non_zero(self, tmp_path, monkeypatch, capsys):
         """review --approve when state is blocked → non-zero Illegal."""
@@ -239,7 +254,6 @@ class TestReviewCommandNoop:
 
         rc = handoff.main(["review", "st-1", "--pr", "42", "--approve"])
         assert rc != 0
-        assert rc != EXIT_STALE_HEAD
         err = capsys.readouterr().err
         assert "Illegal transition" in err
 
@@ -251,7 +265,6 @@ class TestReviewCommandNoop:
 
         rc = handoff.main(["review", "st-1", "--pr", "42", "--approve"])
         assert rc != 0
-        assert rc != EXIT_STALE_HEAD
 
 
 def _make_acceptance_store(tmp_path, sha=SHA1):
@@ -295,14 +308,15 @@ class TestVerifyAcceptanceCommandNoop:
         handoff.main(["verify-acceptance", "st-1", "--pr", "42", "--accept"])
         assert store.get_subtask("st-1", TASK).state == "acceptance_passed"
 
-    def test_stale_head_exits_24(self, tmp_path, monkeypatch, capsys):
+    def test_moved_head_illegal_non_zero(self, tmp_path, monkeypatch, capsys):
+        """verify-acceptance --accept when head SHA has moved → non-zero Illegal."""
         store = _make_acceptance_store(tmp_path, sha=SHA1)
         _patch_verify_acceptance_env(monkeypatch, store, pr_sha=SHA2)
 
         rc = handoff.main(["verify-acceptance", "st-1", "--pr", "42", "--accept"])
-        assert rc == EXIT_STALE_HEAD
+        assert rc != 0
         err = capsys.readouterr().err
-        assert "STALE" in err
+        assert "Illegal transition" in err
 
 
 # ── cb approve idempotency ────────────────────────────────────────────────────
@@ -379,21 +393,3 @@ class TestApproveIdempotency:
         assert len(result) == 1
         assert SHA1 in result[0]
         assert store.get_subtask("st-1", TASK).merge_approved_sha == SHA1
-
-
-# ── FORWARD_PIPELINE sanity ───────────────────────────────────────────────────
-
-def test_forward_pipeline_order():
-    """The linear pipeline is ordered as specified."""
-    expected = (
-        "in_progress", "verify_pending", "review_pending",
-        "review_passed", "acceptance_passed", "merge_pending", "merged",
-    )
-    assert FORWARD_PIPELINE == expected
-
-
-def test_exit_stale_head_is_24():
-    """EXIT_STALE_HEAD=24 is the correct value and follows 23."""
-    from codeband.cli.handoff import EXIT_VERIFY_INFRA_FAILED
-    assert EXIT_STALE_HEAD == 24
-    assert EXIT_VERIFY_INFRA_FAILED == 23

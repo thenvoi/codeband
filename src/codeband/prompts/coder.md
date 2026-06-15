@@ -295,7 +295,6 @@ A `cb-phase` / `cb approve` result tells you what to do next:
 - `NO-OP [...]` -> your outcome is already recorded. Stop. Post nothing. Do not retry,
   re-check, re-announce, or escalate — including the report you'd normally send after
   acting. The durable FSM already reflects it.
-- `STALE: head moved ...` -> actionable: redo your step against the new head.
 - `Illegal transition ...` -> report once, then go idle. Never retry.
 Why: in a shared room, one needless retry or status post wakes other agents, who reply,
 which wakes you — a single message becomes a storm and burns the team's budget. The FSM
