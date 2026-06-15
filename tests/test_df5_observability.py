@@ -313,7 +313,7 @@ class TestAgentPinDefer:
 # ─── Item 4: AGENT_RECONNECTED ────────────────────────────────────────────────
 
 class TestAgentReconnected:
-    """AGENT_RECONNECTED fires once per reconnect (attempt > 1), not on initial start."""
+    """AGENT_RECONNECTED fires on first successful turn after reconnect, not on attempt."""
 
     @staticmethod
     def _agent(coro_factory) -> MagicMock:
@@ -363,7 +363,7 @@ class TestAgentReconnected:
 
     @pytest.mark.asyncio
     async def test_emitted_once_per_reconnect_cycle(self, monkeypatch) -> None:
-        """Each reconnect cycle (attempt > 1) emits exactly one AGENT_RECONNECTED."""
+        """Each reconnect cycle emits AGENT_RECONNECTED after its first successful run."""
         from codeband.orchestration.runner import _run_agent_forever
 
         monkeypatch.setattr(
@@ -379,10 +379,9 @@ class TestAgentReconnected:
         async def run_and_exit():
             nonlocal call_count
             call_count += 1
-            if call_count >= 3:
+            if call_count == 3:
                 target.set()
-                await asyncio.sleep(60)
-            # cycles 1 and 2 return cleanly (triggering AGENT_RESTART)
+            # calls 1–3 return cleanly; call 4 will be cancelled before it matters
 
         activity = _make_activity()
         task = asyncio.create_task(
@@ -401,14 +400,14 @@ class TestAgentReconnected:
                 pass
 
         reconnected = [c for c in activity.log.call_args_list if c.args[0] == "AGENT_RECONNECTED"]
-        # Cycle 1: no AGENT_RECONNECTED. Cycles 2 and 3: one each.
+        # Attempt 1: no marker. Attempts 2 and 3 each succeed → one marker each.
         assert len(reconnected) == 2, (
-            f"expected 2 AGENT_RECONNECTED (cycles 2+3, not cycle 1), got {reconnected}"
+            f"expected 2 AGENT_RECONNECTED (attempts 2+3 succeeded), got {reconnected}"
         )
 
     @pytest.mark.asyncio
     async def test_emitted_after_crash_reconnect(self, monkeypatch) -> None:
-        """Reconnect after a crash (exception path) also emits AGENT_RECONNECTED."""
+        """Reconnect after a crash emits AGENT_RECONNECTED once the next run succeeds."""
         from codeband.orchestration.runner import _run_agent_forever
 
         monkeypatch.setattr(
@@ -421,18 +420,18 @@ class TestAgentReconnected:
         call_count = 0
         target = asyncio.Event()
 
-        async def crash_then_block():
+        async def crash_then_succeed():
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise RuntimeError("simulated crash")
+            # attempt 2: return cleanly → AGENT_RECONNECTED fires after this
             target.set()
-            await asyncio.sleep(60)
 
         activity = _make_activity()
         task = asyncio.create_task(
             _run_agent_forever(
-                lambda _ctx=None: self._agent(crash_then_block),
+                lambda _ctx=None: self._agent(crash_then_succeed),
                 "test-agent", activity,
             ),
         )
@@ -447,5 +446,52 @@ class TestAgentReconnected:
 
         reconnected = [c for c in activity.log.call_args_list if c.args[0] == "AGENT_RECONNECTED"]
         assert len(reconnected) == 1, (
-            f"expected 1 AGENT_RECONNECTED after crash→reconnect, got {reconnected}"
+            f"expected 1 AGENT_RECONNECTED after crash→successful reconnect, got {reconnected}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_not_emitted_when_first_post_reconnect_run_fails(self, monkeypatch) -> None:
+        """A failed first post-reconnect run must NOT fire the marker; the next success does."""
+        from codeband.orchestration.runner import _run_agent_forever
+
+        monkeypatch.setattr(
+            "codeband.orchestration.runner._RECONNECT_BASE_DELAY_SECONDS", 0.0,
+        )
+        monkeypatch.setattr(
+            "codeband.orchestration.runner._RECONNECT_MAX_DELAY_SECONDS", 0.0,
+        )
+
+        call_count = 0
+        target = asyncio.Event()
+
+        async def clean_then_crash_then_succeed():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return  # attempt 1: clean exit, no marker
+            if call_count == 2:
+                raise RuntimeError("post-reconnect crash")  # attempt 2: must NOT emit
+            # attempt 3: succeeds → marker fires now
+            target.set()
+
+        activity = _make_activity()
+        task = asyncio.create_task(
+            _run_agent_forever(
+                lambda _ctx=None: self._agent(clean_then_crash_then_succeed),
+                "test-agent", activity,
+            ),
+        )
+        try:
+            await asyncio.wait_for(target.wait(), timeout=2.0)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        reconnected = [c for c in activity.log.call_args_list if c.args[0] == "AGENT_RECONNECTED"]
+        assert len(reconnected) == 1, (
+            f"expected 1 AGENT_RECONNECTED (only on attempt 3 success, not attempt 2 crash), "
+            f"got {reconnected}"
         )

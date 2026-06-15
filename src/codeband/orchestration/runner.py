@@ -470,13 +470,9 @@ async def _run_agent_forever(
                 )
                 recovery_context = None
         agent = make_agent(recovery_context)
+        reconnect_pending = attempt > 1
         try:
             try:
-                if attempt > 1:
-                    _log_activity_safe(
-                        activity, "AGENT_RECONNECTED", name,
-                        f"Reconnect attempt #{attempt}",
-                    )
                 await agent.run()
             except asyncio.CancelledError:
                 raise
@@ -490,6 +486,11 @@ async def _run_agent_forever(
                     f"{type(exc).__name__}: {exc}",
                 )
             else:
+                if reconnect_pending:
+                    _log_activity_safe(
+                        activity, "AGENT_RECONNECTED", name,
+                        f"Reconnect attempt #{attempt} — first successful turn",
+                    )
                 logger.warning(
                     "%s run() returned cleanly — reconnecting (attempt %d)",
                     name, attempt,
