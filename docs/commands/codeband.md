@@ -19,7 +19,8 @@ $ARGUMENTS
 ## Important constraints to relay if relevant
 - The swarm clones the repo's **remote (origin)** — it works on what is **pushed**, not local uncommitted edits. Tell the user to push first if needed.
 - If the current dir has no `origin`, it falls back to cloning the local repo (committed state only).
-- `jam`/`Band` resolver caveat: never use `jam chat new --with @handle` / `jam agent list` to build the room — they only read the first page of peers and silently drop agents. Always create the room + add participants via the agent API (the Python below does this).
+- `jam`/`Band` resolver caveat: never use `jam chat new --with @handle` (multi-arg) / `jam agent list` to build the room — they only read the first page of peers and silently drop agents. Add participants ONE AT A TIME via `jam chat add @handle` (or via the REST participant API for ids without an `@owner/handle`, like the human user) — never via the multi-arg pager. The Python below does this.
+- **Post as the agent, never as the owner.** Every message you (CC) post to the room goes out under your own agent identity — via `jam send`/`jam reply` as your CC handle — never under the owner's user key. This applies on the ad-hoc path too: if the operator nudges you to post a status, a relay, or anything else, you post as yourself and name the owner in the text body; you do not author messages that appear to come from the human. Two reasons: (1) **attribution integrity** — you must be able to distinguish human-originated actions from agent ones (the Stage-3 attributable posture depends on it); (2) **approval integrity** — a merge approval is a SHA-pinned `cb approve` CLI grant executed by the human, not a message you post on their behalf. An agent must never post an approval that looks like it came from the owner.
 
 ---
 
@@ -139,97 +140,154 @@ echo "cb run pid $(cat .ensemble/run.pid)"
 
 Poll `~/projects/codeband/.ensemble/run.log` for up to ~40s. Success looks like agents starting / connecting. If you see repeated `HTTP 429` (rate limited) or a preflight/auth/clone error, STOP, kill the run (`kill $(cat ~/projects/codeband/.ensemble/run.pid)`), show the error, and do NOT seed the task — tell the user to retry in a few minutes (429) or fix the error.
 
-### Step 6 — YOU create the room with your own key, add the 8 agents, send the task
+### Step 6 — YOU create the room, add the agents + yourself-as-human, send the task
 
-This is the heart of it. Bypass jam's `--with` (buggy pager) and use the agent API directly:
+This is the heart of it. jam 0.2.5 keeps peer state in an encrypted SQLite store (the 0.1.x `~/.config/jam/sessions/*/*.json` files are gone) — so we DON'T glob session files and we DON'T need cc's REST key. Instead: use jam CLI (`jam chat new` / `jam chat add` / `jam send`) for everything cc does (jam auths via the store internally), and use the Conductor's REST key for the two things that aren't a jam CLI command — resolving cc's room-owner id, and adding the **human** (BAND_API_KEY's user) as a participant of the agent-created room so `cb room-log`, the approve/reject notify half, the watchdog, the feed, and the Step 7 receive-gap Monitor all work in agent-room mode.
+
+Add agents one at a time via `jam chat add @handle` (avoids `jam chat new --with` / `jam agent list`'s first-page pager bug). Don't add the human via `jam chat add`: humans have no `@owner/handle`, only a UUID — use the REST participant API for that one.
 
 ```bash
 cd "$CB_HOME"
 GR_TASK="$ARGUMENTS" "$HOME/.local/share/uv/tools/codeband/bin/python" - "$TARGET_DIR" "$CB_HOME" <<'PYEOF'
-import asyncio, os, subprocess, sys, glob, json, yaml
-from thenvoi_rest import AsyncRestClient, ChatRoomRequest, ChatMessageRequest, ParticipantRequest
-from thenvoi_rest.types import ChatMessageRequestMentionsItem as Mention
+import asyncio, os, re, subprocess, sys, yaml
+from thenvoi_rest import AsyncRestClient, ParticipantRequest
 target_dir, cb_home = sys.argv[1], sys.argv[2]
 task = os.environ.get("GR_TASK", "").strip() or "(no task text provided)"
 
-# Find this session's jam state (CC's own agent key + id) by matching cwd
-cc_key = cc_id = handle = team_name = None
-for p in glob.glob(os.path.expanduser("~/.config/jam/sessions/*/*.json")):
-    try:
-        d = json.load(open(p))
-    except Exception:
-        continue
-    if d.get("cwd") == target_dir and d.get("agent_api_key") and d.get("agent_id"):
-        cc_key, cc_id, handle = d["agent_api_key"], d["agent_id"], d.get("handle")
-        team_name = d.get("team_name")
-        break
-if not cc_key:
-    print("ERROR: could not find CC's jam agent key/id for cwd", target_dir); sys.exit(1)
+# 1) Find cc's @owner/handle from `jam list` (the running peer for this onboard).
+jl = subprocess.run(["jam","list"], capture_output=True, text=True)
+if jl.returncode != 0:
+    print("ERROR: `jam list` failed:", jl.stderr, file=sys.stderr); sys.exit(1)
+cc_handle = None
+for line in jl.stdout.splitlines():
+    parts = line.strip().split()
+    if parts and "/" in parts[0] and "running=true" in line:
+        cc_handle = parts[0]; break
+if not cc_handle:
+    print("ERROR: no running jam peer found in `jam list`.\n" + jl.stdout, file=sys.stderr); sys.exit(1)
+
+# 2) Create the room as cc. jam CLI auths via the encrypted store internally.
+cn = subprocess.run(["jam","chat","new","--as",cc_handle], capture_output=True, text=True)
+if cn.returncode != 0:
+    print("ERROR: `jam chat new` failed:", cn.stderr, file=sys.stderr); sys.exit(1)
+m = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", cn.stdout)
+if not m:
+    print("ERROR: could not parse room id from `jam chat new`:", cn.stdout, file=sys.stderr); sys.exit(1)
+rid = m.group(0)
 
 cfg = yaml.safe_load(open(os.path.join(cb_home, "codeband.yaml")))
 rest = cfg["band"]["rest_url"]
 ac = yaml.safe_load(open(os.path.join(cb_home, "agent_config.yaml")))
-agent_ids = [(k, a["agent_id"]) for k, a in ac["agents"].items()]
-cond_id = ac["agents"]["conductor"]["agent_id"]
+band_key = os.environ.get("BAND_API_KEY","").strip()
+if not band_key:
+    print("ERROR: BAND_API_KEY not set in env.", file=sys.stderr); sys.exit(1)
 cond_key = ac["agents"]["conductor"]["api_key"]
 
 async def main():
-    cc = AsyncRestClient(api_key=cc_key, base_url=rest)
-    cond_name = (await AsyncRestClient(api_key=cond_key, base_url=rest).agent_api_identity.get_agent_me()).data.name
-    room = await cc.agent_api_chats.create_agent_chat(chat=ChatRoomRequest())
-    rid = room.data.id
-    # Register the task (tasks row + .codeband/state/.codeband_room pointer, atomically) BEFORE any agent hears about it.
-    reg_cmd = ["cb", "register-task", "--room", rid, "--owner", cc_id, "--description", task, "--dir", cb_home]
-    if handle:
-        reg_cmd += ["--owner-handle", handle]
-    reg = subprocess.run(reg_cmd, capture_output=True, text=True)
+    cond = AsyncRestClient(api_key=cond_key, base_url=rest)
+    cond_me = (await cond.agent_api_identity.get_agent_me()).data
+    cond_handle, cond_name = cond_me.handle, cond_me.name
+
+    # 3) Add the Conductor first via jam CLI so we can use its REST key on the room.
+    r = subprocess.run(["jam","chat","add",rid,"@"+cond_handle,"--as",cc_handle],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"ERROR: jam chat add @{cond_handle} failed:", r.stderr, file=sys.stderr); sys.exit(1)
+
+    # 4) Resolve cc's id via Conductor REST — cc is the room's `owner`-role participant.
+    parts = (await cond.agent_api_participants.list_agent_chat_participants(rid)).data
+    cc_id = next((p.id for p in parts if getattr(p, "role", None) == "owner"), None)
+    if not cc_id:
+        print("ERROR: could not resolve room owner (cc) from participants.", file=sys.stderr); sys.exit(1)
+
+    # 5) Register the task (tasks row + .codeband/state/.codeband_room pointer, atomically) BEFORE any other agent is added and before any kickoff is sent.
+    reg = subprocess.run(["cb","register-task","--room",rid,"--owner",cc_id,
+                          "--owner-handle",cc_handle,"--description",task,"--dir",cb_home],
+                         capture_output=True, text=True)
     if reg.returncode != 0:
-        print("REGISTRATION FAILED (cb register-task exit", reg.returncode, ") — the seed is ABORTED: no task message was sent and no agent was activated.", file=sys.stderr)
+        print("REGISTRATION FAILED (cb register-task exit", reg.returncode, ") — the seed is ABORTED: no task message was sent and no other agent was activated.", file=sys.stderr)
         print(reg.stderr, file=sys.stderr)
         print("Report this registration failure to the user verbatim and STOP. Do not retry, do not message the swarm.", file=sys.stderr)
         sys.exit(1)
-    for k, aid in agent_ids:
-        await cc.agent_api_participants.add_agent_chat_participant(rid, participant=ParticipantRequest(participant_id=aid))
-    msg = (f"@{cond_name} here's a new task for the team. Please send it to the Planner for analysis, "
+
+    # 6) Resolve every other agent's @owner/handle via REST, then `jam chat add` one at a time.
+    async def one(name, a):
+        c = AsyncRestClient(api_key=a["api_key"], base_url=rest)
+        me = (await c.agent_api_identity.get_agent_me()).data
+        return name, me.handle
+    metas = await asyncio.gather(*[one(n,a) for n,a in ac["agents"].items() if n != "conductor"])
+    for name, h in metas:
+        rr = subprocess.run(["jam","chat","add",rid,"@"+h,"--as",cc_handle],
+                            capture_output=True, text=True)
+        if rr.returncode != 0:
+            print(f"ERROR: jam chat add @{h} ({name}) failed:", rr.stderr, file=sys.stderr); sys.exit(1)
+
+    # 7) Add the human (BAND_API_KEY's user) as a participant — Option A.
+    #    Proven live 2026-06-14: Conductor's REST key (a non-creator member) can
+    #    add by human UUID; the room then becomes visible to the human API, so
+    #    `cb room-log`, `cb approve`/`cb reject`'s notify half, the watchdog,
+    #    the feed, and the Step 7 receive-gap Monitor all stop 404ing.
+    human = AsyncRestClient(api_key=band_key, base_url=rest)
+    human_id = (await human.human_api_profile.get_my_profile()).data.id
+    await cond.agent_api_participants.add_agent_chat_participant(
+        rid, participant=ParticipantRequest(participant_id=human_id))
+
+    # 8) Send the kickoff as cc via jam CLI. `@<owner/handle>` is parsed as a Band mention.
+    msg = (f"@{cond_handle} here's a new task for the team. Please send it to the Planner for analysis, "
            f"then coordinate the build. Report progress, questions, and PR-approval requests back to me in this room.\n\n"
            f"Task: {task}\n\n"
            f"Repository: {cfg['repo']['url']} (branch: {cfg['repo']['branch']})")
-    await cc.agent_api_messages.create_agent_chat_message(rid, message=ChatMessageRequest(content=msg, mentions=[Mention(id=cond_id, name=cond_name)]))
+    sd = subprocess.run(["jam","send",rid,msg,"--as",cc_handle], capture_output=True, text=True)
+    if sd.returncode != 0:
+        print("ERROR: jam send (kickoff) failed:", sd.stderr, file=sys.stderr); sys.exit(1)
+
     print("ROOM", rid)
-    print("HANDLE", handle)
+    print("HANDLE", cc_handle)
+    print("OWNER_ID", cc_id)
     print("CONDUCTOR", cond_name)
-    # The inbox path comes from the bridge's ACTUAL team (a pre-existing bridge
-    # keeps its original team name), never from a computed codeband-<repo> guess.
-    if team_name:
-        print("INBOX", os.path.expanduser(f"~/.claude/teams/{team_name}/inboxes/team-lead.json"))
-    else:
-        print("INBOX_UNKNOWN: session JSON has no team_name — the jam inbox path cannot be derived. Do NOT arm the inbox Monitor on a guessed path; tell the user.")
 asyncio.run(main())
 PYEOF
 ```
 
-If this prints `ROOM <id>` you've seeded the task as room owner. Remember `ROOM` (the room id) — you need it for approvals — and `INBOX` (the inbox path for Step 7). If it errors, show the user and stop.
+If this prints `ROOM <id>` you've seeded the task as room owner. Remember `ROOM` (the room id, needed for approvals and for the Step 7 room poll) and `OWNER_ID` (so Step 7 can skip your own messages). Step 7's poll is authoritative on its own — no bridge inbox file is required. If it errors, show the user and stop.
 
-### Step 7 — arm the inbox Monitor (this is your "push")
+### Step 7 — arm the room Monitor (this is your "push")
 
-Call the **Monitor** tool (persistent) so each new Band message auto-wakes you. Use the `INBOX` path printed by Step 6 and substitute it literally into the command. If Step 6 printed `INBOX_UNKNOWN` instead, do NOT arm this Monitor — watching a guessed path fails silently. Tell the user the inbox path could not be derived (no `team_name` in the jam session JSON) and that swarm messages will not auto-wake you, then continue with Steps 7b/7c.
+Call the **Monitor** tool (persistent) so each new Band message auto-wakes you. Read the **authoritative full room** via `cb room-log` — NOT the jam bridge's `team-lead.json`, which is a filtered owner-context slice (it can stall silently when traffic skips the owner's mention, and it can drop or re-emit inbound approvals on bridge retry — both observed in dogfood cluster 7). Substitute `CB_HOME`, `ROOM`, and `OWNER_ID` literally from Step 6.
 
 > Monitor tool call — `persistent: true`, description `"codeband: new Band messages"`, command:
 > ```
-> PY="$HOME/.local/share/uv/tools/codeband/bin/python"; INBOX="<the INBOX path>"; "$PY" -u -c "
-> import json,time,os
-> seen=set()
-> try:
->     for m in json.load(open(os.path.expanduser('$INBOX'))): seen.add(m['band']['message_id'])
-> except Exception: pass
-> while True:
+> PY="$HOME/.local/share/uv/tools/codeband/bin/python"; CB_HOME="<the CB_HOME path>"; ROOM="<the ROOM id>"; OWNER_ID="<the OWNER_ID>"; "$PY" -u -c "
+> import json,subprocess,time,os
+> cb_home=os.environ['CB_HOME']; room=os.environ['ROOM']; owner=os.environ['OWNER_ID']
+> def fetch():
 >     try:
->         for m in json.load(open(os.path.expanduser('$INBOX'))):
->             mid=m['band']['message_id']
->             if mid not in seen:
->                 seen.add(mid); print('NEW BAND MSG '+mid+': '+(m.get('summary') or '')[:240],flush=True)
->     except Exception: pass
->     time.sleep(2)
+>         r=subprocess.run(['cb','room-log','--json','--dir',cb_home,room],capture_output=True,text=True,timeout=20)
+>         if r.returncode!=0: return []
+>         out=[]
+>         for l in r.stdout.splitlines():
+>             l=l.strip()
+>             if not l: continue
+>             try: out.append(json.loads(l))
+>             except Exception: pass
+>         return out
+>     except Exception: return []
+> seen=set()
+> # Prime on startup so existing history is not replayed. Dedup key = inserted_at (microsecond UTC, unique per message).
+> for m in fetch():
+>     k=m.get('inserted_at')
+>     if k: seen.add(k)
+> while True:
+>     for m in fetch():
+>         k=m.get('inserted_at')
+>         if not k or k in seen: continue
+>         seen.add(k)
+>         if m.get('message_type')!='text': continue          # drop thought/tool_call/tool_result
+>         if m.get('sender_id')==owner: continue              # skip own outbound messages
+>         sender=m.get('sender_name') or m.get('sender_id') or '?'
+>         content=(m.get('content') or '')[:280]
+>         print('NEW BAND MSG ['+sender+']: '+content,flush=True)
+>     time.sleep(3)
 > "
 > ```
 
@@ -271,6 +329,14 @@ The inbox and PR Monitors only fire on messages-to-you and on PRs. A swarm can d
 
 On an **error signal**, check whether the pipeline is recovering on its own; if it's been quiet since, treat it as a stall. On a **SWARM STALL**, read `cd "$CB_HOME" && codeband pending --dir .` and the log tail (`grep -vE 'no longer exists' "$CB_HOME/.ensemble/run.log" | tail -20`), tell the user the swarm has stalled and what the last real activity was, and offer to nudge the Conductor or restart the run. Don't sit on it.
 
+### Step 7d — mandatory self-wakeup (owner/jam mode)
+
+When you are the task owner/initiator (agent-as-owner / jam mode — you started the session under your own Band identity), you **MUST** set a recurring self-wakeup, not rely on a passive room monitor alone. The monitor can miss events or stall silently; the self-wakeup is your liveness guarantee.
+
+On each wakeup, re-check the FSM state and the room so you never go dormant while the swarm needs an owner action — approving at `merge_pending`, reacting to a gate-stall, or escalating a blocked task. This is **mandatory** whenever you own the task. (When a human owns the task, a monitor alone is fine.)
+
+Use `ScheduleWakeup` with a delay of 270s or less (stays within the prompt-cache window) and pass the same `/codeband` prompt back as `prompt` so each firing re-enters coordination. Example reasoning for the `reason` field: `"owner self-wakeup: re-check FSM state and swarm room"`.
+
 ### Step 8 — hand off to the user (keep it short)
 
 Tell the user:
@@ -296,7 +362,7 @@ You have two Monitors firing events: **inbox** (swarm messages to you) and **PR 
 
 **Merge approval** — when you receive a merge-approval request (a Band @mention naming a PR, e.g. "PR #12 … is awaiting your merge approval at head <sha>. Approve with: cb approve 12"):
 1. **Review before granting**: confirm the gate's verdicts passed (`cd "$CB_HOME" && codeband pending --dir .`) and read the diff (`gh pr diff <N> --repo <slug>`) — you are approving specific code, not a status. Never approve blindly.
-2. **To grant**: run `cb approve <pr>` from the project directory: `cd "$CB_HOME" && cb approve <N>`. The grant is SHA-pinned — if new commits land on the PR after your approval, it expires automatically and a fresh request will arrive.
+2. **To grant**: run `cb approve <pr>` from the project directory: `cd "$CB_HOME" && cb approve <N>`. The grant is SHA-pinned — if new commits land on the PR after your approval, it expires automatically and a fresh request will arrive. **Never post "approved" as a chat message** — the approval is the `cb approve` CLI grant, executed as the human owner. An agent posting approval text into the room is not a grant and violates attribution integrity.
 3. **To withhold**: reply on Band (`jam reply`) stating what is missing or wrong. Do not run `cb approve`.
 
 Outbound to the Conductor at any time: `cd "$TARGET_DIR" && jam reply <recent Conductor msg_id> "..."`. Do NOT run `cb feed` (it streams and blocks).
