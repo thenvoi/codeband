@@ -363,6 +363,21 @@ VALID_TRANSITIONS: dict[tuple[str, str], frozenset[str]] = {
 }
 
 
+def state_to_roles(state: str) -> set[str]:
+    """Return the set of caller roles that have any outgoing edge from ``state``.
+
+    Derived once from :data:`VALID_TRANSITIONS`. Used by the watchdog stall
+    rung to ask "for a subtask in this state, who is the swarm expecting to
+    act next?" before deciding whether a missing transition is a substantive
+    stall or just a transport pin on the expected actor. Terminal states
+    (``merged``, ``abandoned``) return an empty set — nothing is expected to
+    act on them. The cross-cutting Conductor-abandon / Watchdog-block
+    wildcards are intentionally NOT folded in: those are escalation edges,
+    not "expected next actor" semantics.
+    """
+    return {role for (s, role) in VALID_TRANSITIONS if s == state}
+
+
 def _is_allowed(current_state: str, caller_role: str, new_state: str) -> bool:
     """Return ``True`` if the transition is permitted.
 

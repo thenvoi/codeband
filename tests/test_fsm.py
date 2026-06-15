@@ -9,6 +9,7 @@ import pytest
 from codeband.state.fsm import (
     VALID_TRANSITIONS,
     InvalidTransitionError,
+    state_to_roles,
     transition,
 )
 from codeband.state.store import StateStore
@@ -74,6 +75,25 @@ def test_valid_transitions_matches_rfc_table():
         # the same worker, counters preserved — NOT a cap reset.
         ("blocked", "conductor"): frozenset({"in_progress"}),
     }
+
+
+def test_state_to_roles_matches_rfc_table():
+    # Derived from VALID_TRANSITIONS — sanity-check the canonical lookups the
+    # watchdog stall discriminator uses to resolve "who is expected to act
+    # next on this state?". Terminal states have no expected actor.
+    assert state_to_roles("planned") == {"conductor"}
+    assert state_to_roles("assigned") == {"coder"}
+    assert state_to_roles("in_progress") == {"coder"}
+    assert state_to_roles("verify_pending") == {"coder"}
+    assert state_to_roles("review_pending") == {"reviewer"}
+    assert state_to_roles("review_passed") == {"verifier", "mergemaster"}
+    assert state_to_roles("review_failed") == {"coder"}
+    assert state_to_roles("acceptance_passed") == {"mergemaster"}
+    assert state_to_roles("needs_rebase") == {"coder"}
+    assert state_to_roles("merge_pending") == {"mergemaster"}
+    assert state_to_roles("blocked") == {"conductor"}
+    assert state_to_roles("merged") == set()
+    assert state_to_roles("abandoned") == set()
 
 
 def test_ensure_subtask_auto_creates_row(store):

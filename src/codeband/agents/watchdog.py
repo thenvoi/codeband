@@ -1202,8 +1202,17 @@ class WatchdogDaemon:
         escalate-once marker (marker-after-send, S6-F7n). ``False`` means
         nothing happened (no transition, no alert): the caller retries on the
         next patrol instead of silently never escalating again.
+
+        A discriminator gate runs first: when the FSM-expected actor for the
+        subtask's current state has a transport pin in the task's room, the
+        block is DEFERRED (returns ``False`` without touching FSM state or
+        posting). A transport condition must never mutate gated state — the
+        heal rung clears the pin and the next patrol re-evaluates.
         """
         import asyncio
+
+        if await self._stall_block_deferred_for_pin(sub):
+            return False
 
         visits = self._config.max_phase_visits
         logger.warning(
@@ -1293,6 +1302,151 @@ class WatchdogDaemon:
                 "FSM blocked-transition failed for %s", sub.subtask_id,
             )
             return False
+
+    async def _stall_block_deferred_for_pin(self, sub: Any) -> bool:
+        """Return ``True`` if the stall→blocked transition should be DEFERRED.
+
+        The stall rung counts an absent transition + an absent git-HEAD change
+        across ``max_phase_visits`` patrols as a substantive stall. A transport
+        pin on the FSM-expected actor presents the same symptoms (the agent's
+        delivery queue is wedged at the head, so no FSM advance is possible
+        until the pin clears). Without this gate, a pinned actor was getting
+        marked ``blocked`` — and ``blocked`` poisons recovery because the only
+        legal exit needs a Conductor resume (not auto-triggered).
+
+        Algorithm:
+
+        1. Resolve the set of FSM-expected roles for ``sub.state`` via
+           :func:`state_to_roles`. Terminal states → no expected actor →
+           proceed.
+        2. Take every agent of those roles that has a REST client (i.e. is
+           reachable from the watchdog).
+        3. For each, probe the agent's own delivery queue in the task's room
+           with the SAME pin criteria as the heal rung (processing record OR
+           pending head with ``inserted_at`` older than
+           ``transport_pin_threshold_seconds``).
+        4. Any candidate pinned — or any probe that raises — DEFERS the
+           block. Probe uncertainty fails toward defer because a false block
+           poisons recovery; a transient transport error just delays a real
+           block one patrol.
+
+        ``review_passed`` returns ``{verifier, mergemaster}`` and both are
+        probed: the v1 approximation can over-defer when a subtask is actually
+        waiting on the verifier while the mergemaster is independently pinned
+        on another room, but the cost is a bounded delay of the block, never a
+        wrong block. ``required_verdicts`` is intentionally not consulted
+        here.
+
+        No-ops to ``False`` (proceed) when:
+
+        * the transport-heal rung is disabled — the operator opted out of the
+          composition, so the discriminator opts out too;
+        * no per-agent REST clients are wired — nothing to probe with;
+        * the task's room cannot be resolved — the pin lookup is per-room and
+          we cannot tell, fall through to today's behavior;
+        * no candidate agent of the expected role has a REST client — also
+          nothing to probe with.
+
+        Only ``self._role_map`` membership + room scoping are used (not
+        ``assigned_agent_id``); probing a non-participant returns an empty
+        mailbox for the room, so non-participants cannot cause a false defer.
+        """
+        if not self._config.transport_heal_enabled:
+            return False
+        if not self._agent_rest_clients:
+            return False
+
+        from codeband.state.fsm import state_to_roles  # noqa: PLC0415
+
+        state = getattr(sub, "state", None)
+        if not isinstance(state, str):
+            return False
+        expected_roles = state_to_roles(state)
+        if not expected_roles:
+            return False
+        candidate_agents = [
+            aid for aid, role in self._role_map.items()
+            if role in expected_roles and aid in self._agent_rest_clients
+        ]
+        if not candidate_agents:
+            return False
+
+        room_id = await self._resolve_room_id(sub.task_id)
+        if room_id is None:
+            return False
+
+        threshold = timedelta(seconds=self._config.transport_pin_threshold_seconds)
+        now = datetime.now(UTC)
+        for aid in candidate_agents:
+            client = self._agent_rest_clients[aid]
+            try:
+                pinned = await self._detect_room_pin(
+                    aid, room_id, client, threshold, now,
+                )
+            except Exception:
+                logger.info(
+                    "Stall->blocked deferred for subtask %s: probe of agent "
+                    "%s (role %s) in room %s raised — treating as transport-"
+                    "pinned (fail toward defer).",
+                    sub.subtask_id, aid, self._role_map.get(aid), room_id,
+                    exc_info=True,
+                )
+                return True
+            if pinned:
+                logger.info(
+                    "Stall->blocked deferred for subtask %s: expected actor "
+                    "%s (role %s) transport-pinned in room %s; leaving to "
+                    "transport-heal rung.",
+                    sub.subtask_id, aid, self._role_map.get(aid), room_id,
+                )
+                return True
+        return False
+
+    async def _detect_room_pin(
+        self,
+        agent_id: str,
+        room_id: str,
+        client: Any,
+        threshold: timedelta,
+        now: datetime,
+    ) -> bool:
+        """Return ``True`` if ``agent_id`` has a transport pin in ``room_id``.
+
+        Pin criteria mirror :meth:`_check_one_agent_room_pins` exactly so the
+        heal rung and the stall discriminator share one definition:
+
+        * any ``processing`` record whose ``inserted_at`` is older than
+          ``threshold`` (crash-during-turn class), OR
+        * the ``pending`` HEAD (``data[0]``) whose ``inserted_at`` is older
+          than ``threshold`` (post-turn 422 class) — only the head pins the
+          cursor.
+
+        Probe errors propagate so the caller can decide policy (the
+        discriminator treats them as pinned to fail toward defer); the heal
+        rung's own probes silence errors locally because its policy is
+        different (skip-and-retry).
+        """
+        resp = await client.agent_api_messages.list_agent_messages(
+            chat_id=room_id, status="processing", page_size=100,
+        )
+        for msg in list(getattr(resp, "data", None) or []):
+            if not isinstance(getattr(msg, "id", None), str):
+                continue
+            inserted = _parse_ts(getattr(msg, "inserted_at", None))
+            if inserted is not None and (now - inserted) > threshold:
+                return True
+
+        pending_resp = await client.agent_api_messages.list_agent_messages(
+            chat_id=room_id, status="pending", page=1, page_size=100,
+        )
+        pending_data = list(getattr(pending_resp, "data", None) or [])
+        if not pending_data:
+            return False
+        head = pending_data[0]
+        if not isinstance(getattr(head, "id", None), str):
+            return False
+        inserted = _parse_ts(getattr(head, "inserted_at", None))
+        return inserted is not None and (now - inserted) > threshold
 
     async def _check_blocked_subtasks(self, now: datetime) -> None:
         """Escalate any ``blocked`` subtask to the owner via a Band @mention.
@@ -2100,15 +2254,20 @@ class WatchdogDaemon:
     ) -> None:
         """Owner-escalate a pin that survived ``max_attempts`` heal tries.
 
-        Posts in the pinned agent's room so the owner (if a room participant)
-        sees the alert. The pinned agent is intentionally NOT @-mentioned —
-        a wedged cursor cannot read inbound chat anyway, so the mention would
-        be wasted and risks another 422 storm; the owner-handle mention is
-        also omitted because resolving an owner-participant in the wedged
-        agent's room is the runner's job, not the watchdog's. Best-effort:
-        a send failure is logged but does not break patrol.
+        Actively @-mentions the owner (``self._owner_id`` / ``self._owner_handle``,
+        set by the runner at construction) so the human is woken instead of
+        relying on them seeing a passive room post. The pinned agent is
+        intentionally NOT @-mentioned: a wedged cursor cannot read inbound
+        chat anyway, so the mention would be wasted and risks another 422
+        storm. When no owner id is configured (e.g. the runner has not wired
+        it for this swarm) the post degrades to mention-less, preserving the
+        pre-upgrade behavior. Best-effort: a send failure is logged but does
+        not break patrol.
         """
-        from thenvoi_rest.types import ChatMessageRequest
+        from thenvoi_rest.types import (
+            ChatMessageRequest,
+            ChatMessageRequestMentionsItem,
+        )
 
         threshold = self._config.transport_pin_threshold_seconds
         logger.critical(
@@ -2121,17 +2280,23 @@ class WatchdogDaemon:
                 "AGENT_PIN_UNHEALABLE", "watchdog",
                 f"Pin survived {attempts} heals: {agent_id} msg={message_id}",
             )
+        mentions: list[Any] = []
+        owner_prefix = ""
+        if self._owner_id:
+            handle = self._owner_handle or self._owner_id
+            mentions = [ChatMessageRequestMentionsItem(id=self._owner_id)]
+            owner_prefix = f"@{handle} "
         try:
             await self._rest.agent_api_messages.create_agent_chat_message(
                 chat_id=room_id,
                 message=ChatMessageRequest(
                     content=(
-                        f"[Watchdog] Transport pin on agent {agent_id} "
-                        f"(message {message_id}) survived {attempts} heal "
-                        f"attempts after >{threshold}s in processing. "
-                        f"Owner: investigate or restart the agent."
+                        f"{owner_prefix}[Watchdog] Transport pin on agent "
+                        f"{agent_id} (message {message_id}) survived "
+                        f"{attempts} heal attempts after >{threshold}s in "
+                        f"processing. Owner: investigate or restart the agent."
                     ),
-                    mentions=[],
+                    mentions=mentions,
                 ),
             )
         except Exception:
