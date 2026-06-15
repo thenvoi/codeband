@@ -144,6 +144,21 @@ class WatchdogConfig(_StrictModel):
     # Default 30 patrols ≈ hourly at the default 120s patrol interval —
     # proportionate to ledger size at this scale.
     full_integrity_interval_patrols: int = Field(default=30, ge=1)
+    # Transport-health heal rung: detect and heal turn-boundary 422 pins. When
+    # a mark-processed POST 422s at the turn boundary, the delivery stays stuck
+    # in ``processing`` and the agent's cursor is pinned — a chat nudge cannot
+    # reach it. The watchdog re-asserts ``processing → processed`` on the
+    # stuck delivery, which advances the cursor so the agent's next poll
+    # flows. ``transport_pin_threshold_seconds`` MUST be conservatively longer
+    # than any plausible real turn so mid-turn 422s are never touched — the
+    # default 1800s (30 min) is 2× the longest role threshold (coder /
+    # mergemaster at 900s). After ``transport_heal_max_attempts`` failed
+    # heals on the same delivery the pin escalates to the owner once and no
+    # further heals fire (no infinite heal storm on a server-side rejection).
+    # ``transport_heal_enabled`` is the kill switch.
+    transport_heal_enabled: bool = True
+    transport_pin_threshold_seconds: int = Field(default=1800, ge=1)
+    transport_heal_max_attempts: int = Field(default=3, ge=1)
 
 
 # ─── Worker-pool config primitives ──────────────────────────────────────────

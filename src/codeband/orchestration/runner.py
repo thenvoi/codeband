@@ -1054,6 +1054,18 @@ async def run_local(
     role_map, wd_human_rest = await _build_watchdog_extras(
         agent_config, resolved_config,
     )
+    # Per-agent REST clients for the transport-heal rung: keyed by agent_id,
+    # each authenticated as THAT agent so the rung's
+    # `list_agent_messages(status="processing")` + `mark_agent_message_processed`
+    # calls act on its own delivery row. The Conductor's client only sees/heals
+    # the Conductor's deliveries, so without this map the heal would be a
+    # no-op for every other agent.
+    agent_rest_clients: dict[str, Any] = {
+        creds.agent_id: _create_rest_client(
+            creds.api_key, resolved_config.band.rest_url,
+        )
+        for creds in agent_config.agents.values()
+    }
     watchdog = WatchdogDaemon(
         config=resolved_config.agents.watchdog,
         rest_client=wd_rest,
@@ -1073,6 +1085,7 @@ async def run_local(
         # are cwd-independent.
         bare_repo=layout.bare_repo,
         repo_slug=_watchdog_repo_slug(resolved_config),
+        agent_rest_clients=agent_rest_clients,
     )
     logger.info("Created Watchdog daemon")
 

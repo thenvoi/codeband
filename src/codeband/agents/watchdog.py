@@ -231,6 +231,7 @@ class WatchdogDaemon:
         owner_handle: str | None = None,
         bare_repo: Any | None = None,
         repo_slug: str | None = None,
+        agent_rest_clients: dict[str, Any] | None = None,
     ):
         self._config = config
         self._rest = rest_client
@@ -307,6 +308,19 @@ class WatchdogDaemon:
         # rung; the two are fully decoupled).
         self._full_integrity_alerted: set[tuple[str, str, str]] = set()
         self._full_integrity_patrol_count: int = 0
+        # Transport-health (turn-boundary 422 pin) heal rung. Per-agent REST
+        # clients keyed by agent_id — each is authenticated as THAT agent so
+        # the `list_agent_messages(status="processing")` read and the
+        # `mark_agent_message_processed` heal act on its own delivery row (a
+        # call with the Conductor's credentials only sees/heals the Conductor's
+        # deliveries). ``None`` opts out and the rung is a no-op — same shape
+        # as ``state_store``. ``_pin_heal_attempts`` counts consecutive failed
+        # heals per ``(agent_id, message_id)``; ``_pin_escalated`` is the
+        # escalate-once marker so a server-side-rejected heal can not become
+        # its own storm.
+        self._agent_rest_clients: dict[str, Any] = dict(agent_rest_clients or {})
+        self._pin_heal_attempts: dict[tuple[str, str], int] = {}
+        self._pin_escalated: set[tuple[str, str]] = set()
 
     async def run(self) -> None:
         """Main patrol loop — runs until cancelled."""
@@ -761,6 +775,14 @@ class WatchdogDaemon:
         # the incremental rung's interior-old-row blind spot. Code-driven and
         # independent of any verifier LLM seat; guarded like the rung above.
         await self._check_chain_integrity_full(now)
+
+        # Seventh rung: transport-health (turn-boundary 422 pin) heal. Reuses
+        # the patrol's already-listed rooms so the rung is one extra call per
+        # (agent, active room) and orthogonal to the chat-recency nudge above —
+        # a pinned agent cannot read a nudge, so a separate transport-level
+        # heal is required. ``rooms`` is the patrol's room list and
+        # ``inactive_rooms`` the same active-only filter.
+        await self._check_transport_pins(rooms, inactive_rooms, now)
 
     def _task_rows(self) -> list[tuple[str, str, str, str | None]] | None:
         """Return ``(task_id, room_id, status, owner_id)`` for every task row.
@@ -1770,6 +1792,229 @@ class WatchdogDaemon:
             self._activity.log(
                 "LEDGER_INTEGRITY_ALERT", source,
                 f"{chain_name} {kind}: {detail}",
+            )
+
+    # ── transport-health (turn-boundary 422 pin) heal rung ─────────────────
+
+    async def _check_transport_pins(
+        self,
+        rooms: list[Any],
+        inactive_rooms: set[str],
+        now: datetime,
+    ) -> None:
+        """Detect and HEAL turn-boundary 422 cursor pins.
+
+        When the agent finishes its turn, the system marks the inbound delivery
+        ``processed``. If that POST returns 422 at the turn boundary, the
+        delivery stays in ``processing`` and the agent's cursor is pinned —
+        the agent will not pull the next message because the transport layer
+        thinks it is still on the last one. A chat nudge cannot wake a pinned
+        agent (its cursor is wedged below the new message). The heal re-asserts
+        ``processing → processed`` on the stuck delivery, which advances the
+        cursor so the agent's next poll flows.
+
+        MID-turn 422s are harmless — the agent keeps working and will mark
+        processed when done. Only a long-stuck ``processing`` past
+        ``transport_pin_threshold_seconds`` is treated as a pin. ``T`` is
+        conservatively LONGER than any plausible real turn (default 1800s is
+        2× the longest role threshold), so mid-turn deliveries are never
+        touched.
+
+        Per-agent REST clients are required because both the read
+        (``list_agent_messages(status="processing")``) and the heal
+        (``mark_agent_message_processed``) act on the calling agent's own
+        delivery row — the Conductor's credentials only see/heal the
+        Conductor's deliveries. When ``agent_rest_clients`` is empty (or the
+        kill switch is off), the rung is a no-op and the existing nudge /
+        escalation paths are unaffected.
+        """
+        if not self._config.transport_heal_enabled:
+            return
+        if not self._agent_rest_clients:
+            return
+
+        threshold = timedelta(seconds=self._config.transport_pin_threshold_seconds)
+        room_ids = [
+            r.id for r in rooms if getattr(r, "id", None) not in inactive_rooms
+        ]
+        for agent_id, client in self._agent_rest_clients.items():
+            if agent_id == self._agent_id:
+                # The watchdog already runs with this client's credentials via
+                # ``self._rest``; skipping prevents a redundant double-check
+                # on the same delivery rows.
+                continue
+            for room_id in room_ids:
+                await self._check_one_agent_room_pins(
+                    agent_id, room_id, client, threshold, now,
+                )
+
+    async def _check_one_agent_room_pins(
+        self,
+        agent_id: str,
+        room_id: str,
+        client: Any,
+        threshold: timedelta,
+        now: datetime,
+    ) -> None:
+        """Probe one (agent, room) for pinned deliveries and heal each."""
+        from thenvoi_rest.core.api_error import ApiError
+
+        try:
+            resp = await client.agent_api_messages.list_agent_messages(
+                chat_id=room_id, status="processing", page_size=100,
+            )
+        except ApiError:
+            logger.debug(
+                "Transport-heal: list-processing failed for %s in %s",
+                agent_id, room_id, exc_info=True,
+            )
+            return
+        except Exception:
+            logger.debug(
+                "Transport-heal: list-processing crashed for %s in %s",
+                agent_id, room_id, exc_info=True,
+            )
+            return
+
+        for msg in list(getattr(resp, "data", None) or []):
+            msg_id = getattr(msg, "id", None)
+            if not isinstance(msg_id, str):
+                continue
+            # Use ``inserted_at`` as a conservative proxy for the delivery's
+            # ``started_at``: a delivery's /processing call is always after the
+            # message was inserted, so ``started_at >= inserted_at`` — using
+            # ``inserted_at`` UNDER-counts pin age and only fires later than a
+            # true ``started_at`` read would. The SDK does not surface the
+            # delivery's ``started_at`` on the ChatMessage record.
+            inserted = _parse_ts(getattr(msg, "inserted_at", None))
+            if inserted is None or (now - inserted) <= threshold:
+                continue
+            await self._attempt_pin_heal(agent_id, room_id, msg_id, client)
+
+    async def _attempt_pin_heal(
+        self, agent_id: str, room_id: str, message_id: str, client: Any,
+    ) -> None:
+        """Re-assert ``processing → processed`` on one stuck delivery.
+
+        Idempotency: re-asserting ``processed`` on an already-processed
+        delivery raises HTTP 422 ("Requires an active processing attempt") —
+        treated as success here because the cursor is already advanced past
+        the message (which is what the heal is trying to accomplish).
+
+        After ``transport_heal_max_attempts`` non-422 failures on the same
+        pin, the watchdog escalates to the owner once and stops healing this
+        delivery — a recurring server-side rejection must not become its own
+        storm.
+        """
+        from thenvoi_rest.core.api_error import ApiError
+
+        pin_key = (agent_id, message_id)
+        if pin_key in self._pin_escalated:
+            return
+
+        try:
+            await client.agent_api_messages.mark_agent_message_processed(
+                chat_id=room_id, id=message_id,
+            )
+        except ApiError as e:
+            if e.status_code == 422:
+                # Already processed → cursor already advanced. Idempotent
+                # no-op; drop tracking so the slot frees up.
+                self._pin_heal_attempts.pop(pin_key, None)
+                logger.debug(
+                    "Transport-heal: delivery %s for %s already processed "
+                    "(422) — treating as no-op",
+                    message_id, agent_id,
+                )
+                return
+            attempts = self._pin_heal_attempts.get(pin_key, 0) + 1
+            self._pin_heal_attempts[pin_key] = attempts
+            logger.warning(
+                "Transport-heal attempt %d/%d failed for agent=%s msg=%s "
+                "in room=%s: HTTP %s",
+                attempts, self._config.transport_heal_max_attempts,
+                agent_id, message_id, room_id, e.status_code,
+            )
+            if attempts >= self._config.transport_heal_max_attempts:
+                await self._escalate_unhealable_pin(
+                    agent_id, room_id, message_id, attempts,
+                )
+                self._pin_escalated.add(pin_key)
+            return
+        except Exception:
+            attempts = self._pin_heal_attempts.get(pin_key, 0) + 1
+            self._pin_heal_attempts[pin_key] = attempts
+            logger.warning(
+                "Transport-heal attempt %d/%d crashed for agent=%s msg=%s "
+                "in room=%s",
+                attempts, self._config.transport_heal_max_attempts,
+                agent_id, message_id, room_id, exc_info=True,
+            )
+            if attempts >= self._config.transport_heal_max_attempts:
+                await self._escalate_unhealable_pin(
+                    agent_id, room_id, message_id, attempts,
+                )
+                self._pin_escalated.add(pin_key)
+            return
+
+        # 2xx: cursor advanced. Clear tracking so a future fresh pin on the
+        # same agent/message starts at attempt 0 (current message_id is one-
+        # shot, so this is mostly defensive).
+        self._pin_heal_attempts.pop(pin_key, None)
+        logger.info(
+            "Transport-heal: re-asserted processed for agent=%s msg=%s "
+            "in room=%s (cursor advanced)",
+            agent_id, message_id, room_id,
+        )
+        if self._activity:
+            self._activity.log(
+                "AGENT_PIN_HEALED", "watchdog",
+                f"Healed transport pin for {agent_id} msg={message_id}",
+            )
+
+    async def _escalate_unhealable_pin(
+        self, agent_id: str, room_id: str, message_id: str, attempts: int,
+    ) -> None:
+        """Owner-escalate a pin that survived ``max_attempts`` heal tries.
+
+        Posts in the pinned agent's room so the owner (if a room participant)
+        sees the alert. The pinned agent is intentionally NOT @-mentioned —
+        a wedged cursor cannot read inbound chat anyway, so the mention would
+        be wasted and risks another 422 storm; the owner-handle mention is
+        also omitted because resolving an owner-participant in the wedged
+        agent's room is the runner's job, not the watchdog's. Best-effort:
+        a send failure is logged but does not break patrol.
+        """
+        from thenvoi_rest.types import ChatMessageRequest
+
+        threshold = self._config.transport_pin_threshold_seconds
+        logger.critical(
+            "Transport-heal: unable to clear pin for agent=%s msg=%s in "
+            "room=%s after %d attempts — escalating",
+            agent_id, message_id, room_id, attempts,
+        )
+        if self._activity:
+            self._activity.log(
+                "AGENT_PIN_UNHEALABLE", "watchdog",
+                f"Pin survived {attempts} heals: {agent_id} msg={message_id}",
+            )
+        try:
+            await self._rest.agent_api_messages.create_agent_chat_message(
+                chat_id=room_id,
+                message=ChatMessageRequest(
+                    content=(
+                        f"[Watchdog] Transport pin on agent {agent_id} "
+                        f"(message {message_id}) survived {attempts} heal "
+                        f"attempts after >{threshold}s in processing. "
+                        f"Owner: investigate or restart the agent."
+                    ),
+                    mentions=[],
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Transport-heal: escalation post failed for agent=%s in room=%s",
+                agent_id, room_id,
             )
 
     async def _send_nudge(
