@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import signal
 from dataclasses import dataclass
 from functools import partial
@@ -498,7 +499,7 @@ async def _run_agent_forever(
             _RECONNECT_BASE_DELAY_SECONDS * (2 ** min(attempt - 1, 5)),
             _RECONNECT_MAX_DELAY_SECONDS,
         )
-        await asyncio.sleep(delay)
+        await asyncio.sleep(random.random() * delay)
 
 
 # ─── memory backend patches ────────────────────────────────────────────────

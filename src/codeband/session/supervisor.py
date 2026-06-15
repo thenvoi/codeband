@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
@@ -218,7 +219,7 @@ class WorkerSupervisor:
                 self._worker_id, identity.session_count,
                 exit_reason, delay,
             )
-            await asyncio.sleep(delay)
+            await asyncio.sleep(random.random() * delay)
 
     async def _close_agent(self, agent: Any) -> None:
         """Loud best-effort SDK teardown between worker restart cycles.
