@@ -20,7 +20,7 @@ import pytest
 
 from codeband.cli import handoff, merge
 from codeband.config import AgentsConfig
-from codeband.state.fsm import transition
+from codeband.state.fsm import NoOpTransitionError, transition
 from codeband.state.registration import (
     DEFAULT_MERGE_APPROVAL,
     register_task,
@@ -1191,3 +1191,37 @@ def test_sha_moved_send_back_also_counts_toward_cap(env, capsys):
     env.pr["headRefOid"] = "sha-2"
     assert _run() == merge.EXIT_NEEDS_REBASE
     assert env.store.get_subtask("st-1", TASK).rebase_rounds == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# needs_rebase no-op safety (#fix/needs-rebase-noop)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_needs_rebase_already_applied_is_noop_not_error(store, monkeypatch, capsys):
+    """An already-applied needs_rebase transition converges as a no-op — not an
+    uncaught NoOpTransitionError (#fix/needs-rebase-noop). Mirrors the pattern
+    established by #90 for the merge leg."""
+    import codeband.state.fsm as fsm_module
+    from types import SimpleNamespace
+
+    def _raise_noop(*a, **kw):
+        raise NoOpTransitionError(
+            f"NO-OP [already_needs_rebase] st-1@{SHA} "
+            "(state: review_passed); nothing to do"
+        )
+
+    monkeypatch.setattr(fsm_module, "transition", _raise_noop)
+    monkeypatch.setattr(
+        merge, "load_config",
+        lambda p: SimpleNamespace(agents=SimpleNamespace(max_rebase_rounds=3)),
+    )
+
+    result = merge._needs_rebase_or_blocked(
+        "st-1", TASK, "conflict at execution time",
+        store=store, project_dir=Path("/fake"),
+    )
+    assert result is None
+    out, err = capsys.readouterr()
+    assert "NO-OP [already_needs_rebase]" in out
+    assert err == ""

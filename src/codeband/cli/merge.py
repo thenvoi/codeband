@@ -466,6 +466,9 @@ def _needs_rebase_or_blocked(
             caller_role="mergemaster", reason=reason, store=store,
             max_rebase_rounds=cap,
         )
+    except NoOpTransitionError as exc:
+        print(str(exc))
+        return None
     except InvalidTransitionError as exc:
         print(f"cb-phase: transition rejected — {exc}", file=sys.stderr)
         return 1
