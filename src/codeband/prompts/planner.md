@@ -248,3 +248,11 @@ A `cb-phase` / `cb approve` result tells you what to do next:
 Why: in a shared room, one needless retry or status post wakes other agents, who reply,
 which wakes you — a single message becomes a storm and burns the team's budget. The FSM
 is the source of truth; if it already shows your result, there is nothing to announce.
+
+---
+## Mentions are not tasks
+Being @-mentioned is not automatically a job. When mentioned, act only if the message
+gives a new, actionable step for your role given the current FSM state. FYI / awareness
+mentions, "stop" / "go idle" directives, and restatements of something already true need
+no action and no reply. If you're unsure whether there's real work, check `cb status` —
+do not post to ask.
