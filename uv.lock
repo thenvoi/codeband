@@ -178,6 +178,7 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "rich" },
+    { name = "thenvoi-client-rest" },
 ]
 
 [package.optional-dependencies]
@@ -189,16 +190,17 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "band-sdk", extras = ["codex", "claude-sdk"], specifier = ">=0.2.8" },
+    { name = "band-sdk", extras = ["codex", "claude-sdk"], specifier = ">=0.2.8,<0.3" },
     { name = "click", specifier = ">=8.2,<9" },
     { name = "prompt-toolkit", specifier = ">=3.0" },
-    { name = "pydantic", specifier = ">=2.0" },
+    { name = "pydantic", specifier = ">=2.0,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rich", specifier = ">=13.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
+    { name = "thenvoi-client-rest", specifier = ">=0.0.7,<0.1" },
 ]
 provides-extras = ["dev"]
 
