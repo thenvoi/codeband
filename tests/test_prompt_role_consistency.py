@@ -361,6 +361,8 @@ def test_conductor_halt_discipline_covers_merge_gate():
     assert "subtask st-1, risk:" in conductor
     # Awaiting-approval is a normal pause, not a failure to re-route.
     assert "awaiting approval" in conductor
+    # Chat approval must not re-trigger Mergemaster routing — Conductor clarifies once, then silent.
+    assert "chat reply does not advance the merge gate" in conductor
 
 
 def test_coder_rebase_rework_reenters_verify_walk():

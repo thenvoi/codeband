@@ -330,9 +330,11 @@ def _send_approval_request(
 
     mention_id, handle = _approver_display(task, approver_spec)
     content = (
-        f"@{handle} PR #{pr_number} (subtask {subtask_id}) is awaiting your "
-        f"merge approval at head {head_sha or 'unknown'}. "
-        f"Approve with: cb approve {pr_number}"
+        f"@{handle} PR #{pr_number} (subtask {subtask_id}) is paused at the merge gate "
+        f"(head {head_sha or 'unknown'}). To merge, run this in your terminal:\n\n"
+        f"    cb approve {pr_number}\n\n"
+        f"A chat reply does not advance the gate. Nothing further happens until the "
+        f"grant is recorded; the merge then completes automatically."
     )
 
     async def _send() -> None:
