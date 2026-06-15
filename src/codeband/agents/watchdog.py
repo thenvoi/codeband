@@ -1391,6 +1391,15 @@ class WatchdogDaemon:
                     sub.subtask_id, aid, self._role_map.get(aid), room_id,
                     exc_info=True,
                 )
+                if self._activity:
+                    self._activity.log(
+                        "AGENT_PIN_DEFER", "watchdog",
+                        f"Stall→blocked deferred for subtask {sub.subtask_id}: "
+                        f"probe of agent {aid} raised (fail toward defer)",
+                        subtask_id=sub.subtask_id,
+                        expected_role=self._role_map.get(aid),
+                        pinned_agent=aid,
+                    )
                 return True
             if pinned:
                 logger.info(
@@ -1399,6 +1408,15 @@ class WatchdogDaemon:
                     "transport-heal rung.",
                     sub.subtask_id, aid, self._role_map.get(aid), room_id,
                 )
+                if self._activity:
+                    self._activity.log(
+                        "AGENT_PIN_DEFER", "watchdog",
+                        f"Stall→blocked deferred for subtask {sub.subtask_id}: "
+                        f"agent {aid} transport-pinned",
+                        subtask_id=sub.subtask_id,
+                        expected_role=self._role_map.get(aid),
+                        pinned_agent=aid,
+                    )
                 return True
         return False
 
@@ -2170,6 +2188,8 @@ class WatchdogDaemon:
                     self._activity.log(
                         "AGENT_PIN_HEALED", "watchdog",
                         f"Healed transport pin for {agent_id} msg={message_id}",
+                        branch="pending_2step",
+                        pin_class="pending",
                     )
             else:
                 # Same head — heal did not advance the cursor.
@@ -2247,6 +2267,8 @@ class WatchdogDaemon:
             self._activity.log(
                 "AGENT_PIN_HEALED", "watchdog",
                 f"Healed transport pin for {agent_id} msg={message_id}",
+                branch="processing_1step",
+                pin_class="processing",
             )
 
     async def _escalate_unhealable_pin(
