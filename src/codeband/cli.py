@@ -277,6 +277,11 @@ def cli(
 
     attach_mode = attach or os.environ.get("CODEBAND_SHELL_ATTACH") == "1"
 
+    project = Path(project_dir).resolve()
+    if not (project / "codeband.yaml").exists():
+        click.echo("Error: codeband.yaml not found. Run 'cb init' first.", err=True)
+        sys.exit(1)
+
     from codeband.shell.repl import run as run_shell
     run_shell(project_dir, attach=attach_mode, skip_preflight=skip_preflight)
 
