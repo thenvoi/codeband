@@ -39,7 +39,7 @@ def _reset_cache(monkeypatch):
 @pytest.fixture(autouse=True)
 def _restore_agent_tools():
     """Each test may monkey-patch `AgentTools`; restore originals afterwards."""
-    from thenvoi.runtime import tools as _tools_mod
+    from band.runtime import tools as _tools_mod
 
     cls = getattr(_tools_mod, "AgentToolsRuntime", None) or getattr(
         _tools_mod, "AgentTools", None,
@@ -92,7 +92,7 @@ class TestInstallBackend:
         assert mode == "local"
 
         # Exercise the patched classmethod path.
-        from thenvoi.runtime import tools as _tools_mod
+        from band.runtime import tools as _tools_mod
         cls = getattr(_tools_mod, "AgentToolsRuntime", None) or getattr(
             _tools_mod, "AgentTools",
         )
@@ -159,7 +159,7 @@ class TestLocalStorePatching:
         store = LocalMemoryStore(store_path)
         _patch_agent_tools_to_local_store(store)
 
-        from thenvoi.runtime import tools as _tools_mod
+        from band.runtime import tools as _tools_mod
         cls = getattr(_tools_mod, "AgentToolsRuntime", None) or getattr(
             _tools_mod, "AgentTools",
         )
@@ -396,7 +396,7 @@ class TestPhoenixReconnectOwnership:
     async def test_local_patch_disables_phx_auto_reconnect_and_signal_handlers(
         self, monkeypatch,
     ):
-        from thenvoi.client.streaming import client as streaming_client
+        from band.client.streaming import client as streaming_client
 
         original_aenter = streaming_client.WebSocketClient.__aenter__
         original_run_forever = streaming_client.PHXChannelsClient.run_forever
@@ -441,7 +441,7 @@ class TestPhoenixReconnectOwnership:
     async def test_local_patch_skips_existing_room_subscriptions_by_default(
         self, monkeypatch,
     ):
-        from thenvoi.runtime.presence import RoomPresence
+        from band.runtime.presence import RoomPresence
 
         original_subscribe = RoomPresence._subscribe_to_existing_rooms
         calls = []
@@ -477,7 +477,7 @@ class TestPhoenixReconnectOwnership:
     async def test_local_patch_can_serialize_existing_room_subscriptions(
         self, monkeypatch,
     ):
-        from thenvoi.runtime.presence import RoomPresence
+        from band.runtime.presence import RoomPresence
 
         original_subscribe = RoomPresence._subscribe_to_existing_rooms
         calls = []

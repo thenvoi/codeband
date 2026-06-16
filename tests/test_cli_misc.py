@@ -98,7 +98,7 @@ class TestFeedBannerAndHistory:
             lambda project: SimpleNamespace(agents={}),
         )
         monkeypatch.setattr(
-            "thenvoi.client.rest.AsyncRestClient",
+            "band.client.rest.AsyncRestClient",
             lambda **kwargs: object(),
         )
         monkeypatch.setattr("codeband.monitoring.feed.LiveFeed", _FakeLiveFeed)

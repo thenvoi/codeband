@@ -22,7 +22,7 @@ from codeband.workspace.init import initialize_agent_workspace, initialize_works
 
 if TYPE_CHECKING:
     from codeband.config import AgentConfigFile
-    from thenvoi.core.protocols import FrameworkAdapter
+    from band.core.protocols import FrameworkAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ async def _safe_stop_agent(agent: object) -> None:
 def _patch_band_local_runtime() -> None:
     """Make the Band SDK safe for Codeband's in-process local runtime.
 
-    ``thenvoi`` builds ``PHXChannelsClient`` with its default
+    ``band`` builds ``PHXChannelsClient`` with its default
     ``auto_reconnect=True``. In local mode Codeband already owns the outer
     reconnect loop and creates a fresh Agent per cycle. Letting the Phoenix
     client also reconnect in the background creates competing lifecycle
@@ -83,8 +83,8 @@ def _patch_band_local_runtime() -> None:
     backlog subscription for debugging.
     """
     try:
-        from thenvoi.client.streaming import client as streaming_client
-        from thenvoi.runtime.presence import RoomPresence
+        from band.client.streaming import client as streaming_client
+        from band.runtime.presence import RoomPresence
     except Exception:
         logger.debug("Could not import Band local runtime hooks", exc_info=True)
         return
@@ -225,7 +225,7 @@ async def _run_agent_forever(
 def _get_tools_class():
     """Return the SDK's agent-tools class, or None if the import fails."""
     try:
-        from thenvoi.runtime import tools as _tools_mod
+        from band.runtime import tools as _tools_mod
     except Exception:
         return None
     return getattr(_tools_mod, "AgentToolsRuntime", None) or getattr(
@@ -250,7 +250,7 @@ def _patch_band_subject_id_bug() -> None:
         subject_id=None,
         metadata=None,
     ):
-        from thenvoi.client.rest import MemoryCreateRequest
+        from band.client.rest import MemoryCreateRequest
 
         kwargs = dict(
             content=content,
@@ -395,7 +395,7 @@ def _resolve_workspace_config(config: CodebandConfig, project_dir: Path) -> Code
 
 def _create_band_agent(adapter, creds: AgentCredentials, config: CodebandConfig):
     """Create a Band.ai Agent with standard connection args."""
-    from thenvoi import Agent
+    from band import Agent
 
     return Agent.create(
         adapter=adapter,
@@ -408,7 +408,7 @@ def _create_band_agent(adapter, creds: AgentCredentials, config: CodebandConfig)
 
 def _create_rest_client(api_key: str, rest_url: str):
     """Create a Band.ai REST client (used for the memory probe and watchdog)."""
-    from thenvoi.client.rest import AsyncRestClient
+    from band.client.rest import AsyncRestClient
 
     return AsyncRestClient(api_key=api_key, base_url=rest_url)
 
@@ -558,7 +558,7 @@ async def run_local(
 
     agent_task_filter = AgentTaskFilter()
     sdk_usage_handler = SDKUsageHandler(activity)
-    sdk_logger = logging.getLogger("thenvoi.adapters")
+    sdk_logger = logging.getLogger("band.adapters")
     sdk_logger.addFilter(agent_task_filter)
     sdk_logger.addHandler(sdk_usage_handler)
 
@@ -806,7 +806,7 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
     from codeband.monitoring.usage import SDKUsageHandler
 
     sdk_usage_handler = SDKUsageHandler(activity, agent_name=agent_key)
-    logging.getLogger("thenvoi.adapters").addHandler(sdk_usage_handler)
+    logging.getLogger("band.adapters").addHandler(sdk_usage_handler)
 
     activity.log("AGENT_START", agent_key, f"Starting {agent_key} ({role})")
     logger.info("Starting agent %s (%s)", agent_key, role)

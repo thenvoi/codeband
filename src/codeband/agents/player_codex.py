@@ -33,8 +33,8 @@ class CodexPlayerRunner:
         identity_section: str | None = None,
     ):
         try:
-            from thenvoi.adapters import CodexAdapter
-            from thenvoi.adapters.codex import CodexAdapterConfig
+            from band.adapters import CodexAdapter
+            from band.adapters.codex import CodexAdapterConfig
         except ImportError as e:
             raise ImportError(
                 "Codex adapter unavailable — band-sdk's codex extras failed to import. "

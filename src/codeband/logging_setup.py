@@ -26,7 +26,7 @@ import logging
 from contextlib import contextmanager
 from typing import Iterator
 
-_ADAPTER_LOGGER = "thenvoi.adapters.claude_sdk"
+_ADAPTER_LOGGER = "band.adapters.claude_sdk"
 _SDK_QUERY_LOGGER = "claude_agent_sdk._internal.query"
 
 _FRIENDLY_MSG = (

@@ -65,7 +65,7 @@ async def send_task(config: CodebandConfig, project_dir: Path, description: str)
     # Conductor, so the Conductor must be a participant for that message to
     # land. Every other agent is invited lazily by the inviting agent
     # (Conductor invites Planner; Planner invites Plan Reviewer; Coder invites
-    # Reviewer; …) via thenvoi_add_participant once the workflow needs them.
+    # Reviewer; …) via band_add_participant once the workflow needs them.
     await human_client.human_api_participants.add_my_chat_participant(
         room_id,
         participant=ParticipantRequest(participant_id=conductor_id),

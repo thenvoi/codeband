@@ -49,7 +49,7 @@ _FRAMEWORK_DISPLAY = {
     Framework.CODEX: "Codex",
 }
 
-# Agent descriptions — these are what `thenvoi_lookup_peers` returns for
+# Agent descriptions — these are what `band_lookup_peers` returns for
 # discovery-based invites, so each must be self-describing enough that another
 # agent reading the description alone can decide whether to recruit it.
 # Every description includes a stable `role=...` discovery token, and pool

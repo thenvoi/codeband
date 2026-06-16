@@ -1202,7 +1202,7 @@ def feed(agent: str | None, event_type: str | None, no_thoughts: bool,
         verbose=verbose,
     )
 
-    from thenvoi.client.rest import AsyncRestClient
+    from band.client.rest import AsyncRestClient
 
     rest = AsyncRestClient(api_key=api_key, base_url=config.band.rest_url)
 

@@ -80,7 +80,7 @@ async def start(
     # and body) every time it can't mark a message as processed — typically
     # because the room is gone. The user already sees a clear "Run 'cb reset'"
     # hint; the headers dump is pure noise in an interactive shell.
-    logging.getLogger("thenvoi.platform.link").setLevel(logging.ERROR)
+    logging.getLogger("band.platform.link").setLevel(logging.ERROR)
 
     # Diagnostic: ``CODEBAND_DEBUG=phx`` enables protocol-level logging
     # for the Phoenix Channels client and the websockets library so we
@@ -109,7 +109,7 @@ async def start(
         root.addHandler(stream_handler)
         for noisy in (
             "asyncio", "urllib3", "httpx", "httpcore", "mcp",
-            "thenvoi.platform.link", "thenvoi.adapters",
+            "band.platform.link", "band.adapters",
         ):
             logging.getLogger(noisy).setLevel(logging.WARNING)
         for verbose in (
@@ -356,7 +356,7 @@ async def _start_feed(
     """
     from codeband.config import load_agent_config
     from codeband.monitoring.feed import FeedFormatter, LiveFeed
-    from thenvoi.client.rest import AsyncRestClient
+    from band.client.rest import AsyncRestClient
 
     try:
         agent_config = load_agent_config(project_dir)

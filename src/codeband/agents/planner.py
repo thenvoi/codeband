@@ -46,7 +46,8 @@ class ClaudePlannerRunner:
         worker_roster: str | None = None,
         identity_section: str | None = None,
     ):
-        from thenvoi.adapters import ClaudeSDKAdapter
+        from band.adapters import ClaudeSDKAdapter
+        from band.core.types import AdapterFeatures, Capability, Emit
 
         prompt = _build_prompt(custom_prompt, worker_roster, identity_section)
 
@@ -61,8 +62,10 @@ class ClaudePlannerRunner:
             custom_section=prompt,
             permission_mode="dontAsk",  # type: ignore[arg-type]
             approval_mode=None,
-            enable_execution_reporting=True,
-            enable_memory_tools=True,
+            features=AdapterFeatures(
+                emit={Emit.EXECUTION, Emit.THOUGHTS},
+                capabilities={Capability.MEMORY},
+            ),
             cwd=workspace,
         )
 
@@ -91,8 +94,8 @@ class CodexPlannerRunner:
         identity_section: str | None = None,
     ):
         try:
-            from thenvoi.adapters import CodexAdapter
-            from thenvoi.adapters.codex import CodexAdapterConfig
+            from band.adapters import CodexAdapter
+            from band.adapters.codex import CodexAdapterConfig
         except ImportError as e:
             raise ImportError(
                 "Codex adapter unavailable — band-sdk's codex extras failed to import. "

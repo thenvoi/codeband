@@ -60,7 +60,8 @@ class ClaudeConductorRunner:
         repo_pin: str | None = None,
         identity_section: str | None = None,
     ):
-        from thenvoi.adapters import ClaudeSDKAdapter
+        from band.adapters import ClaudeSDKAdapter
+        from band.core.types import AdapterFeatures, Capability, Emit
 
         prompt = _compose_prompt(
             custom_prompt, worker_roster, auto_merge, repo_pin, identity_section,
@@ -75,8 +76,10 @@ class ClaudeConductorRunner:
             custom_section=prompt,
             permission_mode="dontAsk",  # type: ignore[arg-type]
             approval_mode=None,
-            enable_execution_reporting=True,
-            enable_memory_tools=True,
+            features=AdapterFeatures(
+                emit={Emit.EXECUTION, Emit.THOUGHTS},
+                capabilities={Capability.MEMORY},
+            ),
         )
 
     @property
@@ -105,9 +108,9 @@ class CodexConductorRunner:
         identity_section: str | None = None,
     ):
         try:
-            from thenvoi.adapters import CodexAdapter
-            from thenvoi.adapters.codex import CodexAdapterConfig
-            from thenvoi.core.types import AdapterFeatures, Capability, Emit
+            from band.adapters import CodexAdapter
+            from band.adapters.codex import CodexAdapterConfig
+            from band.core.types import AdapterFeatures, Capability, Emit
         except ImportError as e:
             raise ImportError(
                 "Codex adapter unavailable — band-sdk's codex extras failed to import. "

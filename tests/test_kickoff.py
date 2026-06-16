@@ -378,7 +378,7 @@ class TestSendTask:
 
         # Lazy invites: only the Conductor is added at room creation. Every
         # other agent is invited later by the inviting agent (Conductor →
-        # Planner; Coder → Reviewer; …) via thenvoi_add_participant once the
+        # Planner; Coder → Reviewer; …) via band_add_participant once the
         # workflow needs them.
         human_client.human_api_participants.add_my_chat_participant.assert_called_once()
         add_call = human_client.human_api_participants.add_my_chat_participant.call_args

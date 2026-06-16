@@ -30,7 +30,8 @@ class ClaudePlayerRunner:
         worker_roster: str | None = None,
         identity_section: str | None = None,
     ):
-        from thenvoi.adapters import ClaudeSDKAdapter
+        from band.adapters import ClaudeSDKAdapter
+        from band.core.types import AdapterFeatures, Capability, Emit
 
         self.model = model
         from codeband.agents.prompts import load_prompt
@@ -48,8 +49,10 @@ class ClaudePlayerRunner:
             custom_section=prompt,
             permission_mode="bypassPermissions",
             approval_mode=None,
-            enable_execution_reporting=True,
-            enable_memory_tools=True,
+            features=AdapterFeatures(
+                emit={Emit.EXECUTION, Emit.THOUGHTS},
+                capabilities={Capability.MEMORY},
+            ),
             cwd=workspace,
         )
 

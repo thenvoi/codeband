@@ -31,7 +31,8 @@ class ClaudePlanReviewerRunner:
         workspace: str | None = None,
         identity_section: str | None = None,
     ):
-        from thenvoi.adapters import ClaudeSDKAdapter
+        from band.adapters import ClaudeSDKAdapter
+        from band.core.types import AdapterFeatures, Capability, Emit
 
         from codeband.agents.prompts import build_review_prompt
 
@@ -47,8 +48,10 @@ class ClaudePlanReviewerRunner:
             permission_mode="dontAsk",  # type: ignore[arg-type]
             approval_mode=None,
             cwd=workspace,
-            enable_execution_reporting=True,
-            enable_memory_tools=True,
+            features=AdapterFeatures(
+                emit={Emit.EXECUTION, Emit.THOUGHTS},
+                capabilities={Capability.MEMORY},
+            ),
         )
 
     @property
@@ -70,8 +73,8 @@ class CodexPlanReviewerRunner:
         identity_section: str | None = None,
     ):
         try:
-            from thenvoi.adapters import CodexAdapter
-            from thenvoi.adapters.codex import CodexAdapterConfig
+            from band.adapters import CodexAdapter
+            from band.adapters.codex import CodexAdapterConfig
         except ImportError as e:
             raise ImportError(
                 "Codex adapter unavailable — band-sdk's codex extras failed to import. "

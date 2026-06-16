@@ -35,7 +35,7 @@ def flt() -> _SessionResumeFilter:
 class TestRewritesAdapterWarning:
     def test_rewrites_session_resume_failed_warning(self, flt: _SessionResumeFilter):
         r = _make_record(
-            "thenvoi.adapters.claude_sdk",
+            "band.adapters.claude_sdk",
             logging.WARNING,
             "Room %s: Session resume failed (session_id=%s): %s. Creating new session",
             args=("room-1", "sid-1", "boom"),
@@ -63,7 +63,7 @@ class TestPreservesRealFailures:
 
     def test_passes_session_manager_error(self, flt: _SessionResumeFilter):
         r = _make_record(
-            "thenvoi.integrations.claude_sdk.session_manager",
+            "band.integrations.claude_sdk.session_manager",
             logging.ERROR,
             "Error in session loop: Command failed with exit code 1",
         )
@@ -74,7 +74,7 @@ class TestPreservesRealFailures:
 class TestLeavesOthersAlone:
     def test_passes_unrelated_warning_from_adapter(self, flt: _SessionResumeFilter):
         r = _make_record(
-            "thenvoi.adapters.claude_sdk",
+            "band.adapters.claude_sdk",
             logging.WARNING,
             "Some other warning about a room",
         )
@@ -84,7 +84,7 @@ class TestLeavesOthersAlone:
 
     def test_passes_info_from_any_logger(self, flt: _SessionResumeFilter):
         r = _make_record(
-            "thenvoi.adapters.claude_sdk",
+            "band.adapters.claude_sdk",
             logging.INFO,
             "Session resume failed but this is just an info line",
         )

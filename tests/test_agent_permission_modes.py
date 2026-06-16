@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 def _adapter_kwargs(constructor, **init_kwargs) -> dict:
     """Run an agent constructor with the Claude SDK adapter mocked, and
     return the kwargs that were passed into ``ClaudeSDKAdapter(...)``."""
-    with patch("thenvoi.adapters.ClaudeSDKAdapter") as mock_adapter:
+    with patch("band.adapters.ClaudeSDKAdapter") as mock_adapter:
         mock_adapter.return_value = MagicMock()
         constructor(**init_kwargs)
     assert mock_adapter.call_count == 1, mock_adapter.call_args_list

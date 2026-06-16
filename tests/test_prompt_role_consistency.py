@@ -91,7 +91,7 @@ def test_coder_dispatches_review_directly_to_opposite_framework_reviewer():
     # pattern, since names are an internal convention and descriptions carry
     # the role + framework signal we actually want to match on.
     assert "Pick the reviewer through discovery on `description`" in coder
-    assert "thenvoi_lookup_peers()" in coder
+    assert "band_lookup_peers()" in coder
     assert "role=code_review_agent" in coder
     assert "framework=Codex" in coder
 

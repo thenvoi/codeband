@@ -30,7 +30,7 @@ class TestSDKUsageHandler:
         from codeband.monitoring.usage import SDKUsageHandler
 
         handler = SDKUsageHandler(activity)
-        sdk_logger = logging.getLogger("thenvoi.adapters.claude_sdk.test_capture")
+        sdk_logger = logging.getLogger("band.adapters.claude_sdk.test_capture")
         sdk_logger.addHandler(handler)
         sdk_logger.setLevel(logging.DEBUG)
 
@@ -55,7 +55,7 @@ class TestSDKUsageHandler:
         from codeband.monitoring.usage import SDKUsageHandler
 
         handler = SDKUsageHandler(activity, agent_name="player-0")
-        sdk_logger = logging.getLogger("thenvoi.adapters.claude_sdk.test_named")
+        sdk_logger = logging.getLogger("band.adapters.claude_sdk.test_named")
         sdk_logger.addHandler(handler)
         sdk_logger.setLevel(logging.DEBUG)
 
@@ -75,7 +75,7 @@ class TestSDKUsageHandler:
         from codeband.monitoring.usage import SDKUsageHandler
 
         handler = SDKUsageHandler(activity)
-        sdk_logger = logging.getLogger("thenvoi.adapters.claude_sdk.test_ignore")
+        sdk_logger = logging.getLogger("band.adapters.claude_sdk.test_ignore")
         sdk_logger.addHandler(handler)
         sdk_logger.setLevel(logging.DEBUG)
 
