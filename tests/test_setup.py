@@ -98,6 +98,7 @@ def _make_config(
 # Drift-specific tests construct their own fakes with intentionally divergent
 # descriptions.
 
+
 def _platform_agents_for(config: CodebandConfig) -> list[FakeAgent]:
     """Build FakeAgent records that mirror what `_expected_agents` produces."""
     from codeband.orchestration.setup import _expected_agents
@@ -128,16 +129,19 @@ def _expected_desc_for(config: CodebandConfig, agent_name: str) -> str:
             return desc
     return ""
 
-_DEFAULT_AGENT_CONFIG = AgentConfigFile(agents={
-    "conductor": AgentCredentials(agent_id="cond-0", api_key="key-cond"),
-    "mergemaster": AgentCredentials(agent_id="mm-0", api_key="key-mm"),
-    "planner-claude_sdk-0": AgentCredentials(agent_id="pl-c-0", api_key="key-pl-c0"),
-    "plan_reviewer-codex-0": AgentCredentials(agent_id="pr-x-0", api_key="key-pr-x0"),
-    "coder-claude_sdk-0": AgentCredentials(agent_id="co-c-0", api_key="key-co-c0"),
-    "coder-codex-0": AgentCredentials(agent_id="co-x-0", api_key="key-co-x0"),
-    "reviewer-claude_sdk-0": AgentCredentials(agent_id="re-c-0", api_key="key-re-c0"),
-    "reviewer-codex-0": AgentCredentials(agent_id="re-x-0", api_key="key-re-x0"),
-})
+
+_DEFAULT_AGENT_CONFIG = AgentConfigFile(
+    agents={
+        "conductor": AgentCredentials(agent_id="cond-0", api_key="key-cond"),
+        "mergemaster": AgentCredentials(agent_id="mm-0", api_key="key-mm"),
+        "planner-claude_sdk-0": AgentCredentials(agent_id="pl-c-0", api_key="key-pl-c0"),
+        "plan_reviewer-codex-0": AgentCredentials(agent_id="pr-x-0", api_key="key-pr-x0"),
+        "coder-claude_sdk-0": AgentCredentials(agent_id="co-c-0", api_key="key-co-c0"),
+        "coder-codex-0": AgentCredentials(agent_id="co-x-0", api_key="key-co-x0"),
+        "reviewer-claude_sdk-0": AgentCredentials(agent_id="re-c-0", api_key="key-re-c0"),
+        "reviewer-codex-0": AgentCredentials(agent_id="re-x-0", api_key="key-re-x0"),
+    }
+)
 
 
 def test_expected_agent_descriptions_have_discovery_tokens():
@@ -186,9 +190,11 @@ def test_oversized_description_raises_at_build_time(monkeypatch):
     from codeband.orchestration import setup as setup_mod
 
     # Inflate one singleton's description past the limit.
-    bloated = ("X" * 600)
+    bloated = "X" * 600
     monkeypatch.setitem(
-        setup_mod._SINGLETON_AGENTS, "conductor", ("Conductor", bloated),
+        setup_mod._SINGLETON_AGENTS,
+        "conductor",
+        ("Conductor", bloated),
     )
 
     with pytest.raises(ValueError, match=r"exceeds Band.ai's 500-char limit"):
@@ -231,18 +237,22 @@ class TestSetupReusesExistingAgents:
         # descriptions so drift detection does not flag them for re-register.
         existing_agents = [
             FakeAgent(
-                id="cond-0", name="Conductor",
+                id="cond-0",
+                name="Conductor",
                 description=_expected_desc_for(config, "Conductor"),
             ),
             FakeAgent(
-                id="mm-0", name="Mergemaster",
+                id="mm-0",
+                name="Mergemaster",
                 description=_expected_desc_for(config, "Mergemaster"),
             ),
         ]
-        existing_config = AgentConfigFile(agents={
-            "conductor": AgentCredentials(agent_id="cond-0", api_key="key-cond"),
-            "mergemaster": AgentCredentials(agent_id="mm-0", api_key="key-mm"),
-        })
+        existing_config = AgentConfigFile(
+            agents={
+                "conductor": AgentCredentials(agent_id="cond-0", api_key="key-cond"),
+                "mergemaster": AgentCredentials(agent_id="mm-0", api_key="key-mm"),
+            }
+        )
         existing_config.to_yaml(tmp_path / "agent_config.yaml")
 
         register_count = 0
@@ -258,9 +268,7 @@ class TestSetupReusesExistingAgents:
             )
 
         client = AsyncMock()
-        client.human_api_agents.list_my_agents.return_value = FakeListResponse(
-            data=existing_agents
-        )
+        client.human_api_agents.list_my_agents.return_value = FakeListResponse(data=existing_agents)
         client.human_api_agents.register_my_agent.side_effect = fake_register
 
         await register_all_agents(config, tmp_path, client=client)
@@ -285,47 +293,53 @@ class TestSetupDeletesExcess:
         # is excess regardless of description; Watchdog is legacy by name).
         existing_agents = [
             FakeAgent(
-                id="cond-0", name="Conductor",
+                id="cond-0",
+                name="Conductor",
                 description=_expected_desc_for(config, "Conductor"),
             ),
             FakeAgent(
-                id="mm-0", name="Mergemaster",
+                id="mm-0",
+                name="Mergemaster",
                 description=_expected_desc_for(config, "Mergemaster"),
             ),
             FakeAgent(
-                id="pl-c-0", name="Planner-Claude-0",
+                id="pl-c-0",
+                name="Planner-Claude-0",
                 description=_expected_desc_for(config, "Planner-Claude-0"),
             ),
             FakeAgent(
-                id="pr-x-0", name="Plan-Reviewer-Codex-0",
+                id="pr-x-0",
+                name="Plan-Reviewer-Codex-0",
                 description=_expected_desc_for(config, "Plan-Reviewer-Codex-0"),
             ),
             FakeAgent(
-                id="co-c-0", name="Coder-Claude-0",
+                id="co-c-0",
+                name="Coder-Claude-0",
                 description=_expected_desc_for(config, "Coder-Claude-0"),
             ),
             FakeAgent(id="co-c-1", name="Coder-Claude-1"),  # excess
             FakeAgent(
-                id="re-c-0", name="Reviewer-Claude-0",
+                id="re-c-0",
+                name="Reviewer-Claude-0",
                 description=_expected_desc_for(config, "Reviewer-Claude-0"),
             ),
-            FakeAgent(id="wd-0", name="Watchdog"),          # legacy
+            FakeAgent(id="wd-0", name="Watchdog"),  # legacy
         ]
-        existing_config = AgentConfigFile(agents={
-            "conductor": AgentCredentials(agent_id="cond-0", api_key="key-cond"),
-            "mergemaster": AgentCredentials(agent_id="mm-0", api_key="key-mm"),
-            "planner-claude_sdk-0": AgentCredentials(agent_id="pl-c-0", api_key="k"),
-            "plan_reviewer-codex-0": AgentCredentials(agent_id="pr-x-0", api_key="k"),
-            "coder-claude_sdk-0": AgentCredentials(agent_id="co-c-0", api_key="k"),
-            "coder-claude_sdk-1": AgentCredentials(agent_id="co-c-1", api_key="k"),
-            "reviewer-claude_sdk-0": AgentCredentials(agent_id="re-c-0", api_key="k"),
-        })
+        existing_config = AgentConfigFile(
+            agents={
+                "conductor": AgentCredentials(agent_id="cond-0", api_key="key-cond"),
+                "mergemaster": AgentCredentials(agent_id="mm-0", api_key="key-mm"),
+                "planner-claude_sdk-0": AgentCredentials(agent_id="pl-c-0", api_key="k"),
+                "plan_reviewer-codex-0": AgentCredentials(agent_id="pr-x-0", api_key="k"),
+                "coder-claude_sdk-0": AgentCredentials(agent_id="co-c-0", api_key="k"),
+                "coder-claude_sdk-1": AgentCredentials(agent_id="co-c-1", api_key="k"),
+                "reviewer-claude_sdk-0": AgentCredentials(agent_id="re-c-0", api_key="k"),
+            }
+        )
         existing_config.to_yaml(tmp_path / "agent_config.yaml")
 
         client = AsyncMock()
-        client.human_api_agents.list_my_agents.return_value = FakeListResponse(
-            data=existing_agents
-        )
+        client.human_api_agents.list_my_agents.return_value = FakeListResponse(data=existing_agents)
         client.human_api_agents.delete_my_agent.return_value = FakeDeleteResponse(
             id="deleted", name="deleted"
         )
@@ -395,23 +409,21 @@ class TestSetupDriftDetection:
         )
         client.human_api_agents.register_my_agent.side_effect = fake_register
         client.human_api_agents.delete_my_agent.return_value = FakeDeleteResponse(
-            id="deleted", name="deleted",
+            id="deleted",
+            name="deleted",
         )
 
         await register_all_agents(config, tmp_path, client=client)
 
         # Exactly the drifting agent should be deleted from Band.ai.
         deleted_ids = {
-            call.args[0]
-            for call in client.human_api_agents.delete_my_agent.call_args_list
+            call.args[0] for call in client.human_api_agents.delete_my_agent.call_args_list
         }
         assert deleted_ids == {"co-x-0"}
 
         # And exactly one fresh registration happened (the replacement).
         assert client.human_api_agents.register_my_agent.call_count == 1
-        registered_name = client.human_api_agents.register_my_agent.call_args[1][
-            "agent"
-        ].name
+        registered_name = client.human_api_agents.register_my_agent.call_args[1]["agent"].name
         assert registered_name == "Coder-Codex-0"
 
         # The local agent_config now has the new ID and key for that role.
@@ -478,7 +490,10 @@ class TestSetupDriftDetection:
         )
 
         await register_all_agents(
-            config, tmp_path, client=client, detect_drift=False,
+            config,
+            tmp_path,
+            client=client,
+            detect_drift=False,
         )
 
         # No delete and no re-register: the drifting agent stays as-is.
@@ -513,10 +528,12 @@ class TestSetupDeleteFailure:
         )
         other_agents = [a for a in _platform_agents_for(config) if a.name != "Coder-Claude-0"]
 
-        mismatched_config = AgentConfigFile(agents={
-            **_DEFAULT_AGENT_CONFIG.agents,
-            "coder-claude_sdk-0": AgentCredentials(agent_id="local-id", api_key="key-co-c0"),
-        })
+        mismatched_config = AgentConfigFile(
+            agents={
+                **_DEFAULT_AGENT_CONFIG.agents,
+                "coder-claude_sdk-0": AgentCredentials(agent_id="local-id", api_key="key-co-c0"),
+            }
+        )
         mismatched_config.to_yaml(tmp_path / "agent_config.yaml")
 
         delete_error = RuntimeError("permission denied")
@@ -556,17 +573,18 @@ class TestSetupDeleteFailure:
             description=_expected_desc_for(config, "Coder-Claude-0"),
         )
         other_agents = [
-            a for a in _platform_agents_for(config)
+            a
+            for a in _platform_agents_for(config)
             if a.name not in {"Coder-Claude-0", "Coder-Codex-0"}
         ]
 
         # Local config: Coder-Claude-0 has wrong id; Coder-Codex-0 entirely missing.
-        partial_config = AgentConfigFile(agents={
-            k: v for k, v in _DEFAULT_AGENT_CONFIG.agents.items()
-            if k != "coder-codex-0"
-        })
+        partial_config = AgentConfigFile(
+            agents={k: v for k, v in _DEFAULT_AGENT_CONFIG.agents.items() if k != "coder-codex-0"}
+        )
         partial_config.agents["coder-claude_sdk-0"] = AgentCredentials(
-            agent_id="local-id", api_key="key-co-c0",
+            agent_id="local-id",
+            api_key="key-co-c0",
         )
         partial_config.to_yaml(tmp_path / "agent_config.yaml")
 
@@ -625,10 +643,12 @@ class TestSetupDeleteFailure:
         )
         other_agents = [a for a in _platform_agents_for(config) if a.name != "Coder-Claude-0"]
 
-        mismatched_config = AgentConfigFile(agents={
-            **_DEFAULT_AGENT_CONFIG.agents,
-            "coder-claude_sdk-0": AgentCredentials(agent_id="local-id", api_key="key-co-c0"),
-        })
+        mismatched_config = AgentConfigFile(
+            agents={
+                **_DEFAULT_AGENT_CONFIG.agents,
+                "coder-claude_sdk-0": AgentCredentials(agent_id="local-id", api_key="key-co-c0"),
+            }
+        )
         mismatched_config.to_yaml(tmp_path / "agent_config.yaml")
 
         async def fail_only_mismatch_delete(agent_id, **kwargs):

@@ -194,14 +194,20 @@ def _expected_agents(config: CodebandConfig) -> dict[str, tuple[str, str]]:
 
 # ─── identification of codeband agents on Band.ai ──────────────────────────
 
-_LEGACY_AGENT_NAMES = frozenset({
-    "Watchdog",         # previously registered
-    "Planner",          # legacy single-planner name
-    "Plan Reviewer",    # legacy singleton
-    "Code Reviewer",    # legacy singleton
-})
+_LEGACY_AGENT_NAMES = frozenset(
+    {
+        "Watchdog",  # previously registered
+        "Planner",  # legacy single-planner name
+        "Plan Reviewer",  # legacy singleton
+        "Code Reviewer",  # legacy singleton
+    }
+)
 _CODEBAND_PREFIXES = (
-    "Planner-", "Plan-Reviewer-", "Coder-", "Reviewer-", "Player-",
+    "Planner-",
+    "Plan-Reviewer-",
+    "Coder-",
+    "Reviewer-",
+    "Player-",
 )
 
 
@@ -215,6 +221,7 @@ def _is_codeband_agent(name: str) -> bool:
 
 
 # ─── main registration ─────────────────────────────────────────────────────
+
 
 async def register_all_agents(
     config: CodebandConfig,
@@ -247,6 +254,7 @@ async def register_all_agents(
                 "Get one from https://platform.band.ai"
             )
         from thenvoi_rest import AsyncRestClient
+
         client = AsyncRestClient(api_key=api_key, base_url=config.band.rest_url)
 
     # Load existing credentials if available
@@ -281,12 +289,8 @@ async def register_all_agents(
     for name, agent in list(platform_agents.items()):
         if not _is_codeband_agent(name):
             continue
-        matching_key = next(
-            (k for k, (n, _) in expected.items() if n == name), None
-        )
-        existing_creds = (
-            existing_config.agents.get(matching_key) if matching_key else None
-        )
+        matching_key = next((k for k, (n, _) in expected.items() if n == name), None)
+        existing_creds = existing_config.agents.get(matching_key) if matching_key else None
         delete_reason: _DeleteReason | None = None
         if name not in expected_names:
             delete_reason = _DeleteReason.NAME_NO_LONGER_EXPECTED
@@ -301,7 +305,10 @@ async def register_all_agents(
             try:
                 await client.human_api_agents.delete_my_agent(agent.id, force=True)
                 logger.info(
-                    "Deleted agent %s (%s): %s", name, delete_reason.value, agent.id,
+                    "Deleted agent %s (%s): %s",
+                    name,
+                    delete_reason.value,
+                    agent.id,
                 )
                 # Pop platform_agents so the main loop's reuse check fails and
                 # re-registers. For drift, also pop the local cred — otherwise
@@ -325,7 +332,8 @@ async def register_all_agents(
             # agent still owns the slot. Attempting to register the same name
             # would produce a 422. Skip and surface the failure below.
             logger.error(
-                "Skipping registration of %s: platform agent could not be deleted", display_name,
+                "Skipping registration of %s: platform agent could not be deleted",
+                display_name,
             )
             continue
 
@@ -351,7 +359,8 @@ async def register_all_agents(
             f.write(f"{cred.agent_id}\n")
 
     registered = sum(
-        1 for k in agent_config.agents
+        1
+        for k in agent_config.agents
         if k not in existing_config.agents
         or existing_config.agents[k].agent_id != agent_config.agents[k].agent_id
     )
