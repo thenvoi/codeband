@@ -187,6 +187,10 @@ async def _run_codex_probe() -> tuple[int, str]:
         "Reply with just: ok",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        # Detach stdin: a `codex` build without a real `exec` subcommand falls
+        # back to an interactive session and would block on TTY input until the
+        # timeout. With no stdin it fails fast instead of hanging the preflight.
+        stdin=asyncio.subprocess.DEVNULL,
     )
     stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=45)
     return proc.returncode or 0, stdout.decode(errors="replace")

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -495,3 +496,34 @@ class TestRunPreflight:
             result = await run_preflight(mixed_config)
 
         assert result is codex_err
+
+
+class TestRunCodexProbe:
+    """The probe must never block on interactive input.
+
+    An outdated `codex` (no `exec` subcommand) treats the prompt as an
+    interactive session and, with a TTY on stdin, waits for input until the
+    45s timeout fires. Detaching stdin makes such a codex fail fast instead of
+    hanging the whole preflight.
+    """
+
+    @pytest.mark.asyncio
+    async def test_probe_detaches_stdin_and_runs_codex_exec(self):
+        from codeband.preflight import _run_codex_probe
+
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.communicate = AsyncMock(return_value=(b"ok", None))
+
+        with patch(
+            "asyncio.create_subprocess_exec",
+            AsyncMock(return_value=fake_proc),
+        ) as mock_exec:
+            returncode, output = await _run_codex_probe()
+
+        assert (returncode, output) == (0, "ok")
+        args, kwargs = mock_exec.call_args
+        # Stays a non-interactive `codex exec` invocation.
+        assert args[0] == "codex" and "exec" in args
+        # stdin detached so an interactive-only codex can't block the probe.
+        assert kwargs.get("stdin") is asyncio.subprocess.DEVNULL
