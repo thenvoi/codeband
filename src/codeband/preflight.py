@@ -16,10 +16,17 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
-from codeband.models import CLAUDE_SONNET
+from codeband.models import CLAUDE_OPUS, CLAUDE_SONNET
 
 if TYPE_CHECKING:
     from codeband.config import CodebandConfig
+
+# A worker pool whose entry omits `model` falls back to a default at spawn time.
+# That default is Sonnet for every role except coders (Opus) — mirror the
+# spawner here (runner.py: reviewers/plan_reviewers `or CLAUDE_SONNET`, coders
+# via ClaudePlayerRunner's Opus default). Only the non-Sonnet exception needs an
+# entry; everything else — including any pool added later — defaults to Sonnet.
+_POOL_MODEL_DEFAULT: dict[str, str] = {"coders": CLAUDE_OPUS}
 
 logger = logging.getLogger(__name__)
 
@@ -416,38 +423,43 @@ def _config_uses_codex(config: CodebandConfig) -> bool:
 
 
 def _claude_models(config: CodebandConfig) -> list[str]:
-    """Distinct Claude models actually configured across roles, order-preserving.
+    """Distinct Claude models actually configured across *all* roles, order-preserving.
 
-    Each is probed by ``run_preflight`` so a model that rejects the request shape
-    (e.g. a stale bundled CLI sending legacy ``thinking.type.enabled``) fails fast
-    instead of producing a silent, do-nothing agent at runtime. Pool entries with
-    ``model=None`` fall back to the same role default the spawner uses (Opus for
-    coders, Sonnet elsewhere).
+    Discovered generically from the ``AgentsConfig`` fields so new singleton agents
+    or worker pools are probed automatically — there is no role list to keep in sync.
+    Two shapes are recognized (the same ones the rest of the code duck-types):
+
+    * singleton agents expose ``.framework`` + ``.model`` (Conductor, Mergemaster);
+    * worker pools expose ``.entry_for(framework)`` (planners/coders/reviewers/...).
+
+    A pool entry with ``model=None`` falls back to the same default the spawner uses
+    (Opus for coders, Sonnet elsewhere — see ``_POOL_MODEL_DEFAULT``). Each model is
+    probed by ``run_preflight`` so one that rejects the request shape (e.g. a stale
+    bundled CLI sending legacy ``thinking.type.enabled``) fails fast instead of
+    producing a silent, do-nothing agent at runtime.
     """
     from codeband.config import Framework
-    from codeband.models import CLAUDE_OPUS, CLAUDE_SONNET
 
     agents = config.agents
     models: list[str] = []
-    if agents.conductor.framework == Framework.CLAUDE_SDK:
-        models.append(agents.conductor.model)
-    if agents.mergemaster.framework == Framework.CLAUDE_SDK:
-        models.append(agents.mergemaster.model)
-    pool_defaults = {
-        "planners": CLAUDE_SONNET,
-        "plan_reviewers": CLAUDE_SONNET,
-        "coders": CLAUDE_OPUS,
-        "reviewers": CLAUDE_SONNET,
-    }
-    for pool_name, default_model in pool_defaults.items():
-        entry = getattr(agents, pool_name).entry_for(Framework.CLAUDE_SDK)
-        if entry.count > 0:
-            models.append(entry.model or default_model)
+    for field_name in type(agents).model_fields:
+        value = getattr(agents, field_name)
+        if hasattr(value, "framework") and hasattr(value, "model"):
+            # Singleton agent.
+            if value.framework == Framework.CLAUDE_SDK and value.model:
+                models.append(value.model)
+        elif hasattr(value, "entry_for"):
+            # Worker pool.
+            entry = value.entry_for(Framework.CLAUDE_SDK)
+            if entry.count > 0:
+                models.append(
+                    entry.model or _POOL_MODEL_DEFAULT.get(field_name, CLAUDE_SONNET)
+                )
 
     seen: set[str] = set()
     distinct: list[str] = []
     for model in models:
-        if model not in seen:
+        if model and model not in seen:
             seen.add(model)
             distinct.append(model)
     return distinct
