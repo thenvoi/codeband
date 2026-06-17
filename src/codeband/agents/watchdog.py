@@ -978,6 +978,21 @@ class WatchdogDaemon:
             # cap hit → fall through to the stall counter so a genuinely hung
             # Mergemaster still surfaces to the owner as blocked.
 
+        # Acceptance-advance rung: acceptance_passed + dispatch stalled.
+        # Re-nudge Mergemaster so a verified-and-accepted PR is not escalated
+        # to blocked while waiting for the merge step to be triggered.
+        if (
+            sub.state == "acceptance_passed"
+            and self._config.acceptance_advance_max_renudges > 0
+        ):
+            if await self._maybe_acceptance_advance_renudge(sub, now):
+                health = self._subtask_state.get((sub.task_id, sub.subtask_id))
+                if health is not None:
+                    health.patrol_visits_without_progress = 0
+                return
+            # cap hit → fall through to the stall counter so a genuinely hung
+            # Mergemaster still surfaces to the owner as blocked.
+
         pr_ts = None
         if sub.pr_number is not None:
             reads_attempted += 1
@@ -1231,6 +1246,122 @@ class WatchdogDaemon:
         except Exception:
             logger.warning(
                 "Backstop: failed to send merge renudge for subtask %s",
+                sub.subtask_id, exc_info=True,
+            )
+            return False
+        return True
+
+    async def _maybe_acceptance_advance_renudge(
+        self, sub: Any, now: datetime,
+    ) -> bool:
+        """Return True when the acceptance-advance rung owns the patrol; False on cap-hit.
+
+        True = caller early-returns (rung is active, do not advance the stall
+        counter).  False = cap exhausted, caller falls through to the normal
+        stall path so a genuinely hung Mergemaster still surfaces as blocked.
+
+        Reads ``acceptance_advance_nudge`` markers from the audit log to track
+        how many renudges have fired since the subtask entered
+        ``acceptance_passed`` (markers older than the entry timestamp are from a
+        prior acceptance_passed visit and do not count). Anchor is
+        ``sub.updated_at`` — the FSM and the subtask row are written in the
+        same transaction, so this equals the ``acceptance_passed`` transition
+        timestamp. On fire: sends, flips swarm-status active, and appends a
+        durable marker (marker-after-send discipline: only appended on
+        successful send).
+        """
+        import asyncio
+
+        if self._store is None:
+            return False
+
+        entry_ts = _parse_ts(sub.updated_at)
+        if entry_ts is None:
+            return False
+
+        rows = await asyncio.to_thread(
+            self._store.latest_audit_events,
+            task_id=sub.task_id, subtask_id=sub.subtask_id,
+            event_types=("acceptance_advance_nudge",),
+        )
+        # Only count markers written after the subtask entered acceptance_passed;
+        # older markers are from a prior visit and must not consume the current cap.
+        last_nudge_ts: datetime | None = None
+        nudges_since_entry = 0
+        for _, ts_str, _ in rows:
+            ts = _parse_ts(ts_str)
+            if ts is None or ts < entry_ts:
+                continue
+            nudges_since_entry += 1
+            if last_nudge_ts is None:
+                last_nudge_ts = ts  # rows are newest-first
+
+        if nudges_since_entry >= self._config.acceptance_advance_max_renudges:
+            return False  # cap hit — release patrol to stall path
+
+        anchor_ts = last_nudge_ts or entry_ts
+        window = timedelta(seconds=self._config.acceptance_advance_backstop_seconds)
+        if (now - anchor_ts) < window:
+            return True  # within window — own patrol, don't fire yet
+
+        fired = await self._send_acceptance_advance_renudge(sub)
+        if not fired:
+            return True  # transient send failure — retry next patrol
+        await self._flip_swarm_status_active(sub.task_id)
+        await asyncio.to_thread(
+            self._store.append_audit_event,
+            "acceptance_advance_nudge",
+            task_id=sub.task_id,
+            subtask_id=sub.subtask_id,
+            payload={"pr_number": sub.pr_number},
+        )
+        return True
+
+    async def _send_acceptance_advance_renudge(self, sub: Any) -> bool:
+        """@mention the Mergemaster asking it to run ``cb-phase merge``.
+
+        Resolves the Mergemaster agent id from ``_role_map``, then the room
+        from the store's task row.  Returns True on successful send, False on
+        any resolution failure or send exception (logged at WARNING; does not
+        raise so patrol continues).
+        """
+        from thenvoi_rest.types import ChatMessageRequest, ChatMessageRequestMentionsItem
+
+        mm_id: str | None = next(
+            (aid for aid, role in self._role_map.items() if role == "mergemaster"),
+            None,
+        )
+        if mm_id is None:
+            logger.warning(
+                "AcceptanceAdvance: no Mergemaster in role_map for subtask %s — cannot renudge",
+                sub.subtask_id,
+            )
+            return False
+
+        room_id = await self._resolve_room_id(sub.task_id)
+        if room_id is None:
+            logger.warning(
+                "AcceptanceAdvance: could not resolve room for task %s — cannot renudge %s",
+                sub.task_id, sub.subtask_id,
+            )
+            return False
+
+        pr_ref = f"PR #{sub.pr_number}" if sub.pr_number is not None else "the PR"
+        content = (
+            f"[Watchdog] Subtask {sub.subtask_id}: {pr_ref} has passed acceptance "
+            f"but merge dispatch appears stalled. Please run `cb-phase merge` now."
+        )
+        try:
+            await self._rest.agent_api_messages.create_agent_chat_message(
+                chat_id=room_id,
+                message=ChatMessageRequest(
+                    content=content,
+                    mentions=[ChatMessageRequestMentionsItem(id=mm_id)],
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "AcceptanceAdvance: failed to send renudge for subtask %s",
                 sub.subtask_id, exc_info=True,
             )
             return False

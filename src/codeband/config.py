@@ -171,6 +171,18 @@ class WatchdogConfig(_StrictModel):
     # so a genuinely hung Mergemaster still surfaces as blocked).
     merge_approval_backstop_seconds: int = Field(default=240, ge=1)
     merge_approval_backstop_max_renudges: int = Field(default=1, ge=0)
+    # Acceptance-advance rung: re-@mention the Mergemaster when a subtask has
+    # passed acceptance (``acceptance_passed``) but merge dispatch has stalled,
+    # instead of letting the watchdog escalate a verified-and-accepted PR to
+    # blocked.  Mirrors the approval→merge backstop but targets the state BEFORE
+    # ``merge_pending`` in the verifier-enabled path.
+    # ``acceptance_advance_backstop_seconds``: staleness window (seconds since
+    # acceptance_passed entry, or since the last renudge) before the rung fires.
+    # ``acceptance_advance_max_renudges``: re-@mentions per acceptance_passed
+    # entry (0 disables the send leg; 1 = default, sends once then releases so
+    # a genuinely hung Mergemaster still surfaces as blocked).
+    acceptance_advance_backstop_seconds: int = Field(default=240, ge=1)
+    acceptance_advance_max_renudges: int = Field(default=1, ge=0)
 
 
 # ─── Worker-pool config primitives ──────────────────────────────────────────
