@@ -1366,8 +1366,13 @@ def down(project_dir: str, volumes: bool) -> None:
 
 @cli.command()
 @click.option("--dir", "project_dir", default=".", help="Project directory")
+@click.option(
+    "--clear-state-rooms",
+    is_flag=True,
+    help="Also clear durable StateStore task-room records for a workspace wipe.",
+)
 @_project_aware
-def reset(project_dir: str) -> None:
+def reset(project_dir: str, clear_state_rooms: bool) -> None:
     """Clean up the active Band.ai task room.
 
     Removes every agent from the room recorded in .codeband_room and deletes
@@ -1379,11 +1384,15 @@ def reset(project_dir: str) -> None:
 
     from codeband.orchestration.kickoff import reset_active_room
 
-    room_id = _run_async(reset_active_room(config, project))
+    room_id = _run_async(
+        reset_active_room(config, project, clear_state_rooms=clear_state_rooms)
+    )
     if room_id is None:
         click.echo("No active task room to reset.")
     else:
         click.echo(f"Reset task room: {room_id}")
+    if clear_state_rooms:
+        click.echo("Cleared StateStore task-room records.")
 
 
 @cli.command()

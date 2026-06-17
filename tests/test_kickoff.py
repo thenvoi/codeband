@@ -469,6 +469,45 @@ class TestResetActiveRoom:
         assert not (tmp_path / ".codeband_room").exists()
 
     @pytest.mark.asyncio
+    async def test_reset_preserves_state_store_without_wipe_flag(self, sample_config, tmp_path):
+        """Plain reset cleans pointers only; current workspace task rows stay intact."""
+        from codeband.orchestration.kickoff import reset_active_room
+        from codeband.state import StateStore
+
+        db_path = tmp_path / "workspace" / "state" / "orchestration.db"
+        store = StateStore(db_path)
+        store.create_task("current-room", "current", "current-room")
+
+        result = await reset_active_room(sample_config, tmp_path)
+
+        assert result is None
+        assert store.list_active_task_room_ids() == ["current-room"]
+
+    @pytest.mark.asyncio
+    async def test_reset_wipe_flag_clears_state_store_room_records(
+        self, sample_config, tmp_path,
+    ):
+        """The /codeband re-point wipe retires stale room records before startup."""
+        from codeband.orchestration.kickoff import reset_active_room
+        from codeband.orchestration.runner import _read_active_room_ids
+        from codeband.state import StateStore
+
+        db_path = tmp_path / "workspace" / "state" / "orchestration.db"
+        store = StateStore(db_path)
+        store.create_task("old-room-1", "old one", "old-room-1")
+        store.create_task("old-room-2", "old two", "old-room-2")
+        store.ensure_subtask("st-1", "old-room-1", state="in_progress")
+
+        result = await reset_active_room(
+            sample_config, tmp_path, clear_state_rooms=True,
+        )
+
+        assert result is None
+        assert store.list_active_task_room_ids() == []
+        assert store.list_active_subtasks() == []
+        assert _read_active_room_ids(db_path) == set()
+
+    @pytest.mark.asyncio
     async def test_removes_all_agents_and_deletes_pointer(
         self, sample_config, sample_agent_config, tmp_path,
     ):
