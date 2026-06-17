@@ -899,6 +899,21 @@ class StateStore:
             ).fetchall()
         return [row["room_id"] for row in rows]
 
+    def clear_task_records(self) -> None:
+        """Clear task-room orchestration records for a workspace fresh start.
+
+        Used by the shared-home re-point wipe: once the workspace is being
+        repurposed for a different repo, every existing task room in this DB is
+        stale by definition. Delete the task-scoped tables together so startup
+        recovery, watchdog patrols, and hash-chain verification all see a clean
+        StateStore instead of orphaned rows from the prior campaign.
+        """
+        with self._immediate_transaction() as conn:
+            conn.execute("DELETE FROM audit_log")
+            conn.execute("DELETE FROM transition_log")
+            conn.execute("DELETE FROM subtask_states")
+            conn.execute("DELETE FROM tasks")
+
     # ── subtasks ───────────────────────────────────────────────────────────
 
     def ensure_subtask(

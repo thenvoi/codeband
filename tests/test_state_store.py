@@ -70,6 +70,22 @@ def test_list_active_task_room_ids_empty_store(store: StateStore) -> None:
     assert store.list_active_task_room_ids() == []
 
 
+def test_clear_task_records_resets_room_state_and_is_idempotent(store: StateStore) -> None:
+    store.create_task(task_id="old-room", description="old", room_id="old-room")
+    store.ensure_subtask("st-1", "old-room", state="in_progress")
+
+    store.clear_task_records()
+    store.clear_task_records()
+
+    assert store.get_task("old-room") is None
+    assert store.list_active_task_room_ids() == []
+    assert store.list_active_subtasks() == []
+
+    store.create_task(task_id="fresh-room", description="fresh", room_id="fresh-room")
+
+    assert store.list_active_task_room_ids() == ["fresh-room"]
+
+
 def test_create_task_with_owner_id_round_trips(store: StateStore) -> None:
     store.create_task(
         task_id="room-1",

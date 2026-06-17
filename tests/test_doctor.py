@@ -24,6 +24,7 @@ from codeband.config import (
 from codeband.doctor import (
     Context,
     Status,
+    check_agent_platform_existence,
     check_agent_config_yaml,
     check_band_api_key,
     check_claude_auth,
@@ -246,6 +247,95 @@ class TestAgentConfig:
         ctx = Context(project_dir=tmp_path, config=cfg, agent_config=acfg)
         result = check_agent_config_yaml(ctx)
         assert result.status == Status.OK
+
+    async def test_platform_agents_all_present_ok(self, tmp_path, monkeypatch):
+        cfg = _make_config(tmp_path)
+        acfg = AgentConfigFile(agents={
+            key: AgentCredentials(agent_id=key, api_key="k")
+            for key in (
+                "conductor", "mergemaster",
+                "planner-claude_sdk-0", "plan_reviewer-claude_sdk-0",
+                "coder-claude_sdk-0", "reviewer-claude_sdk-0",
+            )
+        })
+        ctx = Context(project_dir=tmp_path, config=cfg, agent_config=acfg)
+        monkeypatch.setenv("BAND_API_KEY", "band_u_x")
+
+        fake_agents = [
+            type("A", (), {"id": creds.agent_id, "name": key})()
+            for key, creds in acfg.agents.items()
+        ]
+        fake_resp = type("R", (), {"data": fake_agents})()
+
+        async def fake_list_my_agents():
+            return fake_resp
+
+        def fake_client(**_):
+            c = type("C", (), {})()
+            c.human_api_agents = type("H", (), {})()
+            c.human_api_agents.list_my_agents = fake_list_my_agents
+            return c
+
+        with patch("thenvoi_rest.AsyncRestClient", side_effect=fake_client):
+            result = await check_agent_platform_existence(ctx)
+
+        assert result.status == Status.OK
+        assert "6 configured IDs exist" in result.message
+
+    async def test_platform_agent_missing_fails_with_name(self, tmp_path, monkeypatch):
+        cfg = _make_config(tmp_path)
+        acfg = AgentConfigFile(agents={
+            "conductor": AgentCredentials(agent_id="cond-0", api_key="k"),
+            "mergemaster": AgentCredentials(agent_id="mm-0", api_key="k"),
+        })
+        ctx = Context(project_dir=tmp_path, config=cfg, agent_config=acfg)
+        monkeypatch.setenv("BAND_API_KEY", "band_u_x")
+
+        fake_agent = type("A", (), {"id": "cond-0", "name": "Conductor"})()
+        fake_resp = type("R", (), {"data": [fake_agent]})()
+
+        async def fake_list_my_agents():
+            return fake_resp
+
+        def fake_client(**_):
+            c = type("C", (), {})()
+            c.human_api_agents = type("H", (), {})()
+            c.human_api_agents.list_my_agents = fake_list_my_agents
+            return c
+
+        with patch("thenvoi_rest.AsyncRestClient", side_effect=fake_client):
+            result = await check_agent_platform_existence(ctx)
+
+        assert result.status == Status.FAIL
+        assert "mergemaster" in result.message
+        assert "Mergemaster" in result.message
+        assert "mm-0" in result.message
+
+    async def test_platform_lookup_error_warns_not_false_red_or_green(
+        self, tmp_path, monkeypatch,
+    ):
+        cfg = _make_config(tmp_path)
+        acfg = AgentConfigFile(agents={
+            "conductor": AgentCredentials(agent_id="cond-0", api_key="k"),
+        })
+        ctx = Context(project_dir=tmp_path, config=cfg, agent_config=acfg)
+        monkeypatch.setenv("BAND_API_KEY", "band_u_x")
+
+        async def fake_list_my_agents():
+            raise RuntimeError("auth exploded")
+
+        def fake_client(**_):
+            c = type("C", (), {})()
+            c.human_api_agents = type("H", (), {})()
+            c.human_api_agents.list_my_agents = fake_list_my_agents
+            return c
+
+        with patch("thenvoi_rest.AsyncRestClient", side_effect=fake_client):
+            result = await check_agent_platform_existence(ctx)
+
+        assert result.status == Status.WARN
+        assert "Could not verify platform agents" in result.message
+        assert "auth exploded" in result.message
 
 
 class TestCrossModelPairing:
@@ -533,12 +623,23 @@ class TestRunAll:
         async def fake_list(*a, **kw):
             return object()
 
+        fake_agents = [
+            type("A", (), {"id": creds.agent_id, "name": key})()
+            for key, creds in acfg.agents.items()
+        ]
+        fake_agents_resp = type("R", (), {"data": fake_agents})()
+
+        async def fake_list_my_agents():
+            return fake_agents_resp
+
         def fake_client(**_):
             c = type("C", (), {})()
             c.agent_api_identity = type("A", (), {})()
             c.agent_api_identity.get_agent_me = fake_get_me
             c.agent_api_memories = type("M", (), {})()
             c.agent_api_memories.list_agent_memories = fake_list
+            c.human_api_agents = type("H", (), {})()
+            c.human_api_agents.list_my_agents = fake_list_my_agents
             return c
 
         with patch("thenvoi_rest.AsyncRestClient", side_effect=fake_client):

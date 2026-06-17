@@ -86,7 +86,7 @@ if [ -n "$REPO_URL" ]; then
   if [ "$CUR_URL" != "$REPO_URL" ]; then
     echo "Re-pointing codeband: '$CUR_URL' -> '$REPO_URL' (branch $BRANCH); wiping previous workspace."
     [ -f "$CB_HOME/.ensemble/run.pid" ] && kill "$(cat "$CB_HOME/.ensemble/run.pid")" 2>/dev/null || true
-    ( cd "$CB_HOME" && codeband reset --dir . >/dev/null 2>&1 || true )
+    ( cd "$CB_HOME" && codeband reset --dir . --clear-state-rooms >/dev/null 2>&1 || true )
     rm -rf "$CB_HOME/.codeband/repo.git" "$CB_HOME/.codeband/worktrees/"* \
            "$CB_HOME/.codeband/state/"*.jsonl "$CB_HOME/.codeband/state/coder-"*.json \
            "$CB_HOME/.codeband/state/orchestration.db" \

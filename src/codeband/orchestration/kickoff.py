@@ -497,7 +497,23 @@ async def _cleanup_rooms(
     await _remove_agents_from_room(prev_room_id, agent_config, config)
 
 
-async def reset_active_room(config: CodebandConfig, project_dir: Path) -> str | None:
+def _clear_state_room_records(state_dir: Path) -> None:
+    """Clear durable task-room state when a workspace wipe requests it."""
+    db_path = state_dir / "orchestration.db"
+    if not db_path.exists():
+        return
+
+    from codeband.state import StateStore
+
+    StateStore(db_path).clear_task_records()
+
+
+async def reset_active_room(
+    config: CodebandConfig,
+    project_dir: Path,
+    *,
+    clear_state_rooms: bool = False,
+) -> str | None:
     """Remove all agents from the active task room and delete the pointer file.
 
     Returns the room id that was cleaned up, or None if there was nothing to
@@ -521,10 +537,14 @@ async def reset_active_room(config: CodebandConfig, project_dir: Path) -> str | 
     if not room_id:
         for f in pointer_files:
             f.unlink(missing_ok=True)
+        if clear_state_rooms:
+            _clear_state_room_records(state_dir)
         return None
 
     agent_config = load_agent_config(project_dir)
     await _remove_agents_from_room(room_id, agent_config, config)
     for f in pointer_files:
         f.unlink(missing_ok=True)
+    if clear_state_rooms:
+        _clear_state_room_records(state_dir)
     return room_id
