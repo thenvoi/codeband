@@ -622,6 +622,76 @@ async def check_memory_mode(ctx: Context) -> CheckResult:
     )
 
 
+def check_jam_delivery_sdk_coupling(ctx: Context) -> CheckResult:
+    """Tripwire for the jam-delivery transport's coupling to band-sdk internals.
+
+    The opt-in ``CODEBAND_DELIVERY=jam`` path (``codeband/transport/jam_runtime.py``)
+    deliberately bypasses the SDK's public ``Agent.create(...).run()`` facade —
+    that facade IS the wedging ``/next`` path — and reassembles the pieces beneath
+    it. So it depends on internal (and one private) band-sdk surfaces that carry no
+    stability promise. This check imports each one and reports clearly if a band-sdk
+    upgrade moved or renamed it, surfacing the coupling at upgrade time instead of
+    at first jam run. The default ``sdk`` delivery path depends on NONE of this.
+    """
+    import importlib
+
+    # (module, attribute) pairs the jam runtime reassembles. See jam_runtime.py.
+    required = [
+        ("thenvoi.platform.link", "ThenvoiLink"),
+        ("thenvoi.preprocessing.default", "DefaultPreprocessor"),
+        ("thenvoi.runtime.execution", "ExecutionContext"),
+        ("thenvoi.runtime.retry_tracker", "MessageRetryTracker"),
+        ("thenvoi.client.streaming", "MessageCreatedPayload"),
+        ("thenvoi.client.streaming", "MessageMetadata"),
+        ("thenvoi.platform.event", "MessageEvent"),
+    ]
+    missing: list[str] = []
+    for mod_name, attr in required:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception as exc:  # noqa: BLE001 - any import failure = moved/renamed
+            missing.append(f"{mod_name} ({type(exc).__name__})")
+            continue
+        if not hasattr(mod, attr):
+            missing.append(f"{mod_name}.{attr}")
+
+    # The private method the per-room worker calls + the private adapter attr the
+    # handshake sets — the most fragile couplings (no underscore-stability promise).
+    try:
+        from thenvoi.runtime.execution import ExecutionContext as _EC
+
+        if not hasattr(_EC, "_ensure_fresh_context"):
+            missing.append("thenvoi.runtime.execution.ExecutionContext._ensure_fresh_context")
+    except Exception:  # noqa: BLE001 - already recorded by the import loop above
+        pass
+
+    if not missing:
+        return CheckResult(
+            Status.OK,
+            "jam delivery SDK internals present (transport coupling intact)",
+        )
+
+    # Severity tracks exposure: FAIL if jam delivery is actually selected (the path
+    # in use is broken); WARN otherwise (the opt-in path won't work, but the active
+    # sdk path is fine — don't trip the exit code for sdk users).
+    jam_selected = os.environ.get("CODEBAND_DELIVERY", "").strip().lower() == "jam" or (
+        ctx.config is not None
+        and getattr(ctx.config.agents, "delivery", "sdk") == "jam"
+    )
+    return CheckResult(
+        Status.FAIL if jam_selected else Status.WARN,
+        "jam delivery transport is incompatible with the installed band-sdk — "
+        f"missing/moved internal symbol(s): {', '.join(missing)}",
+        remediation=(
+            "The opt-in CODEBAND_DELIVERY=jam path reassembles band-sdk internals "
+            "(see codeband/transport/jam_runtime.py); a band-sdk upgrade moved one. "
+            "Pin band-sdk to the supported range (>=0.2.8,<0.3) or update "
+            "jam_runtime.py to the new SDK shapes. The default CODEBAND_DELIVERY=sdk "
+            "delivery path is unaffected."
+        ),
+    )
+
+
 # ─── registry ───────────────────────────────────────────────────────────────
 
 _CHECKS: list[Check] = [
@@ -640,6 +710,7 @@ _CHECKS: list[Check] = [
     Check("Cross-model pairing", "Config", check_cross_model_pairing),
     Check("Verifier pairing", "Config", check_verifier_pairing),
     Check("Agent count vs Band.ai tier", "Config", check_agent_count_vs_tier),
+    Check("jam delivery SDK coupling", "Environment", check_jam_delivery_sdk_coupling),
     Check("Band.ai REST reachable", "Connectivity", check_band_rest),
     Check("Memory backend", "Connectivity", check_memory_mode),
     Check("Active room membership", "Connectivity", check_active_room_membership),

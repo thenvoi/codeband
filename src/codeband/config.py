@@ -495,6 +495,18 @@ class AgentsConfig(_StrictModel):
     # eliminate it. ge=1: the SDK needs at least one attempt.
     max_message_retries: int = Field(default=3, ge=1)
 
+    # Message-delivery transport for swarm agents. ``sdk`` (default) is today's
+    # behavior: the SDK ExecutionContext's WebSocket + ``/next`` cursor, which
+    # can wedge on a swallowed mark-processed 422. ``jam`` is the opt-in
+    # wedge-immune path: inbound is pulled from the local jam daemon over its
+    # Unix-socket Control contract (durable per-peer queue, non-fatal acks, no
+    # head-of-line cursor). Read via ``runner._resolve_delivery_mode``, where the
+    # ``CODEBAND_DELIVERY`` env var overrides this field. The ``jam`` code is
+    # fully dormant (never imported) unless this resolves to ``jam``. See
+    # ``codeband/transport/``. Recovery machinery (#102/#103/watchdog heal) stays
+    # active on the ``sdk`` path.
+    delivery: Literal["sdk", "jam"] = "sdk"
+
     def total_agent_count(self) -> int:
         """Band.ai seats used (excluding Watchdog — reuses Conductor creds)."""
         return (
