@@ -19,14 +19,13 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from codeband import roster as _roster
 from codeband.config import (
     AgentConfigFile,
     AgentCredentials,
     CodebandConfig,
-    Framework,
-    FrameworkPool,
 )
-from codeband.workers import WorkerId, WorkerRole
+from codeband.workers import WorkerId
 
 if TYPE_CHECKING:
     from thenvoi_rest import AsyncRestClient
@@ -44,96 +43,15 @@ class _DeleteReason(str, Enum):
 
 # ─── naming ─────────────────────────────────────────────────────────────────
 
-_FRAMEWORK_DISPLAY = {
-    Framework.CLAUDE_SDK: "Claude",
-    Framework.CODEX: "Codex",
-}
-
-# Agent descriptions — these are what `band_lookup_peers` returns for
-# discovery-based invites, so each must be self-describing enough that another
-# agent reading the description alone can decide whether to recruit it.
-# Every description includes a stable `role=...` discovery token, and pool
-# descriptions also include `framework=Claude|Codex` so adversarial cross-model
-# pairing rules can filter on exact strings instead of prose.
-#
-# Descriptions are intentionally NOT user-overridable — keep them consistent
-# across deployments so prompts can rely on the wording.
-
-_SINGLETON_AGENTS = {
-    "conductor": (
-        "Conductor",
-        (
-            "Codeband Conductor — orchestration hub. Routes user tasks to a "
-            "Planner, allocates Coders for subtasks, observes Code Reviewer "
-            "verdicts, applies the auto-merge policy (auto-merge low-risk; "
-            "route higher-risk to human approval), and forwards approved PRs "
-            "to the Mergemaster. Relays cross-agent protocols (clarification, "
-            "plan revision, merge conflicts, test failures); intervenes when "
-            "dispatches stall. Singleton; does not plan, code, or review. "
-            "Discovery: role=conductor_agent."
-        ),
-    ),
-    "mergemaster": (
-        "Mergemaster",
-        (
-            "Codeband Mergemaster — integrates approved PRs into the repository "
-            "base branch using a batch-then-bisect strategy. Runs integration "
-            "tests, handles merge conflicts and test failures by routing back "
-            "to the originating Coder via the Conductor. Singleton role; the "
-            "last gate before code reaches main. Discovery: role=merge_agent."
-        ),
-    ),
-}
-
-_POOL_ROLES: tuple[tuple[WorkerRole, str, str], ...] = (
-    (
-        WorkerRole.PLANNER,
-        "planners",
-        (
-            "Codeband Planner — analyzes the codebase and decomposes user "
-            "tasks into independent parallelizable subtasks with acceptance "
-            "criteria. Cross-model paired with a Plan Reviewer on the opposite "
-            "framework. Discovery: role=planning_agent"
-        ),
-    ),
-    (
-        WorkerRole.PLAN_REVIEWER,
-        "plan_reviewers",
-        (
-            "Codeband Plan Reviewer — validates implementation plans before "
-            "Coders begin work. Checks decomposition quality, file conflict "
-            "risk, and acceptance criteria. Cross-model paired with Planners "
-            "on the opposite framework. Discovery: role=plan_review_agent"
-        ),
-    ),
-    (
-        WorkerRole.CODER,
-        "coders",
-        (
-            "Codeband Coder — implements assigned subtasks in an isolated git "
-            "worktree, opens a PR, and dispatches it directly to a Code "
-            "Reviewer on the opposite framework. Cross-model code review is "
-            "the primary value prop of the swarm. Discovery: role=coding_agent"
-        ),
-    ),
-    (
-        WorkerRole.REVIEWER,
-        "reviewers",
-        (
-            "Codeband Code Reviewer — reviews PRs from Coders before merge. "
-            "Cross-model: reviews PRs from Coders on the opposite framework. "
-            "Reports a PASS/FAIL verdict with a risk level "
-            "(low/medium/high/critical) that the Conductor uses to decide "
-            "auto-merge vs human approval. Discovery: role=code_review_agent"
-        ),
-    ),
-)
+# Per-role display labels and Band.ai descriptions live in the canonical roster
+# registry (`codeband.roster`); this module derives the registration map from it
+# via `_expected_agents`.
 
 
 def worker_display_name(worker_id: WorkerId) -> str:
     """Band.ai display name for a pool worker (e.g. `Coder-Claude-0`)."""
     role_label = worker_id.role.value.replace("_", "-").title()
-    fw_label = _FRAMEWORK_DISPLAY[worker_id.framework]
+    fw_label = _roster.FRAMEWORK_DISPLAY[worker_id.framework]
     return f"{role_label}-{fw_label}-{worker_id.index}"
 
 
@@ -143,39 +61,28 @@ _BAND_DESCRIPTION_MAX = 500
 def _expected_agents(config: CodebandConfig) -> dict[str, tuple[str, str]]:
     """Build the full map of agent config-key -> (display_name, description).
 
-    Asserts each description fits within Band.ai's 500-char limit so that a
-    too-long description fails at build time (with a precise pointer to the
-    offending agent) rather than at registration time as an opaque 422 from
-    the platform.
+    Derived from the canonical roster (`codeband.roster`). Asserts each
+    description fits within Band.ai's 500-char limit so a too-long description
+    fails at build time (with a precise pointer to the offending agent) rather
+    than as an opaque 422 at registration time.
     """
     expected: dict[str, tuple[str, str]] = {}
-
-    # Singletons
-    for key, (display, desc) in _SINGLETON_AGENTS.items():
-        expected[key] = (display, desc)
-
-    # Pools — walk (role, attr, base_desc)
-    for role, attr, base_desc in _POOL_ROLES:
-        pool: FrameworkPool = getattr(config.agents, attr)
-        for framework in (Framework.CLAUDE_SDK, Framework.CODEX):
-            entry = pool.entry_for(framework)
-            for i in range(entry.count):
-                wid = WorkerId(role=role, framework=framework, index=i)
-                key = str(wid)
-                display = worker_display_name(wid)
-                desc = (
-                    f"{base_desc}; framework={_FRAMEWORK_DISPLAY[framework]} "
-                    f"({_FRAMEWORK_DISPLAY[framework]})."
-                )
-                expected[key] = (display, desc)
+    for info in _roster.iter_agents(config):
+        spec = info.spec
+        if spec.kind == "singleton":
+            expected[info.key] = (spec.roster_label, spec.description)
+        else:
+            fw = _roster.FRAMEWORK_DISPLAY[info.framework]
+            display = worker_display_name(info.worker_id)
+            desc = f"{spec.description}; framework={fw} ({fw})."
+            expected[info.key] = (display, desc)
 
     for key, (display, desc) in expected.items():
         if len(desc) > _BAND_DESCRIPTION_MAX:
             raise ValueError(
                 f"Description for {display} ({key}) is {len(desc)} chars, "
                 f"exceeds Band.ai's {_BAND_DESCRIPTION_MAX}-char limit. "
-                "Trim the canonical description in `_SINGLETON_AGENTS` or "
-                "`_POOL_ROLES` in setup.py."
+                "Trim the canonical description in `_ROLE_SPECS` in roster.py."
             )
 
     return expected
@@ -189,14 +96,12 @@ _LEGACY_AGENT_NAMES = frozenset({
     "Plan Reviewer",    # legacy singleton
     "Code Reviewer",    # legacy singleton
 })
-_CODEBAND_PREFIXES = (
-    "Planner-", "Plan-Reviewer-", "Coder-", "Reviewer-", "Player-",
-)
+_CODEBAND_PREFIXES = _roster.display_prefixes()
 
 
 def _is_codeband_agent(name: str) -> bool:
     """Check if a platform agent name matches Codeband naming conventions."""
-    if name in {"Conductor", "Mergemaster"}:
+    if name in {s.roster_label for s in _roster.singleton_specs()}:
         return True
     if name in _LEGACY_AGENT_NAMES:
         return True
@@ -221,7 +126,7 @@ async def register_all_agents(
 
     `detect_drift=True` (default, for `cb setup-agents`): also re-register
     agents whose platform-side `description` no longer matches the canonical
-    description in `_SINGLETON_AGENTS` / `_POOL_ROLES`. Re-registration
+    description in the roster registry (`codeband.roster`). Re-registration
     rotates the agent's ID and api_key, so any session currently using the
     old credential will fail on next reconnect. The auto-bootstrap path in
     `runner.py:_ensure_agents_registered` passes `detect_drift=False` so that

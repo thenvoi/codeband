@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from codeband import roster
 from codeband.config import CodebandConfig, Framework, FrameworkPool, PoolEntry
 from codeband.workers import WorkerId, WorkerRole
 from codeband.workspace.git import (
@@ -90,14 +91,28 @@ def resolve_layout(config: CodebandConfig) -> WorkspaceLayout:
     )
 
     agents = config.agents
-    for wid in _iter_pool_worker_ids(WorkerRole.PLANNER, agents.planners):
-        layout.planner_worktrees[str(wid)] = worktrees_dir / str(wid)
-    for wid in _iter_pool_worker_ids(WorkerRole.PLAN_REVIEWER, agents.plan_reviewers):
-        layout.plan_reviewer_worktrees[str(wid)] = worktrees_dir / str(wid)
-    for wid in _iter_pool_worker_ids(WorkerRole.CODER, agents.coders):
-        layout.coder_worktrees[str(wid)] = worktrees_dir / str(wid)
-    for wid in _iter_pool_worker_ids(WorkerRole.REVIEWER, agents.reviewers):
-        layout.reviewer_scratch[str(wid)] = root / "scratch" / str(wid)
+    # Registry-driven: each pool's worktree/scratch dir follows its RoleSpec
+    # workspace_kind, so a newly added pool is laid out automatically (or fails
+    # loud below if its target layout field is missing) rather than being
+    # silently omitted. The target dict is the only layout-shape-specific bit.
+    _pool_layout_field = {
+        "planners": "planner_worktrees",
+        "plan_reviewers": "plan_reviewer_worktrees",
+        "coders": "coder_worktrees",
+        "reviewers": "reviewer_scratch",
+    }
+    for spec in roster.pool_specs():
+        field_name = _pool_layout_field.get(spec.config_attr)
+        if field_name is None:
+            raise ValueError(
+                f"resolve_layout has no layout field for pool '{spec.config_attr}'. "
+                "Add one to _pool_layout_field."
+            )
+        base = worktrees_dir if spec.workspace_kind == "worktree" else layout.scratch_dir
+        target = getattr(layout, field_name)
+        pool = getattr(agents, spec.config_attr)
+        for wid in _iter_pool_worker_ids(spec.worker_role, pool):
+            target[str(wid)] = base / str(wid)
 
     return layout
 
@@ -215,9 +230,6 @@ class AgentWorkspaceLayout:
     notes_dir: Path | None
 
 
-_WORKTREE_ROLES = {"planner", "plan_reviewer", "coder", "mergemaster"}
-
-
 def initialize_agent_workspace(
     config: CodebandConfig,
     worker_id: str,
@@ -298,14 +310,9 @@ def initialize_agent_workspace(
 
 
 def _claude_profile_for_agent_role(agent_role: str) -> ClaudeSettingsProfile | None:
-    """Map an agent role to the Claude permission profile it should use."""
-    if agent_role in {"coder", "mergemaster"}:
-        return "coding"
-    if agent_role == "planner":
-        return "planner"
-    if agent_role == "plan_reviewer":
-        return "plan_reviewer"
-    return None
+    """Map an agent role to the Claude permission profile it should use (roster)."""
+    spec = roster.spec_for_role(agent_role)
+    return spec.claude_profile if spec else None
 
 
 _CLAUDE_SETTINGS_PROFILES: dict[ClaudeSettingsProfile, dict] = {

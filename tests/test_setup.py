@@ -176,13 +176,21 @@ def test_expected_agent_descriptions_within_band_500_char_limit():
 def test_oversized_description_raises_at_build_time(monkeypatch):
     """If a future edit makes a description too long, the build fails with a
     clear error rather than waiting until Band.ai returns 422."""
+    import dataclasses
+
+    from codeband import roster
     from codeband.orchestration import setup as setup_mod
 
-    # Inflate one singleton's description past the limit.
-    bloated = ("X" * 600)
-    monkeypatch.setitem(
-        setup_mod._SINGLETON_AGENTS, "conductor", ("Conductor", bloated),
+    # Inflate one role's canonical description (now owned by the roster) past
+    # the limit, leaving the rest of the registry intact.
+    bloated = "X" * 600
+    patched = tuple(
+        dataclasses.replace(spec, description=bloated)
+        if spec.config_attr == "conductor"
+        else spec
+        for spec in roster._ROLE_SPECS
     )
+    monkeypatch.setattr(roster, "_ROLE_SPECS", patched)
 
     with pytest.raises(ValueError, match=r"exceeds Band.ai's 500-char limit"):
         setup_mod._expected_agents(_make_config())
