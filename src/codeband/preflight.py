@@ -16,17 +16,11 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
-from codeband.models import CLAUDE_OPUS, CLAUDE_SONNET
+from codeband.models import CLAUDE_SONNET
 
 if TYPE_CHECKING:
     from codeband.config import CodebandConfig
 
-# A worker pool whose entry omits `model` falls back to a default at spawn time.
-# That default is Sonnet for every role except coders (Opus) — mirror the
-# spawner here (runner.py: reviewers/plan_reviewers `or CLAUDE_SONNET`, coders
-# via ClaudePlayerRunner's Opus default). Only the non-Sonnet exception needs an
-# entry; everything else — including any pool added later — defaults to Sonnet.
-_POOL_MODEL_DEFAULT: dict[str, str] = {"coders": CLAUDE_OPUS}
 
 logger = logging.getLogger(__name__)
 
@@ -403,68 +397,6 @@ def _restore_anthropic_api_key_fallback() -> bool:
     return True
 
 
-def _config_uses_codex(config: CodebandConfig) -> bool:
-    """True if any role in the config runs on the Codex framework.
-
-    Used to scope the Codex preflight — no point shelling out to ``codex exec``
-    on a Claude-only pool.
-    """
-    from codeband.config import Framework
-
-    agents = config.agents
-    for pool_name in ("planners", "plan_reviewers", "coders", "reviewers"):
-        pool = getattr(agents, pool_name)
-        if pool.entry_for(Framework.CODEX).count > 0:
-            return True
-    return (
-        agents.conductor.framework == Framework.CODEX
-        or agents.mergemaster.framework == Framework.CODEX
-    )
-
-
-def _claude_models(config: CodebandConfig) -> list[str]:
-    """Distinct Claude models actually configured across *all* roles, order-preserving.
-
-    Discovered generically from the ``AgentsConfig`` fields so new singleton agents
-    or worker pools are probed automatically — there is no role list to keep in sync.
-    Two shapes are recognized (the same ones the rest of the code duck-types):
-
-    * singleton agents expose ``.framework`` + ``.model`` (Conductor, Mergemaster);
-    * worker pools expose ``.entry_for(framework)`` (planners/coders/reviewers/...).
-
-    A pool entry with ``model=None`` falls back to the same default the spawner uses
-    (Opus for coders, Sonnet elsewhere — see ``_POOL_MODEL_DEFAULT``). Each model is
-    probed by ``run_preflight`` so one that rejects the request shape (e.g. a stale
-    bundled CLI sending legacy ``thinking.type.enabled``) fails fast instead of
-    producing a silent, do-nothing agent at runtime.
-    """
-    from codeband.config import Framework
-
-    agents = config.agents
-    models: list[str] = []
-    for field_name in type(agents).model_fields:
-        value = getattr(agents, field_name)
-        if hasattr(value, "framework") and hasattr(value, "model"):
-            # Singleton agent.
-            if value.framework == Framework.CLAUDE_SDK and value.model:
-                models.append(value.model)
-        elif hasattr(value, "entry_for"):
-            # Worker pool.
-            entry = value.entry_for(Framework.CLAUDE_SDK)
-            if entry.count > 0:
-                models.append(
-                    entry.model or _POOL_MODEL_DEFAULT.get(field_name, CLAUDE_SONNET)
-                )
-
-    seen: set[str] = set()
-    distinct: list[str] = []
-    for model in models:
-        if model and model not in seen:
-            seen.add(model)
-            distinct.append(model)
-    return distinct
-
-
 async def run_preflight(config: CodebandConfig) -> PreflightError | None:
     """Run all applicable auth preflight checks concurrently.
 
@@ -478,11 +410,13 @@ async def run_preflight(config: CodebandConfig) -> PreflightError | None:
     """
     import asyncio
 
+    from codeband import roster
+
     tasks = [
         check_claude_auth(config.claude.auth_mode, model)
-        for model in _claude_models(config)
+        for model in roster.claude_models(config)
     ]
-    if _config_uses_codex(config):
+    if roster.uses_codex(config):
         tasks.append(check_codex_auth())
 
     results = await asyncio.gather(*tasks)

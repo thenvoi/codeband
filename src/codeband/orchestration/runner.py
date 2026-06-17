@@ -16,6 +16,7 @@ from codeband.config import (
     PoolEntry,
     load_agent_config,
 )
+from codeband import roster
 from codeband.models import CLAUDE_SONNET
 from codeband.workers import WorkerId, WorkerRole
 from codeband.workspace.init import initialize_agent_workspace, initialize_workspace
@@ -26,8 +27,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Roles that are always present exactly once per project.
-_SINGLETON_KEYS = ("conductor", "mergemaster")
+# Roles that are always present exactly once per project (from the roster registry).
+_SINGLETON_KEYS = roster.singleton_keys()
 
 # Light stagger between local in-process agent starts. Docker naturally spreads
 # each agent across container startup; plain ``cb`` otherwise opens and joins
@@ -595,6 +596,17 @@ async def run_local(
     )
     logger.info("Created Mergemaster agent")
 
+    # Anti-rot guard: each pool below is spawned with a role-specific factory, so
+    # the loops can't be collapsed — but a *new* pool added to the registry without
+    # a spawn loop here must fail loud, not be silently never-spawned.
+    _spawned_pools = {"planners", "plan_reviewers", "reviewers", "coders"}
+    _unhandled = roster.pool_attrs() - _spawned_pools
+    if _unhandled:
+        raise ValueError(
+            f"run_local has no spawn loop for pool(s) {_unhandled}. Add one (with the "
+            "role's factory/supervision) next to the existing pool loops."
+        )
+
     # --- Planner pool ---
     for wid, _entry in _iter_pool(resolved_config.agents.planners, WorkerRole.PLANNER):
         key = str(wid)
@@ -944,7 +956,7 @@ def _role_from_key(key: str) -> str:
     parts = key.rsplit("-", 2)
     if len(parts) == 3:
         role = parts[0]
-        if role in {"planner", "plan_reviewer", "coder", "reviewer"}:
+        if role in roster.pool_role_values():
             return role
     raise ValueError(f"Cannot derive role from agent key: {key}")
 
@@ -1011,31 +1023,23 @@ def _build_worker_roster(config: CodebandConfig) -> str:
     lines.append("| Role | Framework | Count | Workers |")
     lines.append("|------|-----------|-------|---------|")
 
-    display_role = {
-        WorkerRole.CODER: "Coder",
-        WorkerRole.REVIEWER: "Reviewer",
-        WorkerRole.PLANNER: "Planner",
-        WorkerRole.PLAN_REVIEWER: "Plan-Reviewer",
-    }
-
-    def _display_name(role: WorkerRole, fw: Framework, index: int) -> str:
+    def _display_name(spec: roster.RoleSpec, fw: Framework, index: int) -> str:
         fw_label = "Claude" if fw == Framework.CLAUDE_SDK else "Codex"
-        return f"{display_role[role]}-{fw_label}-{index}"
+        return f"{spec.display_token}-{fw_label}-{index}"
 
-    def _rows(role: WorkerRole, role_label: str, pool: FrameworkPool) -> None:
+    # Driven by the registry so a newly added pool appears here automatically.
+    for spec in roster.pool_specs():
+        pool = getattr(config.agents, spec.config_attr)
         for fw in (Framework.CLAUDE_SDK, Framework.CODEX):
             entry: PoolEntry = pool.entry_for(fw)
             if entry.count == 0:
                 continue
-            workers = ", ".join(_display_name(role, fw, i) for i in range(entry.count))
-            lines.append(
-                f"| {role_label} | {fw.value} | {entry.count} | {workers} |",
+            workers = ", ".join(
+                _display_name(spec, fw, i) for i in range(entry.count)
             )
-
-    _rows(WorkerRole.CODER, "Coder", config.agents.coders)
-    _rows(WorkerRole.REVIEWER, "Code Reviewer", config.agents.reviewers)
-    _rows(WorkerRole.PLANNER, "Planner", config.agents.planners)
-    _rows(WorkerRole.PLAN_REVIEWER, "Plan Reviewer", config.agents.plan_reviewers)
+            lines.append(
+                f"| {spec.roster_label} | {fw.value} | {entry.count} | {workers} |",
+            )
     return "\n".join(lines)
 
 

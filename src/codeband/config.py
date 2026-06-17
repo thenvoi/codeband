@@ -226,14 +226,21 @@ class AgentsConfig(_StrictModel):
     watchdog: WatchdogConfig = Field(default_factory=WatchdogConfig)
 
     def total_agent_count(self) -> int:
-        """Band.ai seats used (excluding Watchdog — reuses Conductor creds)."""
-        return (
-            2  # conductor + mergemaster
-            + self.planners.total_count()
-            + self.plan_reviewers.total_count()
-            + self.coders.total_count()
-            + self.reviewers.total_count()
-        )
+        """Band.ai seats used (excluding Watchdog — reuses Conductor creds).
+
+        Derived by introspecting the agent fields (singletons + pools) rather than
+        a hardcoded roster, so a newly added role is counted automatically. A
+        singleton field exposes ``.framework``; a pool field exposes ``.total_count``.
+        Non-agent fields (e.g. ``watchdog``) have neither and are skipped.
+        """
+        total = 0
+        for field_name in type(self).model_fields:
+            value = getattr(self, field_name)
+            if hasattr(value, "total_count"):
+                total += value.total_count()
+            elif hasattr(value, "framework") and hasattr(value, "model"):
+                total += 1
+        return total
 
 
 class RepoConfig(_StrictModel):
@@ -356,7 +363,18 @@ def load_agent_config(project_dir: Path | None = None) -> AgentConfigFile:
     return AgentConfigFile.from_yaml(config_path)
 
 
-_SCALABLE_POOLS = {"planners", "plan_reviewers", "coders", "reviewers"}
+def _scalable_pool_names() -> set[str]:
+    """Names of the scalable worker-pool fields on AgentsConfig.
+
+    Discovered by introspection (a pool exposes ``entry_for``) so a newly added
+    pool is scalable automatically — no hardcoded list to keep in sync.
+    """
+    probe = AgentsConfig()
+    return {
+        name
+        for name in type(probe).model_fields
+        if hasattr(getattr(probe, name), "entry_for")
+    }
 
 
 def scale_pool(
@@ -364,15 +382,16 @@ def scale_pool(
 ) -> CodebandConfig:
     """Set the capacity of a (pool, framework) entry in an existing config.
 
-    `pool` must be one of "planners" / "plan_reviewers" / "coders" / "reviewers".
-    Preserves model/restart settings on the pool entry. Saves the updated
-    config back to disk and returns it.
+    `pool` must be one of the worker pools (planners / plan_reviewers / coders /
+    reviewers). Preserves model/restart settings on the pool entry. Saves the
+    updated config back to disk and returns it.
     """
     if count < 0:
         raise ValueError("count must be >= 0")
-    if pool not in _SCALABLE_POOLS:
+    scalable = _scalable_pool_names()
+    if pool not in scalable:
         raise ValueError(
-            f"Unknown pool '{pool}'. Must be one of: {sorted(_SCALABLE_POOLS)}",
+            f"Unknown pool '{pool}'. Must be one of: {sorted(scalable)}",
         )
 
     config = CodebandConfig.from_yaml(config_path)

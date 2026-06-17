@@ -319,18 +319,12 @@ def check_claude_auth(ctx: Context) -> CheckResult:
 
 
 def _needs_codex(ctx: Context) -> bool:
-    """True if any worker pool has a Codex entry with count > 0."""
+    """True if any configured agent runs on the Codex framework."""
     if ctx.config is None:
         return False
-    agents = ctx.config.agents
-    for pool_name in ("planners", "plan_reviewers", "coders", "reviewers"):
-        pool = getattr(agents, pool_name)
-        if pool.entry_for(Framework.CODEX).count > 0:
-            return True
-    return (
-        agents.conductor.framework == Framework.CODEX
-        or agents.mergemaster.framework == Framework.CODEX
-    )
+    from codeband import roster
+
+    return roster.uses_codex(ctx.config)
 
 
 def check_codex_auth(ctx: Context) -> CheckResult:
@@ -466,8 +460,13 @@ def check_cross_model_pairing(ctx: Context) -> CheckResult:
                     f"{critic_count} {opposite.value} reviewers",
                 )
 
-    _check_pair("Planner/Plan Reviewer", agents.planners, agents.plan_reviewers)
-    _check_pair("Coder/Code Reviewer", agents.coders, agents.reviewers)
+    from codeband import roster
+
+    for author_attr, critic_attr in roster.review_pairs():
+        author_spec = roster.spec_for_role(author_attr)
+        critic_spec = roster.spec_for_role(critic_attr)
+        label = f"{author_spec.roster_label}/{critic_spec.roster_label}"
+        _check_pair(label, getattr(agents, author_attr), getattr(agents, critic_attr))
 
     all_issues = issues + capacity_issues
     if all_issues:
