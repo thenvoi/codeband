@@ -25,7 +25,8 @@ Kind = Literal["singleton", "pool"]
 WorkspaceKind = Literal["worktree", "scratch", "none"]
 ClaudeProfile = Literal["coding", "planner", "plan_reviewer"]
 
-_FRAMEWORK_DISPLAY = {Framework.CLAUDE_SDK: "Claude", Framework.CODEX: "Codex"}
+# Human-facing framework labels used in Band.ai display names ("Coder-Claude-0").
+FRAMEWORK_DISPLAY = {Framework.CLAUDE_SDK: "Claude", Framework.CODEX: "Codex"}
 _BAND_DESCRIPTION_MAX = 500
 
 

@@ -24,7 +24,6 @@ from codeband.config import (
     AgentConfigFile,
     AgentCredentials,
     CodebandConfig,
-    Framework,
 )
 from codeband.workers import WorkerId
 
@@ -44,20 +43,15 @@ class _DeleteReason(str, Enum):
 
 # ─── naming ─────────────────────────────────────────────────────────────────
 
-_FRAMEWORK_DISPLAY = {
-    Framework.CLAUDE_SDK: "Claude",
-    Framework.CODEX: "Codex",
-}
-
-# Per-role display labels and Band.ai descriptions now live in the canonical
-# roster registry (`codeband.roster`). This module derives the registration
-# map from it via `_expected_agents`.
+# Per-role display labels and Band.ai descriptions live in the canonical roster
+# registry (`codeband.roster`); this module derives the registration map from it
+# via `_expected_agents`.
 
 
 def worker_display_name(worker_id: WorkerId) -> str:
     """Band.ai display name for a pool worker (e.g. `Coder-Claude-0`)."""
     role_label = worker_id.role.value.replace("_", "-").title()
-    fw_label = _FRAMEWORK_DISPLAY[worker_id.framework]
+    fw_label = _roster.FRAMEWORK_DISPLAY[worker_id.framework]
     return f"{role_label}-{fw_label}-{worker_id.index}"
 
 
@@ -72,15 +66,13 @@ def _expected_agents(config: CodebandConfig) -> dict[str, tuple[str, str]]:
     fails at build time (with a precise pointer to the offending agent) rather
     than as an opaque 422 at registration time.
     """
-    from codeband import roster
-
     expected: dict[str, tuple[str, str]] = {}
-    for info in roster.iter_agents(config):
+    for info in _roster.iter_agents(config):
         spec = info.spec
         if spec.kind == "singleton":
             expected[info.key] = (spec.roster_label, spec.description)
         else:
-            fw = _FRAMEWORK_DISPLAY[info.framework]
+            fw = _roster.FRAMEWORK_DISPLAY[info.framework]
             display = worker_display_name(info.worker_id)
             desc = f"{spec.description}; framework={fw} ({fw})."
             expected[info.key] = (display, desc)
