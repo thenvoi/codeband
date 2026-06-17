@@ -435,35 +435,20 @@ class TestSendTask:
         assert "branch: main" in msg.content
 
 
-class TestResetActiveRoom:
-    """Tests for reset_active_room — Band.ai cleanup helper behind `cb reset`."""
+class TestResetStaleRooms:
+    """Tests for reset_stale_rooms — Band.ai cleanup helper behind `cb reset`.
+
+    Only rooms that are stale (participant read 404s — the Watchdog's own
+    staleness signal) get their agents removed; live rooms are skipped so
+    concurrent task rooms are never disturbed. Rooms are never deleted.
+    """
 
     @pytest.mark.asyncio
-    async def test_no_room_file_is_noop(self, sample_config, tmp_path):
-        """Returns None when .codeband_room is missing — no API calls made."""
-        from codeband.orchestration.kickoff import reset_active_room
-        result = await reset_active_room(sample_config, tmp_path)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_empty_room_file_deletes_and_noops(self, sample_config, tmp_path):
-        """Empty pointer file is cleaned up; returns None; no API calls."""
-        from codeband.orchestration.kickoff import reset_active_room
-        (tmp_path / ".codeband_room").write_text("", encoding="utf-8")
-        result = await reset_active_room(sample_config, tmp_path)
-        assert result is None
-        assert not (tmp_path / ".codeband_room").exists()
-
-    @pytest.mark.asyncio
-    async def test_removes_all_agents_and_deletes_pointer(
-        self, sample_config, sample_agent_config, tmp_path,
-    ):
-        """Each agent's client calls remove_agent_chat_participant; pointer is deleted."""
+    async def test_no_rooms_is_noop(self, sample_config, sample_agent_config, tmp_path):
+        """Empty chat list and no pointer → returns [], makes no removals."""
         from codeband.orchestration import kickoff
 
         sample_agent_config.to_yaml(tmp_path / "agent_config.yaml")
-        (tmp_path / ".codeband_room").write_text("stale-room-id", encoding="utf-8")
-
         factory = _make_clients(AsyncMock(), {
             creds.api_key: (creds.agent_id, key)
             for key, creds in sample_agent_config.agents.items()
@@ -473,52 +458,81 @@ class TestResetActiveRoom:
         original = thenvoi_rest.AsyncRestClient
         thenvoi_rest.AsyncRestClient = factory
         try:
-            result = await kickoff.reset_active_room(sample_config, tmp_path)
+            result = await kickoff.reset_stale_rooms(sample_config, tmp_path)
         finally:
             thenvoi_rest.AsyncRestClient = original
 
-        assert result == "stale-room-id"
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_listing_failure_is_non_fatal(
+        self, sample_config, sample_agent_config, tmp_path,
+    ):
+        """If list_agent_chats raises, reset returns [] instead of crashing."""
+        from codeband.orchestration import kickoff
+
+        sample_agent_config.to_yaml(tmp_path / "agent_config.yaml")
+        factory = _make_clients(AsyncMock(), {
+            creds.api_key: (creds.agent_id, key)
+            for key, creds in sample_agent_config.agents.items()
+        })
+        factory("key-cond").agent_api_chats.list_agent_chats.side_effect = RuntimeError("boom")
+
+        import thenvoi_rest
+        original = thenvoi_rest.AsyncRestClient
+        thenvoi_rest.AsyncRestClient = factory
+        try:
+            result = await kickoff.reset_stale_rooms(sample_config, tmp_path)
+        finally:
+            thenvoi_rest.AsyncRestClient = original
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_only_stale_rooms_cleared_live_untouched(
+        self, sample_config, sample_agent_config, tmp_path,
+    ):
+        """Stale rooms (participant read 404) lose all agents; live rooms are skipped."""
+        from thenvoi_rest.errors.not_found_error import NotFoundError
+
+        from codeband.orchestration import kickoff
+
+        sample_agent_config.to_yaml(tmp_path / "agent_config.yaml")
+        (tmp_path / ".codeband_room").write_text("stale-room", encoding="utf-8")
+
+        factory = _make_clients(AsyncMock(), {
+            creds.api_key: (creds.agent_id, key)
+            for key, creds in sample_agent_config.agents.items()
+        })
+
+        # Conductor client drives both the room listing and the staleness probe.
+        cond = factory("key-cond")
+        cond.agent_api_chats.list_agent_chats.return_value = FakeListResponse(
+            data=[FakeRoom("stale-room"), FakeRoom("live-room")]
+        )
+
+        def participants(chat_id):
+            if chat_id == "stale-room":
+                raise NotFoundError(body="gone")
+            return FakeListResponse(data=[])
+
+        cond.agent_api_participants.list_agent_chat_participants.side_effect = participants
+
+        import thenvoi_rest
+        original = thenvoi_rest.AsyncRestClient
+        thenvoi_rest.AsyncRestClient = factory
+        try:
+            result = await kickoff.reset_stale_rooms(sample_config, tmp_path)
+        finally:
+            thenvoi_rest.AsyncRestClient = original
+
+        assert result == ["stale-room"]
         assert not (tmp_path / ".codeband_room").exists()
 
-        # Every agent's client should have called remove_agent_chat_participant
-        # exactly once with (room_id, agent_id).
+        # Every agent left the stale room exactly once — and never the live room
+        # (assert_called_once_with proves there was no second, live-room call).
         for key, creds in sample_agent_config.agents.items():
             client = factory(creds.api_key)
             client.agent_api_participants.remove_agent_chat_participant.assert_called_once_with(
-                "stale-room-id", creds.agent_id,
+                "stale-room", creds.agent_id,
             )
-
-    @pytest.mark.asyncio
-    async def test_agent_removal_errors_are_swallowed(
-        self, sample_config, sample_agent_config, tmp_path,
-    ):
-        """Agents that can't leave the room (already removed, 404, etc.) don't abort reset."""
-        from codeband.orchestration import kickoff
-
-        sample_agent_config.to_yaml(tmp_path / "agent_config.yaml")
-        (tmp_path / ".codeband_room").write_text("ghost-room", encoding="utf-8")
-
-        factory = _make_clients(AsyncMock(), {
-            creds.api_key: (creds.agent_id, key)
-            for key, creds in sample_agent_config.agents.items()
-        })
-        # Make the conductor's removal raise; the rest should still be called
-        # and the pointer still deleted.
-        cond_client = factory("key-cond")
-        cond_client.agent_api_participants.remove_agent_chat_participant.side_effect = (
-            RuntimeError("404 Not Found")
-        )
-
-        import thenvoi_rest
-        original = thenvoi_rest.AsyncRestClient
-        thenvoi_rest.AsyncRestClient = factory
-        try:
-            result = await kickoff.reset_active_room(sample_config, tmp_path)
-        finally:
-            thenvoi_rest.AsyncRestClient = original
-
-        assert result == "ghost-room"
-        assert not (tmp_path / ".codeband_room").exists()
-        # Mergemaster removal still happened despite conductor failure
-        mm_client = factory("key-mm")
-        mm_client.agent_api_participants.remove_agent_chat_participant.assert_called_once()

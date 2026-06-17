@@ -409,23 +409,50 @@ async def _cleanup_rooms(
     await _remove_agents_from_room(prev_room_id, agent_config, config)
 
 
-async def reset_active_room(config: CodebandConfig, project_dir: Path) -> str | None:
-    """Remove all agents from the active task room and delete the pointer file.
+async def reset_stale_rooms(config: CodebandConfig, project_dir: Path) -> list[str]:
+    """Remove this deployment's agents from stale Band.ai rooms.
 
-    Returns the room id that was cleaned up, or None if there was nothing to
-    reset. Safe to call repeatedly — missing file or dead-on-Band room both
-    reduce to a no-op.
+    Lists the rooms the Conductor agent is still a member of — the same source
+    the Watchdog patrols (``agent_api_chats.list_agent_chats``) — and, for each
+    room that is *stale* (a participant read returns 404, exactly the Watchdog's
+    staleness signal), removes every agent from it. Live rooms (participant read
+    succeeds) are skipped, so concurrent Codeband task rooms are never disturbed.
+    Removal only drops participants; it never deletes a room. The
+    ``.codeband_room`` pointer is cleared too.
+
+    Best-effort: a truly phantom server-side membership may also 404 on removal
+    and keep being returned by Band.ai. Safe to call repeatedly; a listing
+    failure (offline, rate-limited) reduces to a no-op.
+
+    Returns the list of stale room ids it attempted to clear.
     """
-    room_file = project_dir / ".codeband_room"
-    try:
-        room_id = room_file.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return None
-    if not room_id:
-        room_file.unlink(missing_ok=True)
-        return None
+    from thenvoi_rest import AsyncRestClient
+    from thenvoi_rest.core.api_error import ApiError
+    from thenvoi_rest.errors.not_found_error import NotFoundError
 
     agent_config = load_agent_config(project_dir)
-    await _remove_agents_from_room(room_id, agent_config, config)
-    room_file.unlink(missing_ok=True)
-    return room_id
+    conductor = agent_config.get("conductor")
+    client = AsyncRestClient(api_key=conductor.api_key, base_url=config.band.rest_url)
+
+    try:
+        resp = await client.agent_api_chats.list_agent_chats()
+        rooms = list(resp.data or [])
+    except Exception as e:  # offline / rate-limited / API error — nothing to do
+        logger.warning("Could not list rooms during reset: %s", e)
+        rooms = []
+
+    cleared: list[str] = []
+    for room in rooms:
+        room_id = room.id
+        try:
+            await client.agent_api_participants.list_agent_chat_participants(chat_id=room_id)
+        except NotFoundError:
+            # Stale: in the agent's chat list but gone server-side. Drop agents.
+            await _remove_agents_from_room(room_id, agent_config, config)
+            cleared.append(room_id)
+        except ApiError as e:
+            # Ambiguous (rate-limit, transient) — leave the room alone.
+            logger.debug("Skipping room %s during reset — HTTP %s", room_id, e.status_code)
+
+    (project_dir / ".codeband_room").unlink(missing_ok=True)
+    return cleared

@@ -1146,22 +1146,23 @@ def down(project_dir: str, volumes: bool) -> None:
 @click.option("--dir", "project_dir", default=".", help="Project directory")
 @_project_aware
 def reset(project_dir: str) -> None:
-    """Clean up the active Band.ai task room.
+    """Clean up stale Band.ai task rooms.
 
-    Removes every agent from the room recorded in .codeband_room and deletes
-    the pointer file. Use this when the previous session left stale room
-    membership causing 404 warnings on startup.
+    Removes the agents from every room they still belong to that no longer
+    exists server-side (the stale rooms behind the 404 warnings on startup).
+    Live/active task rooms are left untouched, and rooms are never deleted —
+    only the agents leave. Also clears the .codeband_room pointer.
     """
     project = Path(project_dir).resolve()
     config = load_config(project)
 
-    from codeband.orchestration.kickoff import reset_active_room
+    from codeband.orchestration.kickoff import reset_stale_rooms
 
-    room_id = _run_async(reset_active_room(config, project))
-    if room_id is None:
-        click.echo("No active task room to reset.")
+    room_ids = _run_async(reset_stale_rooms(config, project))
+    if not room_ids:
+        click.echo("No stale rooms to reset.")
     else:
-        click.echo(f"Reset task room: {room_id}")
+        click.echo(f"Cleared agents from {len(room_ids)} stale room(s): {', '.join(room_ids)}")
 
 
 @cli.command()

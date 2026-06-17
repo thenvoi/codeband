@@ -311,14 +311,16 @@ class WatchdogDaemon:
             except NotFoundError:
                 # Room was deleted server-side but still appears in the agent's
                 # chat listing (stale Band.ai state from a prior session).
-                # Skip quietly — running `cb reset` before the next session
-                # removes the agent from the stale room. Warn once per room
-                # so the diagnostic is visible without spamming every patrol.
+                # Skip quietly — `cb reset` removes the agents from these stale
+                # rooms (it scans every room, not just the active one). Warn once
+                # per room so the diagnostic is visible without spamming every
+                # patrol.
                 if room_id not in self._warned_stale_rooms:
                     self._warned_stale_rooms.add(room_id)
                     logger.warning(
-                        "Room %s no longer exists — skipping. "
-                        "Run 'cb reset' to clean up stale session state.",
+                        "Room %s no longer exists (stale Band.ai membership from a "
+                        "prior session) — skipping. Run 'cb reset' to clear stale "
+                        "room memberships.",
                         room_id,
                     )
                 continue
