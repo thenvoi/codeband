@@ -963,6 +963,12 @@ async def run_local(
     from codeband.monitoring.activity_log import ActivityLogger
     activity = ActivityLogger(layout.state_dir / "activity.jsonl")
 
+    # Pure-observer instrument over the SDK ack path: emits MSG_ATTEMPT_WINDOW
+    # (the mark_processing→mark_processed held-open window + ack-422 flag) for
+    # diagnosing the mark-processed-422 cursor-pin. Idempotent, best-effort.
+    from codeband.monitoring.attempt_window import install_attempt_window_instrument
+    install_attempt_window_instrument(activity)
+
     # Attach SDK usage tracking — tag log records with agent names
     # based on which asyncio task emitted them.
     from codeband.monitoring.usage import AgentTaskFilter, SDKUsageHandler
@@ -1317,6 +1323,11 @@ async def run_agent(config: CodebandConfig, project_dir: Path, agent_key: str) -
 
     from codeband.monitoring.activity_log import ActivityLogger
     activity = ActivityLogger(layout.state_dir / "activity.jsonl")
+
+    # Pure-observer SDK ack-path instrument (MSG_ATTEMPT_WINDOW). See the local
+    # `run` path above; idempotent, so installing from both is safe.
+    from codeband.monitoring.attempt_window import install_attempt_window_instrument
+    install_attempt_window_instrument(activity)
 
     from codeband.monitoring.usage import SDKUsageHandler
 
