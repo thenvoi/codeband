@@ -74,6 +74,53 @@ class TestCheckClaudeAuth:
         assert "billing" in err.remediation.lower()
 
     @pytest.mark.asyncio
+    async def test_detects_thinking_unsupported_model(self):
+        """The real silent-zombie cause: a stale bundled CLI sends legacy
+        thinking.type.enabled, the model 400s, and the adapter swallows it.
+        Preflight must catch it and point at `claude-agent-sdk`."""
+        from codeband.preflight import check_claude_auth
+
+        # Shape of what one_shot_text surfaces from a ResultMessage.is_error turn.
+        errored = (
+            "result is_error subtype=error_during_execution result='API Error: 400 "
+            '{"type":"error","error":{"type":"invalid_request_error","message":'
+            "\"thinking.type.enabled is not supported for this model. Use "
+            "thinking.type.adaptive\"}}'"
+        )
+        with patch(
+            "codeband.utility_llm.one_shot_text",
+            AsyncMock(return_value=errored),
+        ):
+            err = await check_claude_auth(model="claude-opus-4-7")
+        assert err is not None
+        assert err.classified
+        assert "claude-agent-sdk" in err.remediation
+        assert "claude-opus-4-7" in err.summary
+
+    @pytest.mark.asyncio
+    async def test_detects_invalid_request_error(self):
+        from codeband.preflight import check_claude_auth
+
+        with patch(
+            "codeband.utility_llm.one_shot_text",
+            AsyncMock(return_value="result is_error result='invalid_request_error: bad'"),
+        ):
+            err = await check_claude_auth()
+        assert err is not None
+        assert err.classified
+        assert "claude-agent-sdk" in err.remediation
+
+    @pytest.mark.asyncio
+    async def test_probe_uses_configured_model(self):
+        """The probe must exercise the configured model, not a hardcoded one."""
+        from codeband.preflight import check_claude_auth
+
+        probe = AsyncMock(return_value="ok")
+        with patch("codeband.utility_llm.one_shot_text", probe):
+            await check_claude_auth(model="claude-opus-4-7")
+        assert probe.await_args.kwargs.get("model") == "claude-opus-4-7"
+
+    @pytest.mark.asyncio
     async def test_detects_invalid_api_key(self):
         from codeband.preflight import check_claude_auth
 
@@ -496,6 +543,26 @@ class TestRunPreflight:
             result = await run_preflight(mixed_config)
 
         assert result is codex_err
+
+    @pytest.mark.asyncio
+    async def test_probes_each_distinct_claude_model(self, claude_only_config):
+        """Every distinct configured Claude model is probed — so a model that
+        rejects the request shape (the opus coder) is caught even when the others
+        (sonnet) pass. The default pool puts Opus on coders, Sonnet elsewhere."""
+        from codeband.models import CLAUDE_OPUS, CLAUDE_SONNET
+        from codeband.preflight import run_preflight
+
+        seen_models: list[str] = []
+
+        async def record(_auth_mode, model):
+            seen_models.append(model)
+            return None
+
+        with patch("codeband.preflight.check_claude_auth", side_effect=record):
+            result = await run_preflight(claude_only_config)
+
+        assert result is None
+        assert set(seen_models) == {CLAUDE_OPUS, CLAUDE_SONNET}
 
 
 class TestRunCodexProbe:

@@ -25,6 +25,7 @@ from codeband.doctor import (
     Status,
     check_agent_config_yaml,
     check_band_api_key,
+    check_bundled_claude_cli,
     check_claude_auth,
     check_claude_cli,
     check_codeband_yaml,
@@ -80,6 +81,58 @@ def _make_config(tmp_path: Path, *, use_codex: bool = False) -> CodebandConfig:
 
 
 # ─── individual checks ───────────────────────────────────────────────────────
+
+class TestBundledClaudeCli:
+    """Claude agents use the CLI bundled in claude_agent_sdk, not system `claude`.
+    A stale bundled CLI sends request shapes current models reject (400, swallowed
+    by the adapter → silent zombie agent)."""
+
+    @staticmethod
+    def _ctx() -> Context:
+        return Context(project_dir=Path.cwd(), config=None)
+
+    def test_warns_when_bundled_older_than_system(self, monkeypatch, tmp_path):
+        fake = tmp_path / "claude"
+        fake.write_text("")
+        monkeypatch.setattr("codeband.doctor._bundled_claude_cli_path", lambda: fake)
+        monkeypatch.setattr("codeband.doctor.shutil.which", lambda _name: "/usr/bin/claude")
+
+        def ver(command):
+            return (
+                "2.1.81 (Claude Code)"
+                if str(fake) in command[0]
+                else "2.1.179 (Claude Code)"
+            )
+
+        monkeypatch.setattr("codeband.doctor._claude_cli_version", ver)
+        result = check_bundled_claude_cli(self._ctx())
+        assert result.status == Status.WARN
+        assert "claude-agent-sdk" in result.remediation
+
+    def test_ok_when_bundled_current(self, monkeypatch, tmp_path):
+        fake = tmp_path / "claude"
+        fake.write_text("")
+        monkeypatch.setattr("codeband.doctor._bundled_claude_cli_path", lambda: fake)
+        monkeypatch.setattr("codeband.doctor.shutil.which", lambda _name: "/usr/bin/claude")
+        monkeypatch.setattr(
+            "codeband.doctor._claude_cli_version",
+            lambda _command: "2.1.179 (Claude Code)",
+        )
+        result = check_bundled_claude_cli(self._ctx())
+        assert result.status == Status.OK
+
+    def test_info_when_no_bundled_cli(self, monkeypatch):
+        monkeypatch.setattr("codeband.doctor._bundled_claude_cli_path", lambda: None)
+        result = check_bundled_claude_cli(self._ctx())
+        assert result.status == Status.INFO
+
+    def test_version_tuple_parsing(self):
+        from codeband.doctor import _cli_version_tuple
+
+        assert _cli_version_tuple("2.1.81 (Claude Code)") == (2, 1, 81)
+        assert _cli_version_tuple("2.1.179 (Claude Code)") == (2, 1, 179)
+        assert _cli_version_tuple("") == ()
+
 
 class TestClaudeAuth:
     @pytest.fixture(autouse=True)

@@ -139,6 +139,76 @@ def check_claude_cli(_ctx: Context) -> CheckResult:
         )
 
 
+def _cli_version_tuple(version_str: str) -> tuple[int, ...]:
+    """Parse a leading dotted version (e.g. '2.1.81 (Claude Code)') into a tuple."""
+    import re
+
+    match = re.match(r"\s*(\d+(?:\.\d+)*)", version_str or "")
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def _claude_cli_version(command: list[str]) -> str | None:
+    """Return the `--version` string for a Claude Code CLI binary, or None."""
+    try:
+        out = subprocess.run(
+            [*command, "--version"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
+
+
+def _bundled_claude_cli_path() -> Path | None:
+    """Path to the Claude Code CLI bundled inside claude_agent_sdk, if present."""
+    try:
+        import claude_agent_sdk
+    except Exception:
+        return None
+    candidate = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
+    return candidate if candidate.exists() else None
+
+
+def check_bundled_claude_cli(_ctx: Context) -> CheckResult:
+    """The Claude SDK shells out to a CLI *bundled* inside `claude_agent_sdk`, not
+    the system `claude`. A stale bundled CLI sends outdated request shapes — e.g.
+    the legacy `thinking.type.enabled` extended-thinking block — that current models
+    reject with a 400. The adapter swallows that error and emits nothing, so the
+    agent connects to its room but silently does no work. Warn when the bundled CLI
+    is older than the system CLI."""
+    bundled = _bundled_claude_cli_path()
+    if bundled is None:
+        return CheckResult(
+            Status.INFO,
+            "No bundled Claude Code CLI (claude_agent_sdk absent or uses system claude)",
+        )
+    bundled_ver = _claude_cli_version([str(bundled)])
+    if bundled_ver is None:
+        return CheckResult(
+            Status.WARN,
+            f"bundled Claude Code CLI present but `--version` failed ({bundled})",
+            remediation="Reinstall the SDK: pip install -U claude-agent-sdk",
+        )
+    system_path = shutil.which("claude")
+    system_ver = _claude_cli_version([system_path]) if system_path else None
+    if system_ver and _cli_version_tuple(system_ver) > _cli_version_tuple(bundled_ver):
+        return CheckResult(
+            Status.WARN,
+            f"bundled Claude Code CLI ({bundled_ver}) is older than the system CLI "
+            f"({system_ver})",
+            remediation=(
+                "Claude agents use the bundled CLI, not the system one. A stale bundled "
+                "CLI sends outdated request shapes that current models reject with a 400 "
+                "(e.g. legacy thinking.type.enabled), which the adapter swallows — the "
+                "agent connects but silently does nothing. Update: "
+                "pip install -U claude-agent-sdk"
+            ),
+        )
+    return CheckResult(Status.OK, f"bundled Claude Code CLI {bundled_ver}")
+
+
 def check_codex_cli(_ctx: Context) -> CheckResult:
     """Gated by `_needs_codex` — only runs when any agent uses Codex."""
     path = shutil.which("codex")
@@ -588,6 +658,7 @@ _CHECKS: list[Check] = [
     Check("Codex auth", "Environment", check_codex_auth, applies_when=_needs_codex),
     Check("git", "Tools", check_git),
     Check("claude CLI", "Tools", check_claude_cli),
+    Check("Bundled Claude CLI", "Tools", check_bundled_claude_cli),
     Check("codex CLI", "Tools", check_codex_cli, applies_when=_needs_codex),
     Check("gh CLI", "Tools", check_gh),
     Check("gh authenticated", "Tools", check_gh_auth),
