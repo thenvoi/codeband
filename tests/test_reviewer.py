@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gc
 import os
+import weakref
 from pathlib import Path
 
 from codeband.config import (
@@ -168,6 +170,41 @@ class TestRunnerPermissions:
         assert Path(config.cwd).name.startswith("codeband-conductor-")
         assert config.sandbox == "read-only"
         assert config.approval_policy == "never"
+
+    def test_codex_conductor_adapter_retains_scratch_cwd_after_runner_gc(self):
+        """The adapter path must keep the TemporaryDirectory owner alive."""
+        from codeband.agents.conductor import CodexConductorRunner
+
+        runner = CodexConductorRunner()
+        adapter = runner.adapter
+        scratch_owner_ref = weakref.ref(runner._scratch_dir)
+        runner_ref = weakref.ref(runner)
+        scratch_path = Path(adapter.config.cwd)
+
+        del runner
+        gc.collect()
+
+        assert runner_ref() is None
+        assert scratch_owner_ref() is not None
+        assert getattr(adapter, "_codeband_scratch_dir") is scratch_owner_ref()
+        assert scratch_path.is_dir()
+        assert adapter.config.cwd == str(scratch_path)
+
+    def test_codex_conductor_scratch_cwd_cleans_up_with_adapter(self):
+        """Extending the scratch lifetime to the adapter must not leak it."""
+        from codeband.agents.conductor import CodexConductorRunner
+
+        adapter = CodexConductorRunner().adapter
+        scratch_owner_ref = weakref.ref(getattr(adapter, "_codeband_scratch_dir"))
+        scratch_path = Path(adapter.config.cwd)
+
+        assert scratch_path.is_dir()
+
+        del adapter
+        gc.collect()
+
+        assert scratch_owner_ref() is None
+        assert not scratch_path.exists()
 
     def test_codex_player_uses_full_access_sandbox(self, tmp_path: Path):
         """Codex coder needs full access for git operations and network."""

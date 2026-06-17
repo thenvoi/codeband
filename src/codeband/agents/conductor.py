@@ -140,6 +140,10 @@ class CodexConductorRunner:
                 emit={Emit.EXECUTION, Emit.TASK_EVENTS},
             ),
         )
+        # Callers hand only this adapter to Agent.create(), so this runner can
+        # be collected before Codex starts. Keep the TemporaryDirectory owner
+        # attached to the adapter for as long as its cwd is in use.
+        self._adapter._codeband_scratch_dir = self._scratch_dir
 
     @property
     def adapter(self):
