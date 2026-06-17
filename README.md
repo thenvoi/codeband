@@ -1,7 +1,7 @@
 # Codeband
 
 <p align="center">
-  <img src="img/codeband-image.png" alt="Codeband" width="1280">
+  <img src="https://raw.githubusercontent.com/thenvoi/codeband/main/img/codeband-image.png" alt="Codeband" width="1280">
 </p>
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
