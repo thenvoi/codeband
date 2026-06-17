@@ -509,6 +509,95 @@ def _conductor_rest_client(ctx: Context):
     )
 
 
+def _human_rest_client(ctx: Context):
+    """Return a human-scope REST client, or a CheckResult to short-circuit."""
+    if ctx.config is None:
+        return CheckResult(Status.SKIP, "codeband.yaml not loaded")
+    api_key = os.environ.get("BAND_API_KEY")
+    if not api_key:
+        return CheckResult(
+            Status.WARN,
+            "Could not verify platform agents — BAND_API_KEY is not set",
+            remediation="Set BAND_API_KEY and rerun `cb doctor`, or run `cb setup-agents`.",
+        )
+    try:
+        from thenvoi_rest import AsyncRestClient
+    except ImportError as exc:
+        return CheckResult(Status.FAIL, f"thenvoi_rest not importable: {exc}")
+    return AsyncRestClient(api_key=api_key, base_url=ctx.config.band.rest_url)
+
+
+async def check_agent_platform_existence(ctx: Context) -> CheckResult:
+    """Confirm configured agent IDs still exist on Band.ai.
+
+    ``check_agent_config_yaml`` verifies local shape/count. This networked check
+    verifies that the persisted agent IDs still resolve platform-side, catching
+    deleted agents before the swarm starts with dead credentials.
+    """
+    if ctx.config is None or ctx.agent_config is None:
+        return CheckResult(Status.SKIP, "codeband.yaml or agent_config.yaml not loaded")
+    if ctx.agent_config_error:
+        return CheckResult(Status.SKIP, "agent_config.yaml failed to parse")
+
+    client = _human_rest_client(ctx)
+    if isinstance(client, CheckResult):
+        return client
+
+    try:
+        platform_response = await asyncio.wait_for(
+            client.human_api_agents.list_my_agents(), timeout=5,
+        )
+    except asyncio.TimeoutError:
+        return CheckResult(
+            Status.WARN,
+            f"Could not verify platform agents — Band.ai REST at {ctx.config.band.rest_url} "
+            "timed out after 5s",
+            remediation="Check network or band.rest_url in codeband.yaml, then rerun `cb doctor`.",
+        )
+    except Exception as exc:
+        return CheckResult(
+            Status.WARN,
+            "Could not verify platform agents — "
+            f"{type(exc).__name__}: {exc}",
+            remediation=(
+                "Check BAND_API_KEY, network, and band.rest_url in codeband.yaml, "
+                "then rerun `cb doctor`."
+            ),
+        )
+
+    from codeband.orchestration.setup import _expected_agents
+
+    expected = _expected_agents(ctx.config)
+    platform_by_id = {
+        agent.id: agent
+        for agent in (platform_response.data or [])
+        if getattr(agent, "id", None)
+    }
+    missing: list[str] = []
+    for key, creds in ctx.agent_config.agents.items():
+        if creds.agent_id in platform_by_id:
+            continue
+        display_name = expected.get(key, (None, ""))[0]
+        label = (
+            f"{key} ({display_name}, id {creds.agent_id})"
+            if display_name
+            else f"{key} (id {creds.agent_id})"
+        )
+        missing.append(label)
+
+    if missing:
+        return CheckResult(
+            Status.FAIL,
+            f"Band.ai missing/deleted {len(missing)} configured agent(s): "
+            + ", ".join(sorted(missing)),
+            remediation="Run: cb setup-agents",
+        )
+    return CheckResult(
+        Status.OK,
+        f"Band.ai platform agents OK — {len(ctx.agent_config.agents)} configured IDs exist",
+    )
+
+
 async def check_band_rest(ctx: Context) -> CheckResult:
     client = _conductor_rest_client(ctx)
     if isinstance(client, CheckResult):
@@ -706,6 +795,7 @@ _CHECKS: list[Check] = [
     Check("gh authenticated", "Tools", check_gh_auth),
     Check("codeband.yaml", "Config", check_codeband_yaml),
     Check("agent_config.yaml", "Config", check_agent_config_yaml),
+    Check("Band.ai platform agents", "Config", check_agent_platform_existence),
     Check("Workspace writable", "Config", check_workspace_writable),
     Check("Cross-model pairing", "Config", check_cross_model_pairing),
     Check("Verifier pairing", "Config", check_verifier_pairing),
