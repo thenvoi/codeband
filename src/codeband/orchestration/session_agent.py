@@ -144,7 +144,7 @@ async def register_session_agent(
     credentials = response.data.credentials
     agent_id = agent.id
     api_key = credentials.api_key
-    logger.info("Registered session agent %s (%s)", name, agent_id)
+    logger.warning("Registered session agent %s (%s)", name, agent_id)
 
     try:
         write_heartbeat(

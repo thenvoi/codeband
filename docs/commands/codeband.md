@@ -96,6 +96,7 @@ if [ -n "$REPO_URL" ]; then
     sed -i '' -E "s|^  branch:.*|  branch: $BRANCH|" "$CB_HOME/codeband.yaml"
   else
     echo "Target unchanged ($REPO_URL @ $BRANCH) — reusing existing workspace."
+    ( cd "$CB_HOME" && codeband reset --dir . --clear-state-rooms >/dev/null 2>&1 || true )
   fi
 fi
 

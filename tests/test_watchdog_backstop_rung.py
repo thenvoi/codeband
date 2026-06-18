@@ -36,6 +36,7 @@ APPROVED_SHA = "abc1234"
 def store(tmp_path: Path) -> StateStore:
     s = StateStore(tmp_path / "state" / "orchestration.db")
     s.create_task(TASK_ID, "backstop test task", ROOM_ID, owner_id="owner-1")
+    (s.db_path.parent / ".codeband_room").write_text(ROOM_ID, encoding="utf-8")
     s.ensure_subtask(SUBTASK_ID, TASK_ID, state="in_progress")
     return s
 

@@ -26,6 +26,10 @@ BASELINE_PR_TS = "2026-05-31T00:00:00+00:00"
 
 # ── seeding helpers ─────────────────────────────────────────────────────────
 
+def _write_room_pointer(store, room_id: str = ROOM_ID) -> None:
+    (store.db_path.parent / ".codeband_room").write_text(room_id, encoding="utf-8")
+
+
 def _seed_store(
     tmp_path,
     *,
@@ -38,6 +42,7 @@ def _seed_store(
 
     store = StateStore(tmp_path / "state" / "orchestration.db")
     store.create_task(TASK_ID, "demo task", ROOM_ID)
+    _write_room_pointer(store)
     metadata = {"branch": branch} if branch is not None else None
     store.ensure_subtask(SUBTASK_ID, TASK_ID, state=state, metadata=metadata)
     if pr_number is not None:
@@ -1753,6 +1758,7 @@ def _seed_stall_blocked(tmp_path, *, assigned_worker: str | None = None,
 
     store = StateStore(tmp_path / "state" / "orchestration.db")
     store.create_task(TASK_ID, "demo task", ROOM_ID, owner_id=owner_id)
+    _write_room_pointer(store)
     store.ensure_subtask(
         SUBTASK_ID, TASK_ID,
         state="in_progress",
@@ -1822,6 +1828,7 @@ def _seed_merge_pending(tmp_path, *, approved_sha: str, owner_id: str = "owner-1
 
     store = StateStore(tmp_path / "state" / "orchestration.db")
     store.create_task(TASK_ID, "demo task", ROOM_ID, owner_id=owner_id)
+    _write_room_pointer(store)
     store.ensure_subtask(
         SUBTASK_ID, TASK_ID,
         state="in_progress",

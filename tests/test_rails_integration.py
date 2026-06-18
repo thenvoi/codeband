@@ -149,7 +149,9 @@ def _branch_head(repo: Path, branch: str) -> str:
 
 
 def _new_store(tmp_path: Path) -> StateStore:
-    return StateStore(tmp_path / "state" / "orchestration.db")
+    store = StateStore(tmp_path / "state" / "orchestration.db")
+    (store.db_path.parent / ".codeband_room").write_text("room-1", encoding="utf-8")
+    return store
 
 
 def _log_rows(store: StateStore, subtask_id: str) -> list[sqlite3.Row]:
@@ -1083,6 +1085,7 @@ class TestVerifyAttemptCap:
         # authoritative task_id (room UUID) from it, not from --task.
         (project_dir / ".codeband_room").write_text("room-1", encoding="utf-8")
         store = StateStore(workspace / "state" / "orchestration.db")
+        (store.db_path.parent / ".codeband_room").write_text("room-1", encoding="utf-8")
         store.create_task("room-1", "demo", "room-1")
         return project_dir, store
 

@@ -164,6 +164,10 @@ def _mock_rest():
     return rest
 
 
+def _write_room_pointer(store: StateStore, room_id: str) -> None:
+    (store.db_path.parent / ".codeband_room").write_text(room_id, encoding="utf-8")
+
+
 @pytest.mark.asyncio
 async def test_blocked_st1_in_two_tasks_escalates_once_per_task(store):
     """Blocked st-1 in task A and blocked st-1 in task B → exactly two owner
@@ -204,8 +208,11 @@ async def test_blocked_st1_in_two_tasks_escalates_once_per_task(store):
 
 @pytest.mark.asyncio
 async def test_progress_tracking_keyed_per_task(store, monkeypatch):
-    """The mechanical-progress health map tracks each task's st-1 separately —
-    progress on task A's st-1 must not reset task B's stall counter.
+    """The mechanical-progress health map remains task-scoped across current tasks.
+
+    The watchdog now patrols only the task named by the room pointer, but the
+    remembered health map still keys by ``(task_id, subtask_id)``. Progress on
+    task A's st-1 must not reset task B's remembered stall counter.
     """
     import subprocess as _subprocess
 
@@ -229,14 +236,20 @@ async def test_progress_tracking_keyed_per_task(store, monkeypatch):
     )
 
     now = datetime.now(UTC)
-    await daemon._check_subtask_progress(now)  # baseline → both at 1 (no signals)
-    await daemon._check_subtask_progress(now)  # both at 2
+    _write_room_pointer(store, TASK_A)
+    await daemon._check_subtask_progress(now)  # task A baseline → 1 (no signals)
+    await daemon._check_subtask_progress(now)  # task A → 2
+
+    _write_room_pointer(store, TASK_B)
+    await daemon._check_subtask_progress(now)  # task B baseline → 1
+    await daemon._check_subtask_progress(now)  # task B → 2
 
     # Progress on task A's st-1 only (a new transition_log row for TASK_A).
     transition("st-1", TASK_A, "verify_pending", caller_role="coder", store=store)
+    _write_room_pointer(store, TASK_A)
     await daemon._check_subtask_progress(now)
 
     health_a = daemon._subtask_state[(TASK_A, "st-1")]
     health_b = daemon._subtask_state[(TASK_B, "st-1")]
     assert health_a.patrol_visits_without_progress == 0  # reset by progress
-    assert health_b.patrol_visits_without_progress == 3  # still stalling
+    assert health_b.patrol_visits_without_progress == 2  # untouched by task A

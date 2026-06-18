@@ -10,6 +10,7 @@ import re
 import sqlite3
 import subprocess
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from codeband.config import WatchdogConfig
@@ -818,6 +819,37 @@ class WatchdogDaemon:
             return None
         return {task_id for task_id, _, status, _ in rows if status == "active"}
 
+    def _current_task_id_from_pointer(self) -> str | None:
+        """Return the active task named by the room pointer, or ``None``."""
+        from codeband.state.registration import read_room_pointer
+
+        db_path = getattr(self._store, "db_path", None)
+        if db_path is None:
+            logger.warning("Watchdog skipping subtask nudges: state store path is unavailable.")
+            return None
+        current_room_id = read_room_pointer(
+            Path.cwd(), Path(db_path).parent, warn_legacy=False,
+        )
+        if current_room_id is None:
+            logger.warning("Watchdog skipping subtask nudges: no active room pointer found.")
+            return None
+        rows = self._task_rows()
+        if rows is None:
+            logger.warning(
+                "Watchdog skipping subtask nudges: could not resolve current task "
+                "for room %s.",
+                current_room_id,
+            )
+            return None
+        for task_id, room_id, status, _ in rows:
+            if room_id == current_room_id and status == "active":
+                return task_id
+        logger.warning(
+            "Watchdog skipping subtask nudges: active room %s has no active task row.",
+            current_room_id,
+        )
+        return None
+
     async def _attempt_escalation_send(
         self, send: Any, *, target: str, room_id: str,
     ) -> bool:
@@ -877,19 +909,27 @@ class WatchdogDaemon:
         if self._store is None or not self._config.git_progress_check:
             return
 
+        current_task_id = await asyncio.to_thread(self._current_task_id_from_pointer)
+        if current_task_id is None:
+            return
+
         try:
             subtasks = await asyncio.to_thread(self._store.list_active_subtasks)
         except Exception:
             logger.debug("Watchdog could not list subtasks from store", exc_info=True)
             return
 
-        active_task_ids = await asyncio.to_thread(self._active_task_ids)
-
         patrolled = [
             sub for sub in subtasks
-            if (active_task_ids is None or sub.task_id in active_task_ids)
-            and sub.state in _PATROLLED_SUBTASK_STATES
+            if sub.task_id == current_task_id and sub.state in _PATROLLED_SUBTASK_STATES
         ]
+        for sub in subtasks:
+            if sub.task_id != current_task_id:
+                logger.warning(
+                    "Watchdog skipping subtask %s: belongs to task %s, current task is %s — "
+                    "stale state.",
+                    sub.subtask_id, sub.task_id, current_task_id,
+                )
 
         # Batch-fetch latest transition timestamps for all patrolled subtasks in
         # one query (N+1 elimination). On success, fill None for subtasks with
