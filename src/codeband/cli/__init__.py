@@ -218,6 +218,21 @@ def _resolve_codex_auth() -> None:
         del os.environ["OPENAI_API_KEY"]
 
 
+def _clear_auth_fallbacks() -> None:
+    """Remove CODEBAND_FALLBACK_* keys from the process environment.
+
+    The fallback keys are set by ``_resolve_claude_auth`` /
+    ``_resolve_codex_auth`` so preflight can restore the original API key if
+    the subscription path exhausts during the check.  Once preflight completes
+    (or is skipped), the fallbacks serve no purpose — but they *are* still in
+    ``os.environ``, so every subprocess the SDK spawns (Codex CLI, bash tool
+    calls from agents with shell access) inherits them.  Clearing here ensures
+    the raw API-key value cannot be read by child processes.
+    """
+    os.environ.pop("CODEBAND_FALLBACK_ANTHROPIC_API_KEY", None)
+    os.environ.pop("CODEBAND_FALLBACK_OPENAI_API_KEY", None)
+
+
 @click.group(invoke_without_command=True)
 @click.option(
     "--dir", "project_dir", default=".",
@@ -504,6 +519,12 @@ def run(
             if err.classified:
                 raise click.ClickException(err.remediation)
             raise click.ClickException(f"{err.summary}\n\n{err.remediation}")
+
+    # Fallback keys (CODEBAND_FALLBACK_ANTHROPIC_API_KEY /
+    # CODEBAND_FALLBACK_OPENAI_API_KEY) are only needed during preflight.
+    # Remove them before spawning agent children so they don't inherit the
+    # raw API-key values via the subprocess environment.
+    _clear_auth_fallbacks()
 
     if agent:
         if fresh:

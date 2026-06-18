@@ -617,6 +617,69 @@ class TestSendTaskRegistration:
 
         assert events == ["register", "message"]
 
+    @pytest.mark.asyncio
+    async def test_workspace_env_var_wins_over_config_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """$WORKSPACE overrides relative workspace.path for the StateStore location.
+
+        send_task() must route through resolve_workspace_path() (the ONE shared
+        rule) so that Docker containers with $WORKSPACE=/workspace write the task
+        row and pointer to the shared volume, not to a project-relative shadow.
+        """
+        import os
+
+        import thenvoi_rest
+
+        from codeband.config import (
+            AgentsConfig,
+            CodebandConfig,
+            RepoConfig,
+            WorkspaceConfig,
+        )
+        from codeband.orchestration import kickoff
+
+        workspace_dir = tmp_path / "custom_workspace"
+        workspace_dir.mkdir()
+        monkeypatch.setenv("WORKSPACE", str(workspace_dir))
+
+        config = CodebandConfig(
+            repo=RepoConfig(url="https://github.com/example/repo.git", branch="main"),
+            agents=AgentsConfig(handoff_verify_command="true"),
+            workspace=WorkspaceConfig(path=".codeband"),
+        )
+        config.to_yaml(tmp_path / "codeband.yaml")
+
+        # Minimal agent_config (just the conductor key send_task resolves)
+        from codeband.config import AgentCredentials, AgentConfigFile
+        agent_cfg = AgentConfigFile(agents={
+            "conductor": AgentCredentials(agent_id="cond-0", api_key="key-conductor"),
+        })
+        agent_cfg.to_yaml(tmp_path / "agent_config.yaml")
+
+        human_client = _make_human_client("room-workspace-test")
+        factory = _make_client_factory(human_client)
+
+        with patch.dict(os.environ, {"BAND_API_KEY": "human-key"}):
+            original = thenvoi_rest.AsyncRestClient
+            thenvoi_rest.AsyncRestClient = factory
+            try:
+                await kickoff.send_task(config, tmp_path, "workspace env test task")
+            finally:
+                thenvoi_rest.AsyncRestClient = original
+
+        # DB must be written under $WORKSPACE, not under project_dir/.codeband/
+        ws_db = workspace_dir / ".codeband" / "state" / "orchestration.db"
+        assert ws_db.exists(), f"Expected DB at {ws_db}"
+        task = StateStore(ws_db).get_task("room-workspace-test")
+        assert task is not None
+
+        # Shadow path (project-relative) must be absent.
+        shadow_db = tmp_path / ".codeband" / "state" / "orchestration.db"
+        assert not shadow_db.exists(), (
+            f"Shadow DB found at {shadow_db} — send_task() ignored $WORKSPACE"
+        )
+
 
 # ---------------------------------------------------------------------------
 # cb register-task — thin CLI wrapper

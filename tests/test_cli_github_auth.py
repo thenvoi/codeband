@@ -8,6 +8,7 @@ from unittest.mock import patch
 from click.testing import CliRunner
 
 from codeband.cli import (
+    _clear_auth_fallbacks,
     _detect_codex_auth,
     _detect_github_auth,
     _has_codex_subscription_auth,
@@ -419,3 +420,142 @@ class TestDetectCodexAuth:
             _detect_codex_auth(env)
 
         assert env["CODEX_HOME"] == str(tmp_path / ".codex")
+
+
+class TestClearAuthFallbacks:
+    """CODEBAND_FALLBACK_* keys must be absent from os.environ before agents start.
+
+    Child processes (Codex CLI subprocess, bash tool calls from agents with
+    shell access) inherit os.environ.  If the fallback keys survive past
+    preflight they carry the raw API-key value into every spawned process.
+    _clear_auth_fallbacks() is called in `cb run` immediately before the first
+    agent is spawned, so this boundary is tested here.
+    """
+
+    def test_clears_both_fallback_keys(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CODEBAND_FALLBACK_ANTHROPIC_API_KEY": "sk-ant-secret",
+                "CODEBAND_FALLBACK_OPENAI_API_KEY": "sk-openai-secret",
+            },
+            clear=False,
+        ):
+            _clear_auth_fallbacks()
+            assert "CODEBAND_FALLBACK_ANTHROPIC_API_KEY" not in os.environ
+            assert "CODEBAND_FALLBACK_OPENAI_API_KEY" not in os.environ
+
+    def test_noop_when_no_fallbacks_present(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CODEBAND_FALLBACK_ANTHROPIC_API_KEY", None)
+            os.environ.pop("CODEBAND_FALLBACK_OPENAI_API_KEY", None)
+            _clear_auth_fallbacks()  # must not raise
+
+    def test_child_process_does_not_inherit_fallback_key(self):
+        """Simulate the boundary: fallback set, then cleared, then subprocess spawned.
+
+        Uses a real subprocess to verify the env variable is absent in the
+        child, which is the actual security boundary (not just os.environ state).
+        """
+        import subprocess
+        import sys
+
+        with patch.dict(
+            os.environ,
+            {"CODEBAND_FALLBACK_ANTHROPIC_API_KEY": "sk-ant-should-not-leak"},
+            clear=False,
+        ):
+            _clear_auth_fallbacks()
+            # Spawn a subprocess that prints the value of the env var (empty if absent).
+            result = subprocess.run(
+                [sys.executable, "-c",
+                 "import os, sys; "
+                 "sys.stdout.write(os.environ.get('CODEBAND_FALLBACK_ANTHROPIC_API_KEY', ''))"],
+                capture_output=True,
+                text=True,
+            )
+        assert result.stdout == "", (
+            f"Child process inherited CODEBAND_FALLBACK_ANTHROPIC_API_KEY: {result.stdout!r}"
+        )
+
+    def test_resolve_then_clear_leaves_no_fallback_in_subprocess(self):
+        """Full resolve→clear→spawn path: raw API key must not reach child."""
+        import subprocess
+        import sys
+
+        env_patch = {
+            "ANTHROPIC_API_KEY": "sk-ant-test-secret",
+            "CLAUDE_CODE_OAUTH_TOKEN": "oauth-tok",
+        }
+        with patch.dict(os.environ, env_patch, clear=False), patch(
+            "codeband.cli._has_claude_subscription_oauth", return_value=False,
+        ):
+            _resolve_claude_auth()
+            # Fallback is now set in os.environ.
+            assert "CODEBAND_FALLBACK_ANTHROPIC_API_KEY" in os.environ
+            _clear_auth_fallbacks()
+            # Fallback is gone; spawn a real child to confirm.
+            result = subprocess.run(
+                [sys.executable, "-c",
+                 "import os, sys; "
+                 "sys.stdout.write(os.environ.get('CODEBAND_FALLBACK_ANTHROPIC_API_KEY', ''))"],
+                capture_output=True,
+                text=True,
+            )
+        assert result.stdout == "", (
+            f"Child process inherited CODEBAND_FALLBACK_ANTHROPIC_API_KEY "
+            f"after _clear_auth_fallbacks(): {result.stdout!r}"
+        )
+
+
+class TestDockerEntrypointPrecedence:
+    """docker/entrypoint.sh must implement subscription-first auth (matching cb run).
+
+    When both OPENAI_API_KEY and a ChatGPT subscription auth.json are present,
+    the entrypoint must prefer the subscription — mirroring _resolve_codex_auth()
+    in cli/__init__.py — to avoid silently burning API credits in Docker.
+
+    These tests parse the entrypoint script to assert the condition order rather
+    than executing Docker, following the same meta-test pattern as
+    test_dependency_pins.py and test_prompt_invariants.py.
+    """
+
+    @staticmethod
+    def _entrypoint_text() -> str:
+        from pathlib import Path
+        entrypoint = Path(__file__).parent.parent / "docker" / "entrypoint.sh"
+        return entrypoint.read_text(encoding="utf-8")
+
+    def test_chatgpt_subscription_check_precedes_openai_api_key_check(self):
+        """Subscription branch must appear BEFORE the OPENAI_API_KEY branch."""
+        text = self._entrypoint_text()
+        # Find the line positions of the two sentinel strings.
+        sub_pos = text.find('"auth_mode": *"ChatGPT"')
+        key_pos = text.find('OPENAI_API_KEY (API key')
+        assert sub_pos != -1, "ChatGPT subscription sentinel not found in entrypoint.sh"
+        assert key_pos != -1, "OPENAI_API_KEY sentinel not found in entrypoint.sh"
+        assert sub_pos < key_pos, (
+            "entrypoint.sh checks OPENAI_API_KEY before ChatGPT subscription — "
+            "this contradicts cb run's subscription-first policy and can silently "
+            "burn API credits when both credentials exist in Docker."
+        )
+
+    def test_subscription_branch_does_not_invoke_codex_login(self):
+        """The ChatGPT subscription branch must NOT run `codex login --with-api-key`.
+
+        Running codex login in the subscription branch would overwrite the auth
+        file with an API key, defeating subscription-first.
+        """
+        text = self._entrypoint_text()
+        lines = text.splitlines()
+        in_sub_branch = False
+        for line in lines:
+            if '"auth_mode": *"ChatGPT"' in line:
+                in_sub_branch = True
+            if in_sub_branch:
+                # The subscription branch ends at the next elif/else/fi.
+                if line.strip().startswith(("elif", "else", "fi")) and '"auth_mode"' not in line:
+                    break
+                assert "codex login --with-api-key" not in line, (
+                    f"ChatGPT subscription branch invokes 'codex login --with-api-key': {line!r}"
+                )

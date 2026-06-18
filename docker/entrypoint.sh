@@ -206,11 +206,14 @@ if [ "${USES_CODEX}" = "1" ]; then
         cp "${HOST_CODEX_AUTH}" "${CODEX_HOME}/auth.json"
     fi
     CODEX_AUTH_FILE="${CODEX_HOME}/auth.json"
-    if [ -n "${OPENAI_API_KEY:-}" ]; then
+    # Subscription-first: mirror cb run's _resolve_codex_auth() policy.
+    # If both OPENAI_API_KEY and a ChatGPT subscription auth are present,
+    # prefer the subscription to avoid silently burning API credits.
+    if [ -f "${CODEX_AUTH_FILE}" ] && grep -q '"auth_mode": *"ChatGPT"' "${CODEX_AUTH_FILE}" 2>/dev/null; then
+        echo "Codex auth: ChatGPT subscription (copied from host ~/.codex)"
+    elif [ -n "${OPENAI_API_KEY:-}" ]; then
         echo "Codex auth: OPENAI_API_KEY (API key, container-local)"
         echo "${OPENAI_API_KEY}" | codex login --with-api-key 2>/dev/null || true
-    elif [ -f "${CODEX_AUTH_FILE}" ] && grep -q '"auth_mode": *"ChatGPT"' "${CODEX_AUTH_FILE}" 2>/dev/null; then
-        echo "Codex auth: ChatGPT subscription (copied from host ~/.codex)"
     elif [ -f "${CODEX_AUTH_FILE}" ] && grep -q '"OPENAI_API_KEY"' "${CODEX_AUTH_FILE}" 2>/dev/null; then
         echo "Codex auth: API key (copied from host ~/.codex)"
     else

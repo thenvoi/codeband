@@ -7,7 +7,7 @@ import os
 import re
 from pathlib import Path
 
-from codeband.config import CodebandConfig, load_agent_config
+from codeband.config import CodebandConfig, load_agent_config, resolve_workspace_path
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +90,7 @@ async def send_task(config: CodebandConfig, project_dir: Path, description: str)
     from codeband.state import StateStore
     from codeband.state.registration import register_task
 
-    workspace_path = Path(config.workspace.path)
-    if not workspace_path.is_absolute():
-        workspace_path = project_dir / workspace_path
+    workspace_path = resolve_workspace_path(config, project_dir)
     store = StateStore(workspace_path / "state" / "orchestration.db")
     registration = register_task(
         room_id=room_id,
