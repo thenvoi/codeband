@@ -38,7 +38,10 @@ def _stale_ts() -> str:
 @patch("codeband.orchestration.runner.run_local", new_callable=AsyncMock)
 @patch("codeband.cli._provision_coordinator_identity", new_callable=AsyncMock)
 def test_run_provisions_session_agent_when_band_key_set(
-    mock_provision, mock_run_local, mock_load_config, tmp_path,
+    mock_provision,
+    mock_run_local,
+    mock_load_config,
+    tmp_path,
 ):
     """cb run calls _provision_coordinator_identity when BAND_API_KEY is present."""
     mock_load_config.return_value = _make_mock_config()
@@ -63,7 +66,10 @@ def test_run_provisions_session_agent_when_band_key_set(
 @patch("codeband.orchestration.runner.run_local", new_callable=AsyncMock)
 @patch("codeband.cli._provision_coordinator_identity", new_callable=AsyncMock)
 def test_run_skips_provisioning_when_key_already_set(
-    mock_provision, mock_run_local, mock_load_config, tmp_path,
+    mock_provision,
+    mock_run_local,
+    mock_load_config,
+    tmp_path,
 ):
     """cb run does NOT reprovision when CODEBAND_SESSION_AGENT_KEY is already set."""
     mock_load_config.return_value = _make_mock_config()
@@ -88,7 +94,10 @@ def test_run_skips_provisioning_when_key_already_set(
 @patch("codeband.orchestration.runner.run_local", new_callable=AsyncMock)
 @patch("codeband.cli._provision_coordinator_identity", new_callable=AsyncMock)
 def test_run_skips_provisioning_when_no_band_key(
-    mock_provision, mock_run_local, mock_load_config, tmp_path,
+    mock_provision,
+    mock_run_local,
+    mock_load_config,
+    tmp_path,
 ):
     """cb run silently skips provisioning when BAND_API_KEY is absent."""
     mock_load_config.return_value = _make_mock_config()
@@ -117,7 +126,11 @@ def test_run_skips_provisioning_when_no_band_key(
     new_callable=AsyncMock,
 )
 def test_run_deletes_session_agent_on_clean_exit(
-    mock_delete, mock_provision, mock_run_local, mock_load_config, tmp_path,
+    mock_delete,
+    mock_provision,
+    mock_run_local,
+    mock_load_config,
+    tmp_path,
 ):
     """Session agent is deleted after run_local returns (clean exit)."""
     mock_load_config.return_value = _make_mock_config()
@@ -146,7 +159,11 @@ def test_run_deletes_session_agent_on_clean_exit(
     new_callable=AsyncMock,
 )
 def test_run_deletes_session_agent_even_when_run_local_errors(
-    mock_delete, mock_provision, mock_run_local, mock_load_config, tmp_path,
+    mock_delete,
+    mock_provision,
+    mock_run_local,
+    mock_load_config,
+    tmp_path,
 ):
     """Session agent cleanup runs in finally — fires even when run_local raises."""
     mock_load_config.return_value = _make_mock_config()
@@ -186,13 +203,15 @@ async def test_provision_sweeps_dead_pid_agent_before_registering(tmp_path):
     stale_agent_id = "crash-leftover-agent"
     stale_marker = tmp_path / f"{stale_agent_id}.json"
     stale_marker.write_text(
-        json.dumps({
-            "agent_id": stale_agent_id,
-            "agent_name": f"codeband-session-repo-{stale_agent_id}",
-            "pid": 999999999,  # dead — provably not running
-            "last_heartbeat": datetime.now(timezone.utc).isoformat(),
-            "repo": "testrepo",
-        }),
+        json.dumps(
+            {
+                "agent_id": stale_agent_id,
+                "agent_name": f"codeband-session-repo-{stale_agent_id}",
+                "pid": 999999999,  # dead — provably not running
+                "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+                "repo": "testrepo",
+            }
+        ),
         encoding="utf-8",
     )
     assert stale_marker.is_file()
@@ -218,16 +237,10 @@ async def test_provision_sweeps_dead_pid_agent_before_registering(tmp_path):
     profile_resp.data.id = "operator-id"
 
     sweep_client = MagicMock()
-    sweep_client.human_api_agents.list_my_agents = AsyncMock(
-        return_value=sweep_list_resp
-    )
+    sweep_client.human_api_agents.list_my_agents = AsyncMock(return_value=sweep_list_resp)
     sweep_client.human_api_agents.delete_my_agent = AsyncMock()
-    sweep_client.human_api_agents.register_my_agent = AsyncMock(
-        return_value=register_resp
-    )
-    sweep_client.human_api_profile.get_my_profile = AsyncMock(
-        return_value=profile_resp
-    )
+    sweep_client.human_api_agents.register_my_agent = AsyncMock(return_value=register_resp)
+    sweep_client.human_api_profile.get_my_profile = AsyncMock(return_value=profile_resp)
 
     # Override sessions_dir so markers go to tmp_path, not ~/.codeband/sessions
     with (
@@ -245,7 +258,8 @@ async def test_provision_sweeps_dead_pid_agent_before_registering(tmp_path):
 
     # Stale agent was genuinely removed: REST delete called + marker gone
     sweep_client.human_api_agents.delete_my_agent.assert_any_call(
-        stale_agent_id, force=True,
+        stale_agent_id,
+        force=True,
     )
     assert not stale_marker.is_file(), "Stale marker must be deleted by sweep"
 
@@ -286,18 +300,10 @@ async def test_provision_enrolls_session_agent_in_active_room(tmp_path):
     session_identity_resp.data.id = "enrolled-session-agent-id"
 
     shared_client = MagicMock()
-    shared_client.human_api_agents.list_my_agents = AsyncMock(
-        return_value=sweep_list_resp
-    )
-    shared_client.human_api_agents.register_my_agent = AsyncMock(
-        return_value=register_resp
-    )
-    shared_client.human_api_profile.get_my_profile = AsyncMock(
-        return_value=profile_resp
-    )
-    shared_client.agent_api_identity.get_agent_me = AsyncMock(
-        return_value=session_identity_resp
-    )
+    shared_client.human_api_agents.list_my_agents = AsyncMock(return_value=sweep_list_resp)
+    shared_client.human_api_agents.register_my_agent = AsyncMock(return_value=register_resp)
+    shared_client.human_api_profile.get_my_profile = AsyncMock(return_value=profile_resp)
+    shared_client.agent_api_identity.get_agent_me = AsyncMock(return_value=session_identity_resp)
     shared_client.human_api_participants.add_my_chat_participant = AsyncMock()
 
     with (
@@ -312,9 +318,7 @@ async def test_provision_enrolls_session_agent_in_active_room(tmp_path):
         ),
         patch("codeband.state.registration.resolve_state_dir", return_value=tmp_path),
     ):
-        agent_id, _ = await _provision_coordinator_identity(
-            config, tmp_path, "test-band-key"
-        )
+        agent_id, _ = await _provision_coordinator_identity(config, tmp_path, "test-band-key")
 
     # Session agent was enrolled as a room participant
     shared_client.human_api_participants.add_my_chat_participant.assert_awaited_once()
@@ -348,15 +352,9 @@ async def test_provision_skips_enrollment_when_no_active_room(tmp_path):
     profile_resp.data.id = "operator-id"
 
     shared_client = MagicMock()
-    shared_client.human_api_agents.list_my_agents = AsyncMock(
-        return_value=sweep_list_resp
-    )
-    shared_client.human_api_agents.register_my_agent = AsyncMock(
-        return_value=register_resp
-    )
-    shared_client.human_api_profile.get_my_profile = AsyncMock(
-        return_value=profile_resp
-    )
+    shared_client.human_api_agents.list_my_agents = AsyncMock(return_value=sweep_list_resp)
+    shared_client.human_api_agents.register_my_agent = AsyncMock(return_value=register_resp)
+    shared_client.human_api_profile.get_my_profile = AsyncMock(return_value=profile_resp)
     shared_client.human_api_participants.add_my_chat_participant = AsyncMock()
 
     with (
@@ -371,9 +369,7 @@ async def test_provision_skips_enrollment_when_no_active_room(tmp_path):
         ),
         patch("codeband.state.registration.resolve_state_dir", return_value=tmp_path),
     ):
-        agent_id, _ = await _provision_coordinator_identity(
-            config, tmp_path, "test-band-key"
-        )
+        agent_id, _ = await _provision_coordinator_identity(config, tmp_path, "test-band-key")
 
     # No enrollment attempted
     shared_client.human_api_participants.add_my_chat_participant.assert_not_awaited()
