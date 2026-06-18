@@ -1,5 +1,5 @@
 ---
-description: One-shot codeband swarm — bootstraps the stack on first run (just bring 3 keys), then runs a swarm against the CURRENT repo with THIS Claude as the sole Band coordinator (own identity, owns the room, auto-woken per message)
+description: One-shot codeband swarm — bootstraps the stack on first run (just bring 3 keys), then runs a swarm against the CURRENT repo with THIS Claude as the sole Band coordinator (own identity, owns the room, auto-woken from the room log)
 argument-hint: [task description]
 allowed-tools: [Bash, Monitor, Read, TaskStop]
 ---
@@ -13,14 +13,14 @@ $ARGUMENTS
 
 - A single shared **codeband home** (`~/projects/codeband`) holds the keys (`.env`) and the 8 registered Band agents (`agent_config.yaml`). It gets re-pointed at the current repo each run. Only ONE codeband runs at a time; switching repos wipes the prior workspace.
 - **You** (`jam`) come online as your own ephemeral Band agent (`yoni/claude-<repo>-<hex>`). **You create the task room with your OWN agent key** and add the 8 codeband agents to it. You are `task.owner`, so the Conductor reports back to you by @mentioning you.
-- Delivery: the `jam` sockpuppet bridge receives the swarm's messages in real time and writes them to your team inbox file. A **persistent `Monitor` on that file auto-wakes you** with each new message — no polling, no `TeamCreate` needed.
-- You reply with `jam reply`. You relay concise summaries to the user and handle approvals as the sole coordinator.
+- Delivery: the room Monitor reads the **authoritative full room** via `cb room-log` and auto-wakes you for each new Band message. Do not use the jam bridge's `team-lead.json` inbox slice for delivery; it is not the source of truth for this owner-coordinator loop.
+- You post to the room with `jam send`, relay concise summaries to the user, and handle approvals as the sole coordinator.
 
 ## Important constraints to relay if relevant
 - The swarm clones the repo's **remote (origin)** — it works on what is **pushed**, not local uncommitted edits. Tell the user to push first if needed.
 - If the current dir has no `origin`, it falls back to cloning the local repo (committed state only).
 - `jam`/`Band` resolver caveat: never use `jam chat new --with @handle` (multi-arg) / `jam agent list` to build the room — they only read the first page of peers and silently drop agents. Add participants ONE AT A TIME via `jam chat add @handle` (or via the REST participant API for ids without an `@owner/handle`, like the human user) — never via the multi-arg pager. The Python below does this.
-- **Post as the agent, never as the owner.** Every message you (CC) post to the room goes out under your own agent identity — via `jam send`/`jam reply` as your CC handle — never under the owner's user key. This applies on the ad-hoc path too: if the operator nudges you to post a status, a relay, or anything else, you post as yourself and name the owner in the text body; you do not author messages that appear to come from the human. Two reasons: (1) **attribution integrity** — you must be able to distinguish human-originated actions from agent ones (the Stage-3 attributable posture depends on it); (2) **approval integrity** — a merge approval is a SHA-pinned `cb approve` CLI grant executed by the human, not a message you post on their behalf. An agent must never post an approval that looks like it came from the owner.
+- **Post as the agent, never as the owner.** Every message you (CC) post to the room goes out under your own agent identity — via `jam send` as your CC handle — never under the owner's user key. This applies on the ad-hoc path too: if the operator nudges you to post a status, a relay, or anything else, you post as yourself and name the owner in the text body; you do not author messages that appear to come from the human. Two reasons: (1) **attribution integrity** — you must be able to distinguish human-originated actions from agent ones (the Stage-3 attributable posture depends on it); (2) **approval integrity** — a merge approval is a SHA-pinned `cb approve` CLI grant executed by the human, not a message you post on their behalf. An agent must never post an approval that looks like it came from the owner.
 
 ---
 
@@ -100,8 +100,7 @@ if [ -n "$REPO_URL" ]; then
 fi
 
 # A stable slug for this repo, used only when onboarding a NEW jam bridge in Step 3.
-# Do NOT derive the inbox path from it: a pre-existing bridge keeps its ORIGINAL
-# team name, so the real path comes from the session JSON's team_name (Step 6).
+# Delivery is read from the authoritative room log, so there is no inbox path to derive.
 SLUG="$(basename "$REPO_URL" .git 2>/dev/null | tr -c 'A-Za-z0-9._-' '-' | sed -E 's/-+/-/g;s/^-|-$//g')"
 [ -z "$SLUG" ] && SLUG="$(basename "$TARGET_DIR")"
 TEAM="codeband-$SLUG"
@@ -109,7 +108,7 @@ echo "TARGET: $(grep -m1 -E '^  url:' "$CB_HOME/codeband.yaml" | sed -E 's/^  ur
 echo "CB_HOME=$CB_HOME"; echo "TARGET_DIR=$TARGET_DIR"; echo "TEAM=$TEAM"
 ```
 
-Remember `CB_HOME`, `TARGET_DIR`, and `TEAM` from the output — later steps need them. (`INBOX` is derived in Step 6 from the bridge's actual team.)
+Remember `CB_HOME`, `TARGET_DIR`, and `TEAM` from the output — later steps need them.
 
 ### Step 3 — come online as a Band peer (your own identity)
 
@@ -293,7 +292,7 @@ Call the **Monitor** tool (persistent) so each new Band message auto-wakes you. 
 
 ### Step 7b — arm the PR watcher (CRITICAL — the swarm's deliverable is a PR, and the Conductor does NOT reliably @mention you when one opens)
 
-The Conductor often routes the coder's "PR ready" message to a reviewer/mergemaster and never loops you in — and with `auto_merge` it may merge without ever asking. So do NOT rely on inbox messages to learn about PRs. Watch `cb pending` (GitHub-based, authoritative) with a second persistent **Monitor**. Substitute `CB_HOME` literally:
+The Conductor often routes the coder's "PR ready" message to a reviewer/mergemaster and never loops you in — and with `auto_merge` it may merge without ever asking. So do NOT rely on room messages to learn about PRs. Watch `cb pending` (GitHub-based, authoritative) with a second persistent **Monitor**. Substitute `CB_HOME` literally:
 
 > Monitor tool call — `persistent: true`, description `"codeband: PR status"`, command:
 > ```
@@ -309,7 +308,7 @@ When this fires, a PR has opened or changed state. Run `cd "$CB_HOME" && codeban
 
 ### Step 7c — arm the liveness watcher (so a SILENT stall doesn't go unnoticed)
 
-The inbox and PR Monitors only fire on messages-to-you and on PRs. A swarm can die *silently* mid-run — e.g. a Codex turn timeout + a `422 Failed to mark message as processed` stalls an agent's Band cursor, producing no message to you, no PR, and no surfaced error. Watch the run log for failure signatures **and** for a flat-line (no real progress) with a third persistent **Monitor**. Substitute `CB_HOME` literally:
+The room and PR Monitors only fire on Band messages and on PRs. A swarm can die *silently* mid-run — e.g. a Codex turn timeout + a `422 Failed to mark message as processed` stalls an agent's Band cursor, producing no room message, no PR, and no surfaced error. Watch the run log for failure signatures **and** for a flat-line (no real progress) with a third persistent **Monitor**. Substitute `CB_HOME` literally:
 
 > Monitor tool call — `persistent: true`, description `"codeband: swarm liveness"`, command:
 > ```
@@ -343,26 +342,26 @@ Tell the user:
 - the swarm is running against **<target repo @ branch>**, and **you** are coordinating it as **<your handle>**
 - it operates on **origin** — push local work first if needed
 - they can just talk to you; you'll relay progress, **announce the PR URL as soon as it opens**, and surface anything that needs a decision
-- to stop: `kill $(cat ~/projects/codeband/.ensemble/run.pid)` and `jam daemon stop` (run from the target dir), and you'll stop the Monitor
+- to stop: `kill $(cat ~/projects/codeband/.ensemble/run.pid)` and `jam daemon stop` (run from the target dir), and you'll stop the Monitors
 
 ### The rest of the session — coordinating (you're the sole coordinator)
 
-You have two Monitors firing events: **inbox** (swarm messages to you) and **PR status** (PRs opening/changing).
+You have four Monitors/wakeup paths: **room messages** (`cb room-log` via the room Monitor), **PR status** (`cb pending`), **swarm liveness** (run-log error/stall signals), and the **owner self-wakeup** (recurring FSM/room check).
 
-**On an inbox event:**
-1. Read it: `cd "$TARGET_DIR" && jam inbox` (the `text` field has the message id, content, and the exact reply command).
-2. Decide and act: `cd "$TARGET_DIR" && jam reply <msg_id> "your text"` (auto-mentions the sender, auto-marks processed). **Mark every inbound processed** — if you don't reply, `jam ack <msg_id>`.
+**On a room-message event:**
+1. Read the authoritative transcript: `cd "$CB_HOME" && cb room-log --dir . "$ROOM"` (or `--json` if you need structured sender/content/timestamp fields).
+2. Decide and act. To respond, post into the room as your jam identity: `cd "$TARGET_DIR" && jam send "$ROOM" "<your targeted text>" --as "$HANDLE"`. Include the recipient's `@owner/handle` when you need a specific agent to see it.
 3. Relay a concise summary to the user.
 
 **On a PR-status event** (this is the deliverable — never sit on it):
 1. `cd "$CB_HOME" && codeband pending --dir .` for full risk/eligibility, and `gh pr view <N> --repo <slug>` for the PR itself.
 2. **Tell the user the PR URL right away** and what it does.
-3. Merging is gated: as task owner you are the merge approver, and the swarm will ask you directly — handle it per **Merge approval** below. To request changes at any point, reply into the room: `cd "$TARGET_DIR" && jam reply <a recent Conductor msg_id> "CHANGES REQUESTED on PR #<N>: <specific reasons>."`
+3. Merging is gated: as task owner you are the merge approver, and the swarm will ask you directly — handle it per **Merge approval** below. To request changes at any point, post into the room: `cd "$TARGET_DIR" && jam send "$ROOM" "CHANGES REQUESTED on PR #<N>: <specific reasons>." --as "$HANDLE"`.
 4. As sole coordinator you may approve low-risk PRs autonomously, but **state what you're approving** to the user first; for anything destructive, ambiguous, or high-risk, ask the user before approving.
 
 **Merge approval** — when you receive a merge-approval request (a Band @mention naming a PR, e.g. "PR #12 … is awaiting your merge approval at head <sha>. Approve with: cb approve 12"):
 1. **Review before granting**: confirm the gate's verdicts passed (`cd "$CB_HOME" && codeband pending --dir .`) and read the diff (`gh pr diff <N> --repo <slug>`) — you are approving specific code, not a status. Never approve blindly.
 2. **To grant**: run `cb approve <pr>` from the project directory: `cd "$CB_HOME" && cb approve <N>`. The grant is SHA-pinned — if new commits land on the PR after your approval, it expires automatically and a fresh request will arrive. **Never post "approved" as a chat message** — the approval is the `cb approve` CLI grant, executed as the human owner. An agent posting approval text into the room is not a grant and violates attribution integrity.
-3. **To withhold**: reply on Band (`jam reply`) stating what is missing or wrong. Do not run `cb approve`.
+3. **To withhold**: post on Band (`jam send`) stating what is missing or wrong. Do not run `cb approve`.
 
-Outbound to the Conductor at any time: `cd "$TARGET_DIR" && jam reply <recent Conductor msg_id> "..."`. Do NOT run `cb feed` (it streams and blocks).
+Outbound to the Conductor at any time: `cd "$TARGET_DIR" && jam send "$ROOM" "@<conductor-handle> ..." --as "$HANDLE"`. Do NOT run `cb feed` (it streams and blocks).
