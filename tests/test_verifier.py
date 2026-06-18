@@ -325,7 +325,7 @@ class TestVerifierAgentRegistration:
 
     def test_verifier_in_expected_agents_when_enabled(self):
         """With count=1, verifier keys and display names appear."""
-        from codeband.orchestration.setup import _expected_agents
+        from codeband.orchestration.setup import _expected_agents, _is_codeband_agent
 
         config = CodebandConfig(
             repo=RepoConfig(url="https://github.com/a/b.git"),
@@ -343,6 +343,10 @@ class TestVerifierAgentRegistration:
         codex_name, _ = expected["verifier-codex-0"]
         assert claude_name == "Verifier-Claude-0"
         assert codex_name == "Verifier-Codex-0"
+        assert _is_codeband_agent(claude_name)
+        assert _is_codeband_agent(codex_name)
+        assert not _is_codeband_agent("Verification-Claude-0")
+        assert not _is_codeband_agent("VerifierClaude-0")
 
 
 # ─── cb doctor check_verifier_pairing ────────────────────────────────────────

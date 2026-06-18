@@ -207,6 +207,7 @@ _CODEBAND_PREFIXES = (
     "Plan-Reviewer-",
     "Coder-",
     "Reviewer-",
+    "Verifier-",
     "Player-",
 )
 
