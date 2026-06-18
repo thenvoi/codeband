@@ -904,7 +904,7 @@ def test_shell_slash_approve_is_exempt_from_the_agent_guard(tmp_path, monkeypatc
     monkeypatch.setattr(
         merge_mod, "record_approval_grant",
         lambda project_dir, number: calls.append(number) or [
-            f"Merge approval recorded for subtask st-1 at sha-1 (approver: owner)."
+            "Merge approval recorded for subtask st-1 at sha-1 (approver: owner)."
         ],
     )
 
