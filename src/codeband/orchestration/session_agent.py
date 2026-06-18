@@ -209,6 +209,61 @@ async def sweep_stale_session_agents(
     return deleted
 
 
+async def delete_session_agent(
+    agent_id: str,
+    *,
+    band_api_key: str,
+    rest_url: str,
+    sessions_dir: Path | None = None,
+) -> None:
+    """Delete a specific session agent and its local marker (clean-exit cleanup).
+
+    Separate from sweep: sweep is a startup garbage-collection pass over ALL
+    stale agents; this is the targeted delete for the agent that was minted by
+    THIS run and is being cleaned up at its normal exit.
+    """
+    from thenvoi_rest import AsyncRestClient
+
+    client = AsyncRestClient(api_key=band_api_key, base_url=rest_url)
+    await client.human_api_agents.delete_my_agent(agent_id, force=True)
+    base = sessions_dir if sessions_dir is not None else _sessions_dir()
+    mpath = base / f"{agent_id}.json"
+    if mpath.is_file():
+        mpath.unlink()
+    logger.info("Deleted session agent %s (clean exit)", agent_id)
+
+
+async def enroll_session_agent_in_room(
+    *,
+    session_agent_key: str,
+    band_api_key: str,
+    room_id: str,
+    rest_url: str,
+) -> None:
+    """Add the session agent as a participant in an existing room.
+
+    Called at ``cb run`` startup for late enrollment — the room was created
+    before the session agent was minted, so send_task's enrollment path did not
+    run. Covers both the /codeband path (jam creates the room, cb register-task
+    registers it, then cb run starts) and the cb-task / cb-run two-step.
+    """
+    from thenvoi_rest import AsyncRestClient, ParticipantRequest
+
+    session_client = AsyncRestClient(api_key=session_agent_key, base_url=rest_url)
+    identity = await session_client.agent_api_identity.get_agent_me()
+    session_agent_id = identity.data.id
+
+    human_client = AsyncRestClient(api_key=band_api_key, base_url=rest_url)
+    await human_client.human_api_participants.add_my_chat_participant(
+        room_id,
+        participant=ParticipantRequest(participant_id=session_agent_id),
+    )
+    logger.info(
+        "Enrolled session agent %s in room %s (late enrollment)",
+        session_agent_id, room_id,
+    )
+
+
 async def start_heartbeat_loop(
     agent_id: str,
     agent_name: str,

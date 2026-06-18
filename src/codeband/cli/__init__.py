@@ -27,6 +27,8 @@ from codeband.orchestration.compose import (
     find_compose_file as _find_compose_file,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _load_project_dotenv(project_dir: str) -> None:
     """Load ``.env`` from the project dir if present, else fall back to CWD search.
@@ -463,6 +465,69 @@ def setup_agents(project_dir: str) -> None:
     _run_async(register_all_agents(config, project))
 
 
+async def _provision_coordinator_identity(
+    config: CodebandConfig,
+    project: Path,
+    band_api_key: str,
+) -> tuple[str, str]:
+    """Register a fresh codeband-session-* agent for this run.
+
+    Sets CODEBAND_SESSION_AGENT_KEY in the process environment so
+    send_room_message posts as the session agent (not the human key) and so
+    the runner's heartbeat loop fires. Also sweeps stale session agents and
+    attempts late enrollment in any active task room.
+
+    Returns (agent_id, band_api_key) for clean-exit cleanup by the caller.
+    Non-fatal for the rest of the run: callers must catch and log exceptions.
+    """
+    from thenvoi_rest import AsyncRestClient
+
+    from codeband.orchestration.session_agent import (
+        enroll_session_agent_in_room,
+        register_session_agent,
+        repo_slug_from_project,
+        sweep_stale_session_agents,
+    )
+    from codeband.state.registration import read_room_pointer, resolve_state_dir
+
+    repo = repo_slug_from_project(project)
+
+    await sweep_stale_session_agents(
+        band_api_key=band_api_key,
+        rest_url=config.band.rest_url,
+    )
+
+    try:
+        _profile_client = AsyncRestClient(
+            api_key=band_api_key, base_url=config.band.rest_url,
+        )
+        _profile = await _profile_client.human_api_profile.get_my_profile()
+        owner_id: str = getattr(_profile.data, "id", None) or "unknown"
+    except Exception:
+        owner_id = "unknown"
+
+    agent_id, api_key = await register_session_agent(
+        owner_id, repo,
+        rest_url=config.band.rest_url,
+        band_api_key=band_api_key,
+    )
+    os.environ["CODEBAND_SESSION_AGENT_KEY"] = api_key
+
+    try:
+        room_id = read_room_pointer(project, resolve_state_dir(config, project))
+        if room_id:
+            await enroll_session_agent_in_room(
+                session_agent_key=api_key,
+                band_api_key=band_api_key,
+                room_id=room_id,
+                rest_url=config.band.rest_url,
+            )
+    except Exception:
+        logger.debug("Late room enrollment failed — skipping", exc_info=True)
+
+    return agent_id, band_api_key
+
+
 @cli.command()
 @click.option("--agent", default=None, help="Run a single agent by key (distributed mode)")
 @click.option("--debug", is_flag=True, help="Enable verbose debug logging")
@@ -526,27 +591,61 @@ def run(
     # raw API-key values via the subprocess environment.
     _clear_auth_fallbacks()
 
-    if agent:
-        if fresh:
-            click.echo(
-                "Warning: --fresh only applies to local mode (it controls the "
-                "in-process startup room sweep); ignored with --agent.",
-                err=True,
-            )
-        click.echo(f"Starting agent {agent}... (Ctrl+C to stop)")
-        from codeband.orchestration.runner import run_agent
-        _run_async(run_agent(config, project, agent))
-    else:
-        if config.workspace.mode == DeploymentMode.DISTRIBUTED:
-            click.echo(
-                "Warning: workspace.mode is 'distributed' but running all agents locally. "
-                "Use --agent <key> to run a single agent, or set mode to 'local'.",
-                err=True,
-            )
-        total = config.agents.total_agent_count()
-        click.echo(f"Starting Codeband with {total} agents... (Ctrl+C to stop)")
-        from codeband.orchestration.runner import run_local
-        _run_async(run_local(config, project, fresh=fresh))
+    # Provision a fresh codeband-session-* identity for this run so that
+    # send_room_message posts as the session agent (not the human key) and
+    # the runner's heartbeat loop fires. Non-fatal: if BAND_API_KEY is absent
+    # or registration fails, cb run continues without a session-agent identity.
+    _sa_agent_id: str | None = None
+    _sa_band_key: str | None = None
+    if not os.environ.get("CODEBAND_SESSION_AGENT_KEY"):
+        _bk = os.environ.get("BAND_API_KEY")
+        if _bk:
+            try:
+                _sa_agent_id, _sa_band_key = asyncio.run(
+                    _provision_coordinator_identity(config, project, _bk)
+                )
+            except Exception:
+                logger.warning(
+                    "Session agent provisioning failed — continuing without "
+                    "coordinator identity",
+                    exc_info=True,
+                )
+
+    try:
+        if agent:
+            if fresh:
+                click.echo(
+                    "Warning: --fresh only applies to local mode (it controls the "
+                    "in-process startup room sweep); ignored with --agent.",
+                    err=True,
+                )
+            click.echo(f"Starting agent {agent}... (Ctrl+C to stop)")
+            from codeband.orchestration.runner import run_agent
+            _run_async(run_agent(config, project, agent))
+        else:
+            if config.workspace.mode == DeploymentMode.DISTRIBUTED:
+                click.echo(
+                    "Warning: workspace.mode is 'distributed' but running all agents locally. "
+                    "Use --agent <key> to run a single agent, or set mode to 'local'.",
+                    err=True,
+                )
+            total = config.agents.total_agent_count()
+            click.echo(f"Starting Codeband with {total} agents... (Ctrl+C to stop)")
+            from codeband.orchestration.runner import run_local
+            _run_async(run_local(config, project, fresh=fresh))
+    finally:
+        if _sa_agent_id and _sa_band_key:
+            try:
+                from codeband.orchestration.session_agent import delete_session_agent
+                asyncio.run(
+                    delete_session_agent(
+                        _sa_agent_id,
+                        band_api_key=_sa_band_key,
+                        rest_url=config.band.rest_url,
+                    )
+                )
+            except Exception:
+                logger.debug("Session agent cleanup on exit failed", exc_info=True)
 
     click.echo("All agents stopped.")
 

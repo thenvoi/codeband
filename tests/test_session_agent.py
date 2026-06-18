@@ -14,6 +14,8 @@ import pytest
 from codeband.orchestration.session_agent import (
     _HEARTBEAT_INTERVAL_SECONDS,
     _STALE_THRESHOLD_SECONDS,
+    delete_session_agent,
+    enroll_session_agent_in_room,
     is_stale,
     read_marker,
     register_session_agent,
@@ -233,7 +235,37 @@ def _make_agent(agent_id: str, name: str) -> MagicMock:
 @pytest.mark.asyncio
 async def test_sweep_deletes_stale_old_timestamp(tmp_path):
     agent_id = "stale-old"
-    _make_marker(tmp_path, agent_id, ts=_stale_ts())
+    marker_path = _make_marker(tmp_path, agent_id, ts=_stale_ts())
+    assert marker_path.is_file()
+
+    mock_client = MagicMock()
+    agents = [_make_agent(agent_id, f"codeband-session-repo-{agent_id}")]
+    mock_client.human_api_agents.list_my_agents = AsyncMock(
+        return_value=MagicMock(data=agents)
+    )
+    mock_client.human_api_agents.delete_my_agent = AsyncMock()
+
+    with patch("thenvoi_rest.AsyncRestClient", return_value=mock_client):
+        deleted = await sweep_stale_session_agents(
+            band_api_key="k",
+            rest_url="https://x.com",
+            sessions_dir=tmp_path,
+        )
+
+    assert agent_id in deleted
+    mock_client.human_api_agents.delete_my_agent.assert_awaited_once_with(
+        agent_id, force=True,
+    )
+    # Marker file must be removed — genuine removal, not just a sweep call
+    assert not marker_path.is_file()
+
+
+@pytest.mark.asyncio
+async def test_sweep_deletes_agent_with_no_marker(tmp_path):
+    agent_id = "no-marker-agent"
+    # No marker file — missing marker is a real stale condition (crash with
+    # lost workspace, or agent that never wrote its first heartbeat).
+    assert not (tmp_path / f"{agent_id}.json").is_file()
 
     mock_client = MagicMock()
     agents = [_make_agent(agent_id, f"codeband-session-repo-{agent_id}")]
@@ -256,30 +288,13 @@ async def test_sweep_deletes_stale_old_timestamp(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_sweep_deletes_agent_with_no_marker(tmp_path):
-    agent_id = "no-marker-agent"
-
-    mock_client = MagicMock()
-    agents = [_make_agent(agent_id, f"codeband-session-repo-{agent_id}")]
-    mock_client.human_api_agents.list_my_agents = AsyncMock(
-        return_value=MagicMock(data=agents)
-    )
-    mock_client.human_api_agents.delete_my_agent = AsyncMock()
-
-    with patch("thenvoi_rest.AsyncRestClient", return_value=mock_client):
-        deleted = await sweep_stale_session_agents(
-            band_api_key="k",
-            rest_url="https://x.com",
-            sessions_dir=tmp_path,
-        )
-
-    assert agent_id in deleted
-
-
-@pytest.mark.asyncio
 async def test_sweep_deletes_dead_pid(tmp_path):
+    # Real dead-pid stale condition: marker has a fresh timestamp but the PID
+    # is provably not alive. This matches the crash-recovery scenario where
+    # the process died between heartbeat ticks (dead PID + recent timestamp).
     agent_id = "dead-pid-agent"
-    _make_marker(tmp_path, agent_id, pid=999999999)  # definitely not alive
+    marker_path = _make_marker(tmp_path, agent_id, pid=999999999)  # definitely not alive
+    assert marker_path.is_file()
 
     mock_client = MagicMock()
     agents = [_make_agent(agent_id, f"codeband-session-repo-{agent_id}")]
@@ -296,6 +311,11 @@ async def test_sweep_deletes_dead_pid(tmp_path):
         )
 
     assert agent_id in deleted
+    mock_client.human_api_agents.delete_my_agent.assert_awaited_once_with(
+        agent_id, force=True,
+    )
+    # Genuine removal: marker must be gone from disk, not just the agent deleted
+    assert not marker_path.is_file()
 
 
 @pytest.mark.asyncio
@@ -623,3 +643,121 @@ async def test_send_task_enrollment_failure_raises(tmp_path, monkeypatch):
     ):
         with pytest.raises(RuntimeError, match="enroll session agent"):
             await kickoff.send_task(config, tmp_path, "Do the thing")
+
+
+# ─── delete_session_agent ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_delete_session_agent_removes_agent_and_marker(tmp_path):
+    agent_id = "del-agent-01"
+    marker_path = write_heartbeat(
+        agent_id, "codeband-session-repo-del", pid=os.getpid(), repo="repo",
+        sessions_dir=tmp_path,
+    )
+    assert marker_path.is_file()
+
+    mock_client = MagicMock()
+    mock_client.human_api_agents.delete_my_agent = AsyncMock()
+
+    with patch("thenvoi_rest.AsyncRestClient", return_value=mock_client):
+        await delete_session_agent(
+            agent_id,
+            band_api_key="band-k",
+            rest_url="https://x.com",
+            sessions_dir=tmp_path,
+        )
+
+    mock_client.human_api_agents.delete_my_agent.assert_awaited_once_with(
+        agent_id, force=True,
+    )
+    # Genuine removal: marker is gone from disk
+    assert not marker_path.is_file()
+
+
+@pytest.mark.asyncio
+async def test_delete_session_agent_tolerates_missing_marker(tmp_path):
+    """delete_session_agent succeeds even when the local marker was already removed."""
+    agent_id = "del-agent-no-marker"
+    # No marker written — clean-exit path after crash reboot already swept it
+
+    mock_client = MagicMock()
+    mock_client.human_api_agents.delete_my_agent = AsyncMock()
+
+    with patch("thenvoi_rest.AsyncRestClient", return_value=mock_client):
+        await delete_session_agent(
+            agent_id,
+            band_api_key="band-k",
+            rest_url="https://x.com",
+            sessions_dir=tmp_path,
+        )
+
+    mock_client.human_api_agents.delete_my_agent.assert_awaited_once_with(
+        agent_id, force=True,
+    )
+
+
+# ─── enroll_session_agent_in_room ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_enroll_session_agent_in_room_adds_participant(tmp_path):
+    session_identity_resp = MagicMock()
+    session_identity_resp.data.id = "session-participant-id"
+
+    session_client = MagicMock()
+    session_client.agent_api_identity.get_agent_me = AsyncMock(
+        return_value=session_identity_resp
+    )
+
+    human_client = MagicMock()
+    human_client.human_api_participants.add_my_chat_participant = AsyncMock()
+
+    def _make_client(api_key, base_url):
+        if api_key == "session-key":
+            return session_client
+        return human_client
+
+    with patch("thenvoi_rest.AsyncRestClient", side_effect=_make_client):
+        await enroll_session_agent_in_room(
+            session_agent_key="session-key",
+            band_api_key="human-key",
+            room_id="room-uuid-42",
+            rest_url="https://x.com",
+        )
+
+    human_client.human_api_participants.add_my_chat_participant.assert_awaited_once()
+    call_args = human_client.human_api_participants.add_my_chat_participant.call_args
+    assert call_args.args[0] == "room-uuid-42"
+    assert call_args.kwargs["participant"].participant_id == "session-participant-id"
+
+
+@pytest.mark.asyncio
+async def test_enroll_session_agent_in_room_propagates_failure():
+    """Enrollment failure propagates so the caller can treat it as non-fatal."""
+    session_identity_resp = MagicMock()
+    session_identity_resp.data.id = "session-participant-id"
+
+    session_client = MagicMock()
+    session_client.agent_api_identity.get_agent_me = AsyncMock(
+        return_value=session_identity_resp
+    )
+
+    human_client = MagicMock()
+    human_client.human_api_participants.add_my_chat_participant = AsyncMock(
+        side_effect=RuntimeError("403 Forbidden")
+    )
+
+    def _make_client(api_key, base_url):
+        if api_key == "session-key":
+            return session_client
+        return human_client
+
+    with patch("thenvoi_rest.AsyncRestClient", side_effect=_make_client):
+        with pytest.raises(RuntimeError, match="403"):
+            await enroll_session_agent_in_room(
+                session_agent_key="session-key",
+                band_api_key="human-key",
+                room_id="room-x",
+                rest_url="https://x.com",
+            )
