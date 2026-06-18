@@ -17,7 +17,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -230,7 +230,6 @@ class TestMaybeAcceptanceAdvanceRenudge:
         self, store: StateStore,
     ) -> None:
         """Markers from a prior acceptance_passed visit don't count against new cap."""
-        old_entry = _ts(30)
         # Old nudge from the prior visit (before the new entry timestamp)
         _insert_audit_row(
             store, "acceptance_advance_nudge", ts=_ts(25),
@@ -346,7 +345,7 @@ class TestCheckOneSubtaskAcceptanceAdvance:
         self, store: StateStore, monkeypatch,
     ) -> None:
         """After cap exhausted → stall counter advances → subtask blocked."""
-        entry_ts = _set_acceptance_passed(store, minutes_ago=20)
+        _set_acceptance_passed(store, minutes_ago=20)
         # Pre-exhaust the cap (1 nudge already sent)
         _insert_audit_row(
             store, "acceptance_advance_nudge", ts=_ts(10),

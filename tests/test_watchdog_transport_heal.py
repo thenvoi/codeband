@@ -509,7 +509,6 @@ async def test_pending_probe_api_error_no_crash_patrol_continues(watchdog_config
     """Pending probe raises ApiError → no crash, no heal; patrol completes normally."""
     from thenvoi_rest.core.api_error import ApiError
 
-    now = datetime.now(UTC)
     conductor_rest = _make_conductor_rest_client()
     agent_client = MagicMock()
     agent_client.agent_api_messages = MagicMock()
@@ -538,7 +537,6 @@ async def test_pending_probe_api_error_no_crash_patrol_continues(watchdog_config
 @pytest.mark.asyncio
 async def test_pending_probe_generic_exception_no_crash(watchdog_config):
     """Pending probe raises a generic Exception → no crash, no heal."""
-    now = datetime.now(UTC)
     conductor_rest = _make_conductor_rest_client()
     agent_client = MagicMock()
     agent_client.agent_api_messages = MagicMock()

@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import logging
 
-import pytest
 
 from codeband.orchestration.runner import _make_watchdog_done_callback
 
