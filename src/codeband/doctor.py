@@ -346,6 +346,21 @@ def check_codeband_yaml(ctx: Context) -> CheckResult:
     )
 
 
+def check_handoff_verify_command(ctx: Context) -> CheckResult:
+    if ctx.config is None:
+        return CheckResult(Status.SKIP, "codeband.yaml not loaded")
+    if ctx.config.agents.handoff_verify_command:
+        return CheckResult(Status.OK, "handoff verify command configured")
+    return CheckResult(
+        Status.INFO,
+        "handoff verify is available but not active",
+        remediation=(
+            "Set `agents.handoff_verify_command` in codeband.yaml to require "
+            "a repo-specific verify command before review."
+        ),
+    )
+
+
 def check_agent_config_yaml(ctx: Context) -> CheckResult:
     if ctx.config is None:
         return CheckResult(Status.SKIP, "codeband.yaml not loaded")
@@ -814,6 +829,7 @@ _CHECKS: list[Check] = [
     Check("gh CLI", "Tools", check_gh),
     Check("gh authenticated", "Tools", check_gh_auth),
     Check("codeband.yaml", "Config", check_codeband_yaml),
+    Check("handoff verify command", "Config", check_handoff_verify_command),
     Check("agent_config.yaml", "Config", check_agent_config_yaml),
     Check("Band.ai platform agents", "Config", check_agent_platform_existence),
     Check("Workspace writable", "Config", check_workspace_writable),

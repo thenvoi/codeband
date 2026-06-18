@@ -36,6 +36,7 @@ from codeband.doctor import (
     check_gh,
     check_gh_auth,
     check_git,
+    check_handoff_verify_command,
     check_active_room_membership,
     check_memory_mode,
     check_python_version,
@@ -403,6 +404,27 @@ class TestWorkspace:
     def test_skip_without_config(self, tmp_path):
         ctx = Context(project_dir=tmp_path)
         result = check_workspace_writable(ctx)
+        assert result.status == Status.SKIP
+
+
+class TestHandoffVerifyCommand:
+    def test_missing_verify_command_is_info(self, tmp_path):
+        cfg = _make_config(tmp_path)
+        ctx = Context(project_dir=tmp_path, config=cfg)
+        result = check_handoff_verify_command(ctx)
+        assert result.status == Status.INFO
+        assert "not active" in result.message
+        assert "agents.handoff_verify_command" in result.remediation
+
+    def test_configured_verify_command_is_ok(self, tmp_path):
+        cfg = _make_config(tmp_path)
+        cfg.agents.handoff_verify_command = "make test"
+        ctx = Context(project_dir=tmp_path, config=cfg)
+        result = check_handoff_verify_command(ctx)
+        assert result.status == Status.OK
+
+    def test_skips_without_config(self, tmp_path):
+        result = check_handoff_verify_command(Context(project_dir=tmp_path))
         assert result.status == Status.SKIP
 
 

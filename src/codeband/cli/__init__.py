@@ -283,6 +283,8 @@ def init(repo: str, branch: str, project_dir: str) -> None:
     conductor + mergemaster. The verifiers make `verify_acceptance` a required,
     SHA-pinned merge verdict; drop a verifier vendor to `count: 0` to reclaim a
     seat (acceptance still gates via the remaining vendor; cb doctor warns).
+    The local `verify` verdict is opt-in: set `agents.handoff_verify_command`
+    when the repository has a real test/build command to gate handoff.
 
     To scale up on paid tier: edit `codeband.yaml` or use `cb scale`.
     """

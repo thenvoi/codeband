@@ -63,9 +63,7 @@ KNOWN_VERDICTS: frozenset[str] = frozenset({"verify", "review", "verify_acceptan
 # ``required_verdicts``.
 DEFAULT_MERGE_APPROVAL = "owner"
 
-# What an absent ``agents.required_verdicts`` key resolves to: the verify +
-# review pair, PLUS ``verify_acceptance`` whenever a verifier is configured
-# (resolved per-config in :func:`resolve_required_verdicts`). This base tuple
+# The verify + review pair used when a verify command is configured. This tuple
 # is also the NULL-snapshot fallback the merge-eligibility gate uses for tasks
 # registered before snapshots existed (state/fsm.py) — those predate verifiers
 # and must never retroactively require acceptance, so the verifier coupling
@@ -91,12 +89,11 @@ def resolve_required_verdicts(agents: AgentsConfig) -> list[str]:
     Resolution happens at *registration* time — the result is snapshotted onto
     the tasks row so later config edits cannot change an in-flight task:
 
-    * key absent (``None``) → the default ``["verify", "review"]``, PLUS
+    * key absent (``None``) → ``["review"]``, PLUS ``"verify"`` when
+      ``agents.handoff_verify_command`` is configured, PLUS
       ``"verify_acceptance"`` whenever a verifier is configured
-      (``agents.verifiers.total_count() > 0``). This is the coupling that makes
-      acceptance on-by-default exactly when there is a verifier to produce the
-      verdict — and a no-op for verifier-less configs, so activation never
-      fail-louds an existing one.
+      (``agents.verifiers.total_count() > 0``). This keeps fresh installs
+      executable while making verify opt-in by configuring the command.
     * present and non-empty → taken verbatim
     * explicitly ``[]`` → :class:`ValueError`, unless
       ``agents.allow_ungated_merge`` is also set (the deliberately ugly
@@ -106,9 +103,9 @@ def resolve_required_verdicts(agents: AgentsConfig) -> list[str]:
 
     * an unknown name (not in :data:`KNOWN_VERDICTS`) fails, naming the entry
       — typo protection, since a missing verdict would silently weaken gating
-    * ``verify`` requires ``agents.handoff_verify_command`` to be set; this
-      intentionally turns a fresh install's silent verify-skip into a loud
-      fail-at-seed
+    * ``verify`` requires ``agents.handoff_verify_command`` to be set; the
+      default resolution only includes ``verify`` when that command exists, but
+      an explicit unexecutable ``verify`` still fails loud
     * ``verify_acceptance`` requires at least one configured verifier
       (``agents.verifiers.total_count() > 0``) — otherwise nothing could ever
       run ``cb-phase verify-acceptance`` and every merge would dead-end on a
@@ -124,7 +121,10 @@ def resolve_required_verdicts(agents: AgentsConfig) -> list[str]:
     """
     configured = agents.required_verdicts
     if configured is None:
-        resolved = list(DEFAULT_REQUIRED_VERDICTS)
+        if agents.handoff_verify_command:
+            resolved = list(DEFAULT_REQUIRED_VERDICTS)
+        else:
+            resolved = ["review"]
         if agents.verifiers.total_count() > 0:
             resolved.append("verify_acceptance")
     elif not configured:

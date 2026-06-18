@@ -26,10 +26,10 @@ from codeband.state.registration import register_task
 def _gated_agents(**overrides) -> AgentsConfig:
     """An AgentsConfig whose default verdict list is executable.
 
-    The default ``required_verdicts`` resolution includes ``verify``, which
-    requires ``handoff_verify_command`` — fresh-install registration now fails
-    loudly without one (that change is the point). Tests that just exercise
-    the registration mechanics use this config so they pass the verdict gate.
+    When ``handoff_verify_command`` is configured, the default
+    ``required_verdicts`` resolution includes ``verify``. Tests that exercise
+    the fully gated registration mechanics use this config so they pass the
+    verdict gate.
 
     Verifiers are pinned INERT by default so the resolved snapshot stays the
     ``verify``/``review`` pair these mechanics tests assert (the active product
@@ -420,12 +420,22 @@ class TestRequiredVerdicts:
         assert task is not None
         assert task.required_verdicts == []
 
-    def test_verify_without_command_fails_at_seed(
+    def test_fresh_default_without_verify_command_registers_without_verify(
         self, tmp_path: Path, store: StateStore
     ) -> None:
-        # Fresh-install shape: default list (includes 'verify'), no command.
-        # Was a silent verify-skip at run time; now a loud fail at seed time.
         agents = AgentsConfig()  # handoff_verify_command unset
+        result = self._register(tmp_path, store, agents)
+
+        assert result.outcome == "registered"
+        task = store.get_task("room-1")
+        assert task is not None
+        assert "verify" not in task.required_verdicts
+        assert task.required_verdicts == ["review", "verify_acceptance"]
+
+    def test_explicit_verify_without_command_fails_at_seed(
+        self, tmp_path: Path, store: StateStore
+    ) -> None:
+        agents = AgentsConfig(required_verdicts=["verify", "review"])
         with pytest.raises(ValueError, match="handoff_verify_command"):
             self._register(tmp_path, store, agents)
         assert _task_row_count(store.db_path) == 0
@@ -572,9 +582,6 @@ class TestSendTaskRegistration:
     async def test_registration_ordered_before_message_post(
         self, sample_config, sample_agent_config, tmp_path: Path, monkeypatch
     ) -> None:
-        # Registration resolves the default verdict list (includes 'verify'),
-        # so the config must carry an executable verify command.
-        sample_config.agents.handoff_verify_command = "true"
         sample_agent_config.to_yaml(tmp_path / "agent_config.yaml")
         human_client = _make_human_client("room-123")
 
@@ -617,9 +624,6 @@ class TestSendTaskRegistration:
 
 class TestRegisterTaskCli:
     def test_success_exits_zero_and_registers(self, sample_config, tmp_path: Path) -> None:
-        # Registration resolves the default verdict list (includes 'verify'),
-        # so the config must carry an executable verify command.
-        sample_config.agents.handoff_verify_command = "true"
         sample_config.to_yaml(tmp_path / "codeband.yaml")
 
         runner = CliRunner()
@@ -642,6 +646,7 @@ class TestRegisterTaskCli:
         assert task.owner_id == "owner-9"
         assert task.owner_handle == "yoni/peer"
         assert task.status == "active"
+        assert task.required_verdicts == ["review"]
 
     def test_missing_owner_exits_nonzero_writes_nothing(
         self, sample_config, tmp_path: Path

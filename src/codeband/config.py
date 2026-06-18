@@ -374,16 +374,14 @@ class AgentsConfig(_StrictModel):
     # Resolved and validated at task-registration time by
     # ``state/registration.py`` — the single writer of "a task exists" — and
     # snapshotted onto the tasks row, so a mid-task config edit cannot change
-    # what an in-flight task requires. ``None`` (key absent) resolves to the
-    # default ``["verify", "review"]`` — plus ``"verify_acceptance"`` whenever a
-    # verifier is configured (the iff-configured coupling in
-    # ``state/registration.py``; verifiers are count=0 by default, so the
-    # default snapshot stays the verify/review pair); an explicit ``[]`` is a
-    # loud error unless
-    # ``allow_ungated_merge`` is also set. Known verdicts: ``verify`` (requires
-    # ``handoff_verify_command``), ``review``, and ``verify_acceptance``
-    # (requires a configured verifier). The merge-eligibility gate
-    # (``state/fsm.py``) reads the snapshot.
+    # what an in-flight task requires. ``None`` (key absent) resolves to
+    # ``["review"]`` plus ``"verify"`` only when ``handoff_verify_command`` is
+    # configured, plus ``"verify_acceptance"`` whenever a verifier is
+    # configured (the iff-configured coupling in ``state/registration.py``). An
+    # explicit ``[]`` is a loud error unless ``allow_ungated_merge`` is also set.
+    # Known verdicts: ``verify`` (requires ``handoff_verify_command``),
+    # ``review``, and ``verify_acceptance`` (requires a configured verifier).
+    # The merge-eligibility gate (``state/fsm.py``) reads the snapshot.
     required_verdicts: list[str] | None = None
 
     # Escape hatch for ``required_verdicts: []`` — the name is deliberately
