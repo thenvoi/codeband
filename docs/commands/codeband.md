@@ -116,17 +116,23 @@ Run from the **target dir** so your bridge is scoped to this repo's cwd:
 
 ```bash
 cd "$TARGET_DIR"
-# If a bridge is already running for this cwd, reuse it; otherwise onboard.
-# NOTE: `jam daemon status` exits 0 even when not running — must grep the output.
-if jam daemon status 2>/dev/null | grep -q '^Running'; then
-  echo "bridge already running"
+# Use an explicit --session key (== TEAM) so this run's peer is selected
+# deterministically — not "first running peer globally" which can bind to
+# a completely unrelated session (e.g., Lyra) when other jam peers are active.
+# The session key is a stable per-repo name here; a later refactor can swap
+# it for $TEAM-$(uuidgen) to get fresh-per-run identities without changing
+# the selection mechanism.
+JAM_SESSION="$TEAM"
+if jam --session "$JAM_SESSION" status 2>/dev/null | grep -q 'running=true'; then
+  echo "bridge already running for session $JAM_SESSION"
 else
-  jam onboard --team "$TEAM" >/dev/null 2>&1
+  jam --session "$JAM_SESSION" onboard --team "$TEAM" >/dev/null 2>&1
 fi
-jam daemon status
+jam --session "$JAM_SESSION" status
+export JAM_SESSION
 ```
 
-The `Running yoni/claude-<repo>-<hex>` line is your handle. Quote it to the user later.
+The first token of the status line (`owner/handle`) is your handle. Quote it to the user later.
 
 ### Step 4 — start the swarm (background) from the home
 
@@ -153,17 +159,23 @@ from thenvoi_rest import AsyncRestClient, ParticipantRequest
 target_dir, cb_home = sys.argv[1], sys.argv[2]
 task = os.environ.get("GR_TASK", "").strip() or "(no task text provided)"
 
-# 1) Find cc's @owner/handle from `jam list` (the running peer for this onboard).
-jl = subprocess.run(["jam","list"], capture_output=True, text=True)
-if jl.returncode != 0:
-    print("ERROR: `jam list` failed:", jl.stderr, file=sys.stderr); sys.exit(1)
+# 1) Find cc's @owner/handle from the session-scoped status (deterministic).
+# JAM_SESSION was exported in Step 3; it is == TEAM (codeband-<slug>).
+# Using --session avoids "first running peer globally" which can pick the
+# wrong identity when other jam peers (e.g. Lyra) are concurrently active.
+jam_session = os.environ.get("JAM_SESSION", "")
+if not jam_session:
+    print("ERROR: JAM_SESSION not set — Step 3 must export it.", file=sys.stderr); sys.exit(1)
+js = subprocess.run(["jam", "--session", jam_session, "status"], capture_output=True, text=True)
+if js.returncode != 0:
+    print(f"ERROR: jam --session {jam_session} status failed:", js.stderr, file=sys.stderr); sys.exit(1)
 cc_handle = None
-for line in jl.stdout.splitlines():
+for line in js.stdout.splitlines():
     parts = line.strip().split()
-    if parts and "/" in parts[0] and "running=true" in line:
+    if parts and "/" in parts[0]:
         cc_handle = parts[0]; break
 if not cc_handle:
-    print("ERROR: no running jam peer found in `jam list`.\n" + jl.stdout, file=sys.stderr); sys.exit(1)
+    print(f"ERROR: could not parse handle from jam --session {jam_session} status:\n{js.stdout}", file=sys.stderr); sys.exit(1)
 
 # 2) Create the room as cc. jam CLI auths via the encrypted store internally.
 cn = subprocess.run(["jam","chat","new","--as",cc_handle], capture_output=True, text=True)
@@ -361,7 +373,10 @@ You have four Monitors/wakeup paths: **room messages** (`cb room-log` via the ro
 
 **Merge approval** — when you receive a merge-approval request (a Band @mention naming a PR, e.g. "PR #12 … is awaiting your merge approval at head <sha>. Approve with: cb approve 12"):
 1. **Review before granting**: confirm the gate's verdicts passed (`cd "$CB_HOME" && codeband pending --dir .`) and read the diff (`gh pr diff <N> --repo <slug>`) — you are approving specific code, not a status. Never approve blindly.
-2. **To grant**: run `cb approve <pr>` from the project directory: `cd "$CB_HOME" && cb approve <N>`. The grant is SHA-pinned — if new commits land on the PR after your approval, it expires automatically and a fresh request will arrive. **Never post "approved" as a chat message** — the approval is the `cb approve` CLI grant, executed as the human owner. An agent posting approval text into the room is not a grant and violates attribution integrity.
+2. **To grant**:
+   a. Record the durable grant (no room notification yet): `cd "$CB_HOME" && cb approve --no-notify <N>`
+   b. If that exits 0, post the coordinator notification as yourself (not as the human key): `jam send "$ROOM" "Durable merge grant recorded for PR #<N> — please proceed with merge." --as "$HANDLE"`
+   The grant is SHA-pinned — if new commits land after your approval, it expires and a fresh request arrives. **Never post "approved" as a bare chat message** — only the `cb approve` CLI grant is the durable record; an agent posting approval text without a `cb approve` grant violates attribution integrity.
 3. **To withhold**: post on Band (`jam send`) stating what is missing or wrong. Do not run `cb approve`.
 
 Outbound to the Conductor at any time: `cd "$TARGET_DIR" && jam send "$ROOM" "@<conductor-handle> ..." --as "$HANDLE"`. Do NOT run `cb feed` (it streams and blocks).

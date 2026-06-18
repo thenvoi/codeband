@@ -407,13 +407,20 @@ def test_code_reviewer_verdict_commands_pin_the_pr():
 def test_codeband_command_doc_grants_approval_instead_of_prohibiting():
     """As of the merge-execution leg, ``cb approve`` writes the SHA-pinned
     approval grant and the invoking agent is the task owner/approver — the old
-    do-not-use prohibition is obsolete and must stay gone."""
+    do-not-use prohibition is obsolete and must stay gone.
+
+    A2 (F14): the approval flow now uses --no-notify so the coordinator can
+    post the room notification as its own jam identity (not the human key).
+    """
     doc = Path("docs/commands/codeband.md").read_text(encoding="utf-8")
 
-    assert "cb approve <pr>" in doc
+    # A2: coordinator-specific grant path uses --no-notify.
+    assert "cb approve --no-notify" in doc
     assert "SHA-pinned" in doc
     assert "Never approve blindly" in doc
     assert "Do not run `cb approve`" in doc  # the withhold path
+    # A2: coordinator posts notification as its own identity.
+    assert "Durable merge grant recorded for PR" in doc
     # Distinctive substring of the pre-merge-leg prohibition.
     assert "do NOT use `cb approve`" not in doc
 

@@ -900,9 +900,12 @@ def test_shell_slash_approve_is_exempt_from_the_agent_guard(tmp_path, monkeypatc
 
     monkeypatch.setenv("CODEBAND_AGENT_SESSION", "1")
     calls: list = []
+    # Return a non-empty grant list so the notification path is exercised.
     monkeypatch.setattr(
         merge_mod, "record_approval_grant",
-        lambda project_dir, number: calls.append(number) or [],
+        lambda project_dir, number: calls.append(number) or [
+            "Merge approval recorded for subtask st-1 at sha-1 (approver: owner)."
+        ],
     )
 
     async def _fake_send(config, project, message, command_style="cli"):

@@ -1179,8 +1179,23 @@ def pending(project_dir: str, command_style: str = "cli") -> None:
 @cli.command()
 @click.argument("number", type=int)
 @click.option("--dir", "project_dir", default=".", help="Project directory")
+@click.option(
+    "--no-notify",
+    is_flag=True,
+    default=False,
+    help=(
+        "Record the durable grant only; skip the room notification. "
+        "Use this in coordinator flows (e.g. /codeband) where the caller "
+        "posts the notification as the coordinator identity via `jam send --as`."
+    ),
+)
 @_project_aware
-def approve(number: int, project_dir: str, command_style: str = "cli") -> None:
+def approve(
+    number: int,
+    project_dir: str,
+    no_notify: bool = False,
+    command_style: str = "cli",
+) -> None:
     """Approve a PR for merge (records the durable grant + notifies the room).
 
     Human-approval primitive: refuses to run inside an agent session
@@ -1238,6 +1253,26 @@ def approve(number: int, project_dir: str, command_style: str = "cli") -> None:
         raise click.ClickException(str(e)) from None
     for line in grant_lines:
         click.echo(line)
+
+    # A1: fail closed when no grant was recorded (unbound PR or no request
+    # marker). record_approval_grant already printed the reason to stderr.
+    # Never post a notification without a real grant on record.
+    if not grant_lines:
+        raise click.ClickException(
+            f"cb approve: no durable grant recorded for PR #{number} — "
+            "no room notification sent. "
+            "Re-run after the merge leg requests approval."
+        )
+
+    # A2: --no-notify lets coordinator flows (e.g. /codeband) post the
+    # notification as the coordinator's jam identity via `jam send --as`,
+    # rather than falling back to BAND_API_KEY (the human key).
+    if no_notify:
+        click.echo(
+            f"Grant recorded for PR #{number} (--no-notify: "
+            "room notification suppressed; caller must notify via jam send)."
+        )
+        return
 
     message = (
         f"APPROVED: Please merge PR #{number}. {link}\n"

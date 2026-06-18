@@ -176,3 +176,89 @@ def test_cb_approve_still_refuses_in_agent_session(tmp_path, monkeypatch):
     result = CliRunner().invoke(cli, ["approve", "1", "--dir", str(project)])
     assert result.exit_code != 0
     assert "human-approval primitive" in result.output
+
+
+# ── A1: no ghost approval when no grant is recorded (F13) ────────────────────
+
+def test_cb_approve_sends_no_notification_when_no_grant_recorded(tmp_path, monkeypatch):
+    """A1 (F13): when record_approval_grant returns [], cb approve must exit
+    nonzero and must NOT call send_room_message — no ghost APPROVED post."""
+    import codeband.cli.merge as merge_mod
+    import codeband.orchestration.kickoff as kickoff_mod
+    from codeband.cli import approve as approve_cmd
+
+    notified: list = []
+
+    monkeypatch.setattr(merge_mod, "record_approval_grant", lambda _dir, _n: [])
+
+    async def _should_not_be_called(*a, **kw):  # pragma: no cover
+        notified.append("sent")
+
+    monkeypatch.setattr(kickoff_mod, "send_room_message", _should_not_be_called)
+    (tmp_path / "codeband.yaml").write_text(
+        "repo:\n  url: https://github.com/acme/widgets\n", encoding="utf-8",
+    )
+
+    import click
+    with pytest.raises(click.ClickException) as exc_info:
+        approve_cmd.callback(number=42, project_dir=str(tmp_path))
+
+    assert "no durable grant recorded" in str(exc_info.value)
+    assert notified == [], "send_room_message must not be called when no grant was recorded"
+
+
+# ── A2: --no-notify skips the room message (F14 mechanism) ───────────────────
+
+def test_cb_approve_no_notify_records_grant_but_skips_room_message(tmp_path, monkeypatch):
+    """A2 (F14): --no-notify records the grant (exits 0) but does NOT call
+    send_room_message — the caller (e.g. /codeband) posts via jam send --as."""
+    import codeband.cli.merge as merge_mod
+    import codeband.orchestration.kickoff as kickoff_mod
+    from codeband.cli import approve as approve_cmd
+
+    notified: list = []
+    monkeypatch.setattr(
+        merge_mod, "record_approval_grant",
+        lambda _dir, _n: ["Merge approval recorded for subtask st-1 at sha-1 (approver: owner)."],
+    )
+
+    async def _should_not_be_called(*a, **kw):  # pragma: no cover
+        notified.append("sent")
+
+    monkeypatch.setattr(kickoff_mod, "send_room_message", _should_not_be_called)
+    (tmp_path / "codeband.yaml").write_text(
+        "repo:\n  url: https://github.com/acme/widgets\n", encoding="utf-8",
+    )
+
+    # Must not raise — exits 0 with grant recorded, notification suppressed.
+    approve_cmd.callback(number=42, project_dir=str(tmp_path), no_notify=True)
+
+    assert notified == [], "send_room_message must not be called with --no-notify"
+
+
+def test_cb_approve_with_grant_and_notify_calls_send_room_message(tmp_path, monkeypatch):
+    """Positive path: when a grant IS recorded and --no-notify is not set,
+    send_room_message is called exactly once."""
+    import codeband.cli.merge as merge_mod
+    import codeband.orchestration.kickoff as kickoff_mod
+    from codeband.cli import approve as approve_cmd
+
+    notified: list = []
+    monkeypatch.setattr(
+        merge_mod, "record_approval_grant",
+        lambda _dir, _n: ["Merge approval recorded for subtask st-1 at sha-1 (approver: owner)."],
+    )
+
+    async def _fake_send(config, project, message, command_style="cli"):
+        notified.append(message)
+
+    monkeypatch.setattr(kickoff_mod, "send_room_message", _fake_send)
+    (tmp_path / "codeband.yaml").write_text(
+        "repo:\n  url: https://github.com/acme/widgets\n", encoding="utf-8",
+    )
+
+    approve_cmd.callback(number=42, project_dir=str(tmp_path))
+
+    assert len(notified) == 1
+    assert "APPROVED" in notified[0]
+    assert "42" in notified[0]
